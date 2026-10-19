@@ -10,6 +10,10 @@ September 23 `628ed18e` measurements. All llama.cpp measurements are unchanged.
 [Recurrent-state review](artifacts/recurrent-fork-review.json) records matched
 main/PR checks and the remaining variable latency observations.
 
+The [component-cache refresh](artifacts/component-cache-review.json) has separate
+per-request short-history controls and remains under qualification. These
+throughput tables retain their dates and do not qualify the new cache wiring.
+
 Positive gain favors Gufo.
 [Quality and measurement details](QUALITY.md) · [Model identities](artifacts/model-identities.json)
 
