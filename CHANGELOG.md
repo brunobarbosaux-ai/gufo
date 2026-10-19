@@ -4,6 +4,90 @@ Notable user-facing changes are recorded here. Gufo follows
 [Semantic Versioning](https://semver.org/) under the compatibility policy in
 [the release guide](docs/RELEASING.md).
 
+## [0.18.0](https://github.com/gufo-org/gufo/compare/v0.17.1...v0.18.0) (2026-10-19)
+
+
+### Features
+
+* **serve:** honor the Messages thinking budget ([#524](https://github.com/gufo-org/gufo/issues/524)) ([295f26c](https://github.com/gufo-org/gufo/commit/295f26ce63e93b288a47b1bb54d8d823a93e8c0d))
+* **serve:** prepare the structured-output vocabulary before serving ([#638](https://github.com/gufo-org/gufo/issues/638)) ([e773094](https://github.com/gufo-org/gufo/commit/e77309421b0013d44d62ec0824be63c057a970e5))
+
+
+### Bug Fixes
+
+* **cache:** keep disk-cache snapshots out of the page cache ([#477](https://github.com/gufo-org/gufo/issues/477)) ([bff0eec](https://github.com/gufo-org/gufo/commit/bff0eec6f1eaaa5847d00712787153a3de78a4a0))
+* **ci:** keep the devlab report when later jobs start ([#659](https://github.com/gufo-org/gufo/issues/659)) ([fbfc712](https://github.com/gufo-org/gufo/commit/fbfc712586c8972b2209bd6c13c69c8146311b81))
+* **qwen-flash:** pin square-accumulation order in all HcCombineMoeF16Kernel instantiations ([#624](https://github.com/gufo-org/gufo/issues/624)) ([43b829d](https://github.com/gufo-org/gufo/commit/43b829d4dee5574d66fbd499640e56f40cbf4baa))
+* **qwen:** reuse historical image preprocessing ([#645](https://github.com/gufo-org/gufo/issues/645)) ([f948ddd](https://github.com/gufo-org/gufo/commit/f948ddd371bf2a3f7360b7069fc703badbbc07ed))
+* **serve:** reclaimable page cache is available in cgroup space ([#637](https://github.com/gufo-org/gufo/issues/637)) ([9e1afaa](https://github.com/gufo-org/gufo/commit/9e1afaaa4da0f36e3638ac88bf12b054d2a1114a))
+* **tools:** preserve optional arguments in native calls ([#643](https://github.com/gufo-org/gufo/issues/643)) ([a802cc7](https://github.com/gufo-org/gufo/commit/a802cc77c795e26388e45cacec94aafcd69d12b4))
+
+
+### Performance
+
+* **flash-next:** reduce prompt and decode stalls ([#653](https://github.com/gufo-org/gufo/issues/653)) ([3462aa9](https://github.com/gufo-org/gufo/commit/3462aa96d0c02da3a6a511e0be197e186bd9f36a))
+* **qwen:** fork the recurrent state across two buffers instead of copying it ([#650](https://github.com/gufo-org/gufo/issues/650)) ([95ba1ea](https://github.com/gufo-org/gufo/commit/95ba1eae63f62fd8a4576f6313ffa6be05f1e83b))
+
+## [0.17.1](https://github.com/gufo-org/gufo/compare/v0.17.0...v0.17.1) (2026-10-18)
+
+
+### Bug Fixes
+
+* **cache:** reject capacity retries before reading payloads ([#636](https://github.com/gufo-org/gufo/issues/636)) ([778061d](https://github.com/gufo-org/gufo/commit/778061d453ff4cf863c47059f8ea63142c7f5ca1))
+* **inference:** reduce Flash-Next cache and cold-prompt stalls ([#633](https://github.com/gufo-org/gufo/issues/633)) ([1f97092](https://github.com/gufo-org/gufo/commit/1f97092333af10f29887b098d9cb8a041610004a))
+
+
+### Performance
+
+* **qwen-flash:** copy repeated context into MTP drafts ([#613](https://github.com/gufo-org/gufo/issues/613)) ([8497711](https://github.com/gufo-org/gufo/commit/8497711eb154ecff55ef4119a01ace214149e276))
+* **qwen-flash:** cut prefill and decode attention cost at depth ([#626](https://github.com/gufo-org/gufo/issues/626)) ([5a1669a](https://github.com/gufo-org/gufo/commit/5a1669a6c15129917a4e91b77bd36ddaa3e7b0d8))
+
+## [0.17.0](https://github.com/gufo-org/gufo/compare/v0.16.0...v0.17.0) (2026-10-17)
+
+
+### Features
+
+* **serve:** prepare the Qwen vision sidecar before serving ([#616](https://github.com/gufo-org/gufo/issues/616)) ([0604e9e](https://github.com/gufo-org/gufo/commit/0604e9ebc41388ab610ed0bed198e49ef96a6a82))
+
+
+### Bug Fixes
+
+* **cache:** bound publication waits by observed prefill cost ([#621](https://github.com/gufo-org/gufo/issues/621)) ([e8e508f](https://github.com/gufo-org/gufo/commit/e8e508f51826c86d567ed3b7ea6bf2b1eaeb1ab5))
+* **cache:** let disk eviction wait for startup orphan reclamation ([#625](https://github.com/gufo-org/gufo/issues/625)) ([78248de](https://github.com/gufo-org/gufo/commit/78248de23cc279b1a5d4443cef816a6059bde189))
+* **serve:** keep the decimal spelling of integer JSON numbers ([#614](https://github.com/gufo-org/gufo/issues/614)) ([22e3676](https://github.com/gufo-org/gufo/commit/22e36769f9b25a57963a9215003eae0f5f9c15d6))
+* **serve:** preserve cache reuse when tool choice changes ([#623](https://github.com/gufo-org/gufo/issues/623)) ([23d970d](https://github.com/gufo-org/gufo/commit/23d970d0ca0ef694dafec64131269f9c24590940))
+
+
+### Performance
+
+* **qwen-flash:** compact sparse attention selections once per row ([#622](https://github.com/gufo-org/gufo/issues/622)) ([baf5a1b](https://github.com/gufo-org/gufo/commit/baf5a1bbab5b99a8278c4869122fd173b205671b))
+
+## [0.16.0](https://github.com/gufo-org/gufo/compare/v0.15.1...v0.16.0) (2026-10-16)
+
+
+### Features
+
+* **serve:** keep /health answering while the model and disk tier load ([#610](https://github.com/gufo-org/gufo/issues/610)) ([f6ca085](https://github.com/gufo-org/gufo/commit/f6ca085a5091eed23541cde6fa1ff282cbd4c68b))
+
+
+### Performance
+
+* **cache:** reduce long-context checkpoint overhead ([#615](https://github.com/gufo-org/gufo/issues/615)) ([f8be547](https://github.com/gufo-org/gufo/commit/f8be5474228095dd0eec6cec14cbc6ba7f070f90))
+* **qwen-flash:** score MTP drafts over request vocabulary ([#603](https://github.com/gufo-org/gufo/issues/603)) ([51a8b00](https://github.com/gufo-org/gufo/commit/51a8b00d9dc5360688fc8642df94dfe1387ec2ca))
+
+
+### Code Refactoring
+
+* **serve:** move tool-call dialect parsing next to its renderers ([#592](https://github.com/gufo-org/gufo/issues/592)) ([b6ba33d](https://github.com/gufo-org/gufo/commit/b6ba33d48c7a2749a2e0b98e891a22e27d17cbdb))
+
+## [0.15.1](https://github.com/gufo-org/gufo/compare/v0.15.0...v0.15.1) (2026-10-15)
+
+
+### Bug Fixes
+
+* **cache:** avoid artifact hashing for RAM-only Flash-Next ([#602](https://github.com/gufo-org/gufo/issues/602)) ([43ad9a5](https://github.com/gufo-org/gufo/commit/43ad9a5a7133dabc820a66a825247331c5503bf4))
+* **cache:** repair flash-next functional cache regressions ([#596](https://github.com/gufo-org/gufo/issues/596)) ([ec69aa3](https://github.com/gufo-org/gufo/commit/ec69aa328ea78f00090c42a78034cc012eae151e))
+
 ## [0.15.0](https://github.com/gufo-org/gufo/compare/v0.14.0...v0.15.0) (2026-10-13)
 
 

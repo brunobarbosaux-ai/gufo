@@ -366,7 +366,9 @@ the `max_bytes` an explicit value may claim.
 
 Both are sampled after weights and execution states are allocated, then fixed
 for the server run. Flash-Next and Qwen3.8-27B use half the available
-host RAM, respecting container/cgroup limits. 27B also clamps this to HIP's free
+host RAM, respecting container/cgroup limits. Inactive page cache, such as
+recently read model files, counts as available because the kernel reclaims it
+before failing an allocation. Dirty and writeback pages do not. 27B also clamps this to HIP's free
 device memory. CPU and GPU allocations compete for the same physical RAM on
 Strix Halo, so HIP's free-memory estimate alone is not enough.
 For example, 44 GiB available at load gives a 22 GiB automatic RAM cache and
@@ -376,9 +378,11 @@ Memory that another process claims after startup is not subtracted. When
 other GPU servers share the machine, such as an image or speech server, set an
 explicit `--cache-ram-bytes` that leaves room for their peak use; starting
 them first only accounts for what they hold at that moment.
-The RAM payload budget excludes weights, execution states, token metadata
-and disk staging. It also excludes temporary host buffers used to save
-checkpoints to disk; this is not a limit on total server memory.
+The RAM payload budget excludes weights, execution states, token metadata,
+disk staging and Qwen's separate CPU image-preprocessing cache (up to 128 MiB
+of retained encoded/RGB vectors plus bounded metadata). It also excludes temporary
+host buffers used to save checkpoints to disk; this is not a limit on total
+server memory.
 
 The 32 GiB automatic cap limits default growth on a lightly loaded machine.
 It leaves room for several 27B histories: two 3.7 GB checkpoints per history
@@ -438,6 +442,30 @@ count under 128; only larger explicit budgets can reach the record limit. The st
 `schema=component-cache-v1 event=configured` reports `capacity_bytes`,
 `automatic_bytes`, `max_bytes`, `staging_capacity_bytes` and
 `disk_capacity_bytes`.
+
+Flash-Next prepares a bounded two-segment reserve before readiness and can
+prepare the next segment before a prefill with at least 512 tokens remaining
+or when assigning backing to completed append rows. Private-state and partial-tail copies do not request speculative
+growth; a capture still commits any backing it needs.
+
+Backing excludes transparent huge pages before population and attempts a Linux
+long-term page pin before GPU registration. GPU registration alone leaves
+anonymous pages movable: ordinary memory compaction can invalidate their GPU
+mappings and pause the process's queues. Registered `io_uring` buffers supply
+the extra pin without submitting I/O or running polling threads. Their
+lifetime follows the backing, including blocks that outlive the pool facade;
+cleanup unregisters the GPU mapping and releases the pin before unmapping.
+If `io_uring` or the process's memory-lock limit refuses the pin, the existing
+registered base-page path remains available with the same cache capacity.
+`event=backing_prepared` and `event=backing_grown` report
+`long_term_pinned_bytes` alongside committed bytes, making that fallback visible.
+
+Container seccomp profiles may block `io_uring_setup` and `io_uring_register`.
+An unlimited `memlock` setting alone does not enable them. Check the pin-byte
+counter inside the running container: zero means the extra migration protection
+is unavailable. Enabling it requires allowing these two calls in the
+operator-managed syscall policy; `io_uring_enter` is not used. The registered
+base-page fallback remains compatible with restrictive container policies.
 
 A step of about 1 GiB took 56–58 ms on the capturing thread while the host had
 free pages **(measured)**. Captures run on the scheduler thread, so concurrent
@@ -538,6 +566,8 @@ result can still populate the cache. `null` keeps the default, `true`.
 | `schema=component-cache-v1 event=option_ignored option=--cache-disk-staging-bytes` | Flash-Next: the staging option is ignored; disk transfers use the internal buffer |
 | `schema=component-cache-v1 event=disk_evicted reason=budget` | Flash-Next: startup removed the oldest checkpoints (creation order) to fit a lowered `--cache-disk-bytes` |
 | `schema=component-cache-v1 event=disk_over_budget` | Flash-Next: the directory still exceeds `--cache-disk-bytes` after startup reclamation and eviction; publication is refused until it fits |
+| `schema=component-cache-v1 event=published` | A checkpoint finished disk publication; `checkpoint_id` identifies the capture and `tokens` its boundary |
+| `schema=component-cache-v1 event=persistence_refused reason=min_step` | A captured checkpoint is too close to an existing publication; includes `checkpoint_id` and `tokens` |
 | `event=snapshot action=removed reason=entry_capacity` | a retained prefix was evicted because every entry was taken |
 | `event=snapshot action=skipped reason=entry_capacity` | no checkpoint record could be replaced safely for this capture |
 | `event=snapshot action=skipped reason=byte_capacity` | a checkpoint did not fit the RAM budget |
@@ -557,6 +587,11 @@ stored prompt shares a token with the request and `no_compatible_boundary`
 when one does but no restorable boundary covers it;
 `cache_common_prefix_tokens` is then the longest agreement and
 `cache_checkpoint_tokens` the deepest compatible boundary.
+
+Flash-Next also reports `usage.gufo.component_cache.captured_checkpoint_ids`.
+Match these request-local IDs to `checkpoint_id` in publication/refusal logs:
+an earlier request's asynchronous write may finish after the current response.
+IDs belong to one server lifetime; correlate each restart separately.
 
 Reading them:
 

@@ -587,6 +587,7 @@ void PrintServeHelp(std::string_view program_name,
     std::string reasoning_mode = "auto";
     std::string reasoning_effort = "auto";
     std::string preserve_thinking = "auto";
+    std::int64_t reasoning_budget = -1;
     std::string speculative_backend;
     std::string dflash_model_path;
     std::string draft_policy;
@@ -652,6 +653,11 @@ void PrintServeHelp(std::string_view program_name,
     parser.AddOption("", "--preserve-thinking", "MODE",
                      "Replay prior reasoning: on, off, or auto",
                      "Reasoning Defaults", &preserve_thinking);
+    parser.AddOption(
+        "", "--reasoning-budget", "N",
+        "Reasoning tokens before </think> is forced: -1 unlimited, 0 none "
+        "(default: -1)",
+        "Reasoning Defaults", &reasoning_budget);
 
     // Speculative & Hardware
     parser.AddOption("", "--speculative", "MODE",
@@ -1133,6 +1139,7 @@ int RunServe(std::span<const char* const> args) {
     std::string reasoning_mode = "auto";
     std::string reasoning_effort = "auto";
     std::string preserve_thinking = "auto";
+    std::int64_t reasoning_budget = -1;
     std::string speculative_backend;
     std::string dflash_model_path;
     std::string draft_policy;
@@ -1194,6 +1201,11 @@ int RunServe(std::span<const char* const> args) {
     llm_parser.AddOption("", "--preserve-thinking", "MODE",
                          "Replay prior reasoning: on, off, or auto",
                          "Reasoning Defaults", &preserve_thinking);
+    llm_parser.AddOption(
+        "", "--reasoning-budget", "N",
+        "Reasoning tokens before </think> is forced: -1 unlimited, 0 none "
+        "(default: -1)",
+        "Reasoning Defaults", &reasoning_budget);
     llm_parser.AddOption("", "--speculative", "MODE",
                          "HTTP draft backend: dspark, dflash2, mtp, or off",
                          "Speculative", &speculative_backend);
@@ -1342,12 +1354,19 @@ int RunServe(std::span<const char* const> args) {
       std::cerr << "Error: speculative draft limits are invalid\n";
       return 2;
     }
-    const auto reasoning_defaults = ResolveReasoningDefaults(
+    auto reasoning_defaults = ResolveReasoningDefaults(
         reasoning_mode, reasoning_effort, preserve_thinking, &parse_err);
     if (!reasoning_defaults.has_value()) {
       std::cerr << "Error: " << parse_err << "\n";
       return 2;
     }
+    if (reasoning_budget < -1) {
+      std::cerr << "Error: --reasoning-budget must be -1 or nonnegative\n";
+      return 2;
+    }
+    if (reasoning_budget >= 0)
+      reasoning_defaults->budget_tokens =
+          static_cast<std::size_t>(reasoning_budget);
 
     server::TextSpeculativeConfig speculative_config;
     if (speculative_backend.empty() && !dspark_model_path.empty()) {
@@ -1399,39 +1418,42 @@ int RunServe(std::span<const char* const> args) {
     std::string err;
     ModelLoadLog load_log("text", model);
     backend = std::make_shared<server::InferenceBackend>();
-    if (!backend->load(model, &err, max_context, session_count,
-                       server::TextPrefillPolicy{
-                           .decode_active_tokens = prefill_chunk_tokens,
-                       },
-                       server::TextSchedulerPolicy{
-                           .max_pending_requests = max_pending_requests,
-                           .max_pending_requests_per_client =
-                               max_pending_requests_per_client,
-                           .max_output_bytes_per_request = max_output_bytes,
-                           .max_buffered_output_bytes_per_request =
-                               max_buffered_output_bytes,
-                           .max_buffered_output_bytes_total =
-                               max_buffered_output_bytes_total,
-                           .request_timeout =
-                               std::chrono::milliseconds{
-                                   static_cast<std::chrono::milliseconds::rep>(
-                                       request_timeout_ms)},
-                           .stall_timeout =
-                               std::chrono::milliseconds{
-                                   static_cast<std::chrono::milliseconds::rep>(
-                                       stall_timeout_ms)},
-                           .log_progress = log_progress,
-                       },
-                       speculative_config,
-                       server::TextDiskCacheConfig{
-                           .directory = cache_disk_directory,
-                           .capacity_bytes = cache_disk_bytes,
-                           .staging_capacity_bytes = cache_disk_staging_bytes,
-                           .model_artifact_fingerprint = {},
-                       },
-                       vision_model_path,
-                       server::TextRunnerRamCacheOptions{
-                           .capacity_bytes = cache_ram_bytes})) {
+    // The disk snapshot tier is walked during load, which can take minutes.
+    // Answer 503 `Loading model` on the port meanwhile, as llama-server does,
+    // so supervisors see a loading server rather than a refused connection.
+    server::LoadingResponder loading(host, port);
+    const bool load_ok = backend->load(
+        model, &err, max_context, session_count,
+        server::TextPrefillPolicy{
+            .decode_active_tokens = prefill_chunk_tokens,
+        },
+        server::TextSchedulerPolicy{
+            .max_pending_requests = max_pending_requests,
+            .max_pending_requests_per_client = max_pending_requests_per_client,
+            .max_output_bytes_per_request = max_output_bytes,
+            .max_buffered_output_bytes_per_request = max_buffered_output_bytes,
+            .max_buffered_output_bytes_total = max_buffered_output_bytes_total,
+            .request_timeout =
+                std::chrono::milliseconds{
+                    static_cast<std::chrono::milliseconds::rep>(
+                        request_timeout_ms)},
+            .stall_timeout =
+                std::chrono::milliseconds{
+                    static_cast<std::chrono::milliseconds::rep>(
+                        stall_timeout_ms)},
+            .log_progress = log_progress,
+        },
+        speculative_config,
+        server::TextDiskCacheConfig{
+            .directory = cache_disk_directory,
+            .capacity_bytes = cache_disk_bytes,
+            .staging_capacity_bytes = cache_disk_staging_bytes,
+            .model_artifact_fingerprint = {},
+        },
+        vision_model_path,
+        server::TextRunnerRamCacheOptions{.capacity_bytes = cache_ram_bytes});
+    loading.stop();
+    if (!load_ok) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";
       return 1;
     }

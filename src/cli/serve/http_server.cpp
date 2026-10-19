@@ -1146,8 +1146,9 @@ HttpResponse OpenAiResponses(const HttpRequest& req,
 }
 
 // Messages selects reasoning with thinking.type; adaptive leaves the choice to
-// the server's default. budget_tokens has no native equivalent, so enabled
-// thinking keeps the server's effort unless output_config.effort sets it.
+// the server's default. With enabled thinking, budget_tokens caps the
+// reasoning tokens, as llama.cpp does; enabled thinking keeps the server's
+// effort unless output_config.effort sets it.
 // Reasoning is returned for every display, because replayed thinking blocks
 // restore the cached thought.
 std::optional<HttpResponse> ReadThinking(const json::Value& body,
@@ -1163,10 +1164,15 @@ std::optional<HttpResponse> ReadThinking(const json::Value& body,
         "'thinking.type' must be enabled, adaptive, or disabled");
   if (const auto* budget = thinking->find("budget_tokens");
       budget != nullptr &&
-      (!budget->is_number() || budget->as_double() < 1 ||
+      (!budget->is_number() || !std::isfinite(budget->as_double()) ||
+       budget->as_double() < 1 ||
+       budget->as_double() > std::numeric_limits<std::int32_t>::max() ||
        std::floor(budget->as_double()) != budget->as_double()))
     return InvalidCompatibilityRequest(
-        "'thinking.budget_tokens' must be a positive integer");
+        "'thinking.budget_tokens' must be a positive integer at most "
+        "2147483647");
+  else if (budget != nullptr && type->str() == "enabled")
+    reasoning->budget_tokens = static_cast<std::size_t>(budget->as_double());
   if (const auto* display = thinking->find("display");
       display != nullptr &&
       (!display->is_string() ||
@@ -1502,6 +1508,17 @@ HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend& b) {
       << "llamacpp:spec_decode_num_accepted_tokens_total "
       << detail::TotalDraftAcceptedTokens().load(std::memory_order_relaxed)
       << "\n"
+      << "# HELP gufo_spec_lookup_tokens_total Total prompt-lookup copies "
+         "proposed\n"
+      << "# TYPE gufo_spec_lookup_tokens_total counter\n"
+      << "gufo_spec_lookup_tokens_total "
+      << detail::TotalLookupTokens().load(std::memory_order_relaxed) << "\n"
+      << "# HELP gufo_spec_lookup_accepted_tokens_total Total prompt-lookup "
+         "copies accepted\n"
+      << "# TYPE gufo_spec_lookup_accepted_tokens_total counter\n"
+      << "gufo_spec_lookup_accepted_tokens_total "
+      << detail::TotalLookupAcceptedTokens().load(std::memory_order_relaxed)
+      << "\n"
       << "# HELP llamacpp:prompt_tokens_seconds Prompt processing speed in "
          "tokens per second\n"
       << "# TYPE llamacpp:prompt_tokens_seconds gauge\n"
@@ -1593,6 +1610,88 @@ std::string PeerAddress(int client_fd) {
 }
 
 }  // namespace
+
+LoadingResponder::LoadingResponder(const std::string& host, int port) {
+  sockaddr_storage addr{};
+  socklen_t addr_length = 0;
+  if (port <= 0 || port > 65535 ||
+      !ParseListenAddress(host, port, &addr, &addr_length))
+    return;
+  const int fd = ::socket(addr.ss_family, SOCK_STREAM, 0);
+  if (fd < 0)
+    return;
+  // Match HttpServer::start, which binds the same address after stop().
+  const int yes = 1;
+  const int no = 0;
+  ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+  if ((addr.ss_family == AF_INET6 &&
+       ::setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &no, sizeof(no)) != 0) ||
+      ::bind(fd, reinterpret_cast<sockaddr*>(&addr), addr_length) < 0 ||
+      ::listen(fd, 16) < 0) {
+    const int error = errno;
+    Logger::Debug("server", "event=loading_listener_unavailable host=" + host +
+                                " port=" + std::to_string(port) +
+                                " errno=" + std::to_string(error));
+    ::close(fd);
+    return;
+  }
+  listen_fd_ = fd;
+  thread_ = std::thread([this] { serve(); });
+}
+
+LoadingResponder::~LoadingResponder() {
+  stop();
+}
+
+void LoadingResponder::stop() {
+  stopped_.store(true, std::memory_order_release);
+  if (thread_.joinable())
+    thread_.join();
+  if (listen_fd_ >= 0) {
+    ::close(listen_fd_);
+    listen_fd_ = -1;
+  }
+}
+
+void LoadingResponder::serve() {
+  HttpResponse loading = Err(503, "Service Unavailable", "Loading model",
+                             "unavailable_error", "loading");
+  loading.headers.emplace_back("Retry-After", "1");
+  const std::string reply = BuildResponse(loading);
+  // One connection at a time is enough for probes. Read the request head
+  // before replying so closing does not reset an unread request, but bound
+  // the wait: a client that connects and sends nothing must not delay stop().
+  constexpr auto kRequestWait = std::chrono::milliseconds(500);
+  while (!stopped_.load(std::memory_order_acquire)) {
+    pollfd listener{.fd = listen_fd_, .events = POLLIN, .revents = 0};
+    if (::poll(&listener, 1, 100) <= 0)
+      continue;
+    const int client_fd = ::accept(listen_fd_, nullptr, nullptr);
+    if (client_fd < 0)
+      continue;
+    std::string head;
+    const auto deadline = std::chrono::steady_clock::now() + kRequestWait;
+    while (head.find("\r\n\r\n") == std::string::npos && head.size() < 8192 &&
+           !stopped_.load(std::memory_order_acquire)) {
+      const auto remaining =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              deadline - std::chrono::steady_clock::now())
+              .count();
+      pollfd client{.fd = client_fd, .events = POLLIN, .revents = 0};
+      if (remaining <= 0 ||
+          ::poll(&client, 1, static_cast<int>(remaining)) <= 0)
+        break;
+      char buffer[2048];
+      const ssize_t received = ::recv(client_fd, buffer, sizeof(buffer), 0);
+      if (received <= 0)
+        break;
+      head.append(buffer, static_cast<std::size_t>(received));
+    }
+    (void)SendAll(client_fd, reply);
+    ::shutdown(client_fd, SHUT_WR);
+    ::close(client_fd);
+  }
+}
 
 bool IsListenAddress(const std::string& host) {
   sockaddr_storage address{};

@@ -10,6 +10,7 @@
 #include <cassert>
 #include <chrono>
 #include <csignal>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -920,6 +921,11 @@ void TestLlamaSlotsAndMetrics() {
   assert(metrics.find("# TYPE gufo_device_lost_total counter\n") !=
          std::string::npos);
   assert(metrics.find("gufo_device_lost_total 0\n") != std::string::npos);
+  for (const std::string counter : {"gufo_spec_lookup_tokens_total",
+                                    "gufo_spec_lookup_accepted_tokens_total"}) {
+    assert(metrics.find("# TYPE " + counter + " counter\n") !=
+           std::string::npos);
+  }
   const std::string ratio_prefix = "llamacpp:kv_cache_usage_ratio ";
   const auto ratio_pos = metrics.find("\n" + ratio_prefix);
   assert(ratio_pos != std::string::npos);
@@ -1474,6 +1480,9 @@ void TestCompatibilityRequests() {
          blocks[1].member_str("type") == "text" &&
          blocks[1].member_str("text") == "answer");
   assert(server.backend->LastCall().chat.reasoning.enabled == true);
+  // budget_tokens caps the reasoning that the sampler allows (#266).
+  assert(server.backend->LastCall().chat.reasoning.budget_tokens ==
+         std::size_t{1024});
   response_body(server.Post("/v1/messages", R"({"messages":[
       {"role":"user","content":"hi"},
       {"role":"assistant","content":[
@@ -1482,7 +1491,106 @@ void TestCompatibilityRequests() {
       {"role":"user","content":"next"}],
     "thinking":{"type":"disabled"}})"));
   const auto replayed = server.backend->LastCall().chat;
-  assert(replayed.reasoning.enabled == false);
+  assert(replayed.reasoning.enabled == false &&
+         !replayed.reasoning.budget_tokens);
+
+  // --reasoning-budget is a server default for Chat, Responses and Messages;
+  // Messages budget_tokens overrides it per request.
+  server.backend->reasoning.budget_tokens = 50;
+  response_body(server.Post("/v1/responses", R"({"input":"hi"})"));
+  assert(server.backend->LastCall().chat.reasoning.budget_tokens ==
+         std::size_t{50});
+  response_body(
+      server.Post("/v1/chat/completions", R"({"model":"test","messages":[
+      {"role":"user","content":"hi"}]})"));
+  assert(server.backend->LastCall().chat.reasoning.budget_tokens ==
+         std::size_t{50});
+  response_body(server.Post("/v1/messages", R"({"messages":[
+      {"role":"user","content":"hi"}],
+      "thinking":{"type":"enabled","budget_tokens":8}})"));
+  assert(server.backend->LastCall().chat.reasoning.budget_tokens ==
+         std::size_t{8});
+  // As in llama.cpp, adaptive thinking takes no budget_tokens.
+  response_body(server.Post("/v1/messages", R"({"messages":[
+      {"role":"user","content":"hi"}],
+      "thinking":{"type":"adaptive","budget_tokens":8}})"));
+  assert(server.backend->LastCall().chat.reasoning.budget_tokens ==
+         std::size_t{50});
+  // llama.cpp's thinking_budget_tokens sets it on Chat and Responses; -1
+  // keeps the server default and 0 ends reasoning at once.
+  response_body(
+      server.Post("/v1/chat/completions", R"({"model":"test","messages":[
+      {"role":"user","content":"hi"}],"thinking_budget_tokens":0})"));
+  assert(server.backend->LastCall().chat.reasoning.budget_tokens ==
+         std::size_t{0});
+  response_body(
+      server.Post("/v1/chat/completions", R"({"model":"test","messages":[
+      {"role":"user","content":"hi"}],"thinking_budget_tokens":-1})"));
+  assert(server.backend->LastCall().chat.reasoning.budget_tokens ==
+         std::size_t{50});
+  response_body(server.Post("/v1/responses",
+                            R"({"input":"hi","thinking_budget_tokens":12})"));
+  assert(server.backend->LastCall().chat.reasoning.budget_tokens ==
+         std::size_t{12});
+  for (const auto* invalid : {"-2", "1.5", "\"8\""}) {
+    const auto rejected = server.Post(
+        "/v1/chat/completions", std::string(R"({"model":"test","messages":[
+        {"role":"user","content":"hi"}],"thinking_budget_tokens":)") +
+                                    invalid + "}");
+    ExpectStatus(rejected, 400);
+    assert(rejected.find("thinking_budget_tokens") != std::string::npos);
+  }
+  for (const auto* path : {"/v1/chat/completions", "/v1/responses"}) {
+    const auto input = gufo::json::parse(
+        std::string_view(path) == "/v1/responses"
+            ? R"({"input":"hi"})"
+            : R"({"model":"test","messages":[{"role":"user","content":"hi"}]})");
+    for (const auto* field :
+         {"reasoning_budget_tokens", "thinking_budget_tokens"}) {
+      for (const auto* value : {"-1", "0", "16", "2147483647"}) {
+        auto body = input;
+        body[field] = gufo::json::parse(value);
+        response_body(server.Post(path, body.dump()));
+        const auto expected =
+            std::string_view(value) == "-1"
+                ? std::size_t{50}
+                : static_cast<std::size_t>(body[field].as_double());
+        assert(server.backend->LastCall().chat.reasoning.budget_tokens ==
+               expected);
+      }
+      for (const auto* invalid : {"-2", "1.5", "\"8\"", "2147483648", "1e30"}) {
+        auto body = input;
+        body[field] = gufo::json::parse(invalid);
+        const auto rejected = server.Post(path, body.dump());
+        ExpectStatus(rejected, 400);
+        assert(rejected.find(field) != std::string::npos);
+      }
+    }
+    auto body = input;
+    body["reasoning_budget_tokens"] = 4;
+    body["thinking_budget_tokens"] = 16;
+    response_body(server.Post(path, body.dump()));
+    assert(server.backend->LastCall().chat.reasoning.budget_tokens ==
+           std::size_t{4});
+    body["reasoning_budget_tokens"] = -1;
+    response_body(server.Post(path, body.dump()));
+    assert(server.backend->LastCall().chat.reasoning.budget_tokens ==
+           std::size_t{50});
+    body["reasoning_budget_tokens"] = gufo::json::Value{};
+    response_body(server.Post(path, body.dump()));
+    assert(server.backend->LastCall().chat.reasoning.budget_tokens ==
+           std::size_t{16});
+  }
+  for (const auto* invalid : {"2147483648", "18446744073709551616", "1e30"}) {
+    const auto rejected =
+        server.Post("/v1/messages",
+                    std::string(R"({"messages":[{"role":"user","content":"hi"}],
+        "thinking":{"type":"enabled","budget_tokens":)") +
+                        invalid + "}}");
+    ExpectStatus(rejected, 400);
+    assert(rejected.find("thinking.budget_tokens") != std::string::npos);
+  }
+  server.backend->reasoning.budget_tokens.reset();
   assert(replayed.messages.size() == 3 &&
          replayed.messages[1].thought == "plan" &&
          replayed.messages[1].content == "answer");
@@ -2227,6 +2335,167 @@ void TestListenAddresses() {
   assert(peer(dual, "127.0.0.1") == "127.0.0.1");
 }
 
+// Binds port 0 to find a free port, then releases it for the code under test.
+int FreePort(const std::string& host = "127.0.0.1") {
+  sockaddr_storage address{};
+  socklen_t length = 0;
+  auto* ipv4 = reinterpret_cast<sockaddr_in*>(&address);
+  auto* ipv6 = reinterpret_cast<sockaddr_in6*>(&address);
+  if (::inet_pton(AF_INET, host.c_str(), &ipv4->sin_addr) == 1) {
+    ipv4->sin_family = AF_INET;
+    length = sizeof(*ipv4);
+  } else {
+    assert(::inet_pton(AF_INET6, host.c_str(), &ipv6->sin6_addr) == 1);
+    ipv6->sin6_family = AF_INET6;
+    length = sizeof(*ipv6);
+  }
+  const int fd = ::socket(address.ss_family, SOCK_STREAM, 0);
+  assert(fd >= 0);
+  assert(::bind(fd, reinterpret_cast<const sockaddr*>(&address), length) == 0);
+  assert(::getsockname(fd, reinterpret_cast<sockaddr*>(&address), &length) ==
+         0);
+  ::close(fd);
+  return ntohs(address.ss_family == AF_INET6 ? ipv6->sin6_port
+                                             : ipv4->sin_port);
+}
+
+int ConnectTo(const std::string& host, int port) {
+  sockaddr_storage address{};
+  socklen_t length = 0;
+  auto* ipv4 = reinterpret_cast<sockaddr_in*>(&address);
+  auto* ipv6 = reinterpret_cast<sockaddr_in6*>(&address);
+  if (::inet_pton(AF_INET, host.c_str(), &ipv4->sin_addr) == 1) {
+    ipv4->sin_family = AF_INET;
+    ipv4->sin_port = htons(static_cast<std::uint16_t>(port));
+    length = sizeof(*ipv4);
+  } else {
+    assert(::inet_pton(AF_INET6, host.c_str(), &ipv6->sin6_addr) == 1);
+    ipv6->sin6_family = AF_INET6;
+    ipv6->sin6_port = htons(static_cast<std::uint16_t>(port));
+    length = sizeof(*ipv6);
+  }
+  const int fd = ::socket(address.ss_family, SOCK_STREAM, 0);
+  assert(fd >= 0);
+  const timeval timeout{3, 0};
+  assert(::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) ==
+         0);
+  if (::connect(fd, reinterpret_cast<const sockaddr*>(&address), length) != 0) {
+    ::close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+// Sends each part separately, pausing between them, and reads to EOF.
+std::string SendParts(const std::string& host, int port,
+                      const std::vector<std::string>& parts) {
+  const int fd = ConnectTo(host, port);
+  assert(fd >= 0);
+  for (std::size_t index = 0; index < parts.size(); ++index) {
+    if (index > 0)
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    assert(::send(fd, parts[index].data(), parts[index].size(), MSG_NOSIGNAL) ==
+           static_cast<ssize_t>(parts[index].size()));
+  }
+  std::string response;
+  char buffer[4096];
+  for (;;) {
+    const auto count = ::read(fd, buffer, sizeof(buffer));
+    assert(count >= 0);
+    if (count == 0)
+      break;
+    response.append(buffer, static_cast<std::size_t>(count));
+  }
+  ::close(fd);
+  return response;
+}
+
+void ExpectLoading(const std::string& response) {
+  ExpectStatus(response, 503);
+  assert(response.find("\r\nRetry-After: 1\r\n") != std::string::npos);
+  const auto body = response.substr(response.find("\r\n\r\n") + 4);
+  assert(body ==
+         R"({"error":{"message":"Loading model","type":"unavailable_error",)"
+         R"("code":"loading"}})");
+}
+
+void TestLoadingResponder() {
+  using gufo::server::LoadingResponder;
+  // Nothing to hold for an ephemeral port or an address HttpServer rejects.
+  assert(!LoadingResponder("127.0.0.1", 0).listening());
+  assert(!LoadingResponder("127.0.0.1", 65536).listening());
+  assert(!LoadingResponder("localhost", FreePort()).listening());
+
+  const int port = FreePort();
+  LoadingResponder loading("127.0.0.1", port);
+  assert(loading.listening());
+  // Health and readiness included: a 200 would read as ready to llama-swap
+  // and other pollers, then their requests would fail.
+  for (const std::string path : {"/health", "/v1/health", "/healthz", "/ready",
+                                 "/v1/ready", "/readyz", "/v1/models"}) {
+    ExpectLoading(
+        SendParts("127.0.0.1", port, {"GET " + path + " HTTP/1.1\r\n\r\n"}));
+  }
+  ExpectLoading(SendParts(
+      "127.0.0.1", port,
+      {"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}"}));
+  // A request head split across segments is answered after it completes.
+  ExpectLoading(
+      SendParts("127.0.0.1", port, {"GET /hea", "lth HTTP/1.1\r\n", "\r\n"}));
+
+  // The port is held: the real server cannot bind it until stop().
+  {
+    HttpServer early("127.0.0.1", port, nullptr);
+    std::string error;
+    assert(!early.start(&error));
+  }
+
+  // A client that connects and sends nothing delays neither the next client
+  // nor stop() beyond the bounded request wait.
+  const int idle = ConnectTo("127.0.0.1", port);
+  assert(idle >= 0);
+  auto started = std::chrono::steady_clock::now();
+  ExpectLoading(SendParts("127.0.0.1", port, {"GET /health HTTP/1.1\r\n\r\n"}));
+  assert(std::chrono::steady_clock::now() - started < std::chrono::seconds(2));
+  const int idle_during_stop = ConnectTo("127.0.0.1", port);
+  assert(idle_during_stop >= 0);
+  started = std::chrono::steady_clock::now();
+  loading.stop();
+  assert(std::chrono::steady_clock::now() - started < std::chrono::seconds(2));
+  assert(!loading.listening());
+  ::close(idle);
+  ::close(idle_during_stop);
+
+  // Handoff: the real server binds the same address and answers health.
+  HttpServer server("127.0.0.1", port, nullptr);
+  std::string error;
+  assert(server.start(&error));
+  std::jthread worker([&server] { server.run(); });
+  const auto health =
+      SendParts("127.0.0.1", port, {"GET /health HTTP/1.1\r\n\r\n"});
+  ExpectStatus(health, 200);
+  assert(health.ends_with(R"({"status":"ok"})"));
+  server.stop();
+  worker.join();
+
+  // A port already in use leaves the responder idle and the owner unaffected.
+  {
+    RunningServer owner;
+    LoadingResponder blocked("127.0.0.1", owner.server.port());
+    assert(!blocked.listening());
+    ExpectStatus(owner.Send("GET /health HTTP/1.1\r\n\r\n"), 200);
+  }
+
+  if (!HasIpv6Loopback()) {
+    std::cout << "IPv6 loopback unavailable; skipping IPv6 loading checks.\n";
+    return;
+  }
+  const int ipv6_port = FreePort("::1");
+  LoadingResponder ipv6("::1", ipv6_port);
+  assert(ipv6.listening());
+  ExpectLoading(SendParts("::1", ipv6_port, {"GET /health HTTP/1.1\r\n\r\n"}));
+}
+
 void TestCompatibilityUtf8() {
   RunningServer server;
   server.backend->SetOutput("é中😀\xE2\x94!\xF0\x9F");
@@ -2730,6 +2999,7 @@ int main() {
   TestLogLevelNames();
   TestInvalidBindSettings();
   TestListenAddresses();
+  TestLoadingResponder();
   TestQueryParameters();
   TestAuthorization();
   TestFramingAndMetrics();
