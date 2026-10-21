@@ -15,6 +15,8 @@ add_qwen27b_test(qwen27b_vision_test vision_test.cpp "cpu;vision;correctness")
 
 add_qwen27b_test(qwen_mtp_reference_test mtp_reference_test.cpp
   "cpu;mtp;external-model")
+add_qwen27b_test(qwen_mtp_draft_vocab_test mtp_draft_vocab_test.cpp
+  "cpu;mtp;correctness")
 if (ENGINE_ENABLE_HIP)
   add_qwen27b_test(qwen_sampling_hip_test sampling_test.hip
     "hip;gpu;sampling;correctness")
