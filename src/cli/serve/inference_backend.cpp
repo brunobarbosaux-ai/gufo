@@ -524,9 +524,9 @@ public:
       verifier_ = std::make_unique<speculative::SpeculativeVerifier>(
           *executor_, std::move(draft_backend), speculative_options);
     } else if (mtp_model != nullptr) {
-      // MTP's draft block must mirror the target's whole prefix, so its cache is
-      // sized to the target's context; vision injection stays unwired, exactly
-      // as the DFlash session leaves it.
+      // MTP's draft block must mirror the target's whole prefix, so its cache
+      // is sized to the target's context; vision injection stays unwired,
+      // exactly as the DFlash session leaves it.
       auto draft_backend = hip::QwenMtpGpuDraftBackend::Create(
           std::move(mtp_model),
           hip::QwenMtpGpuDraftConfig{
@@ -1094,9 +1094,9 @@ public:
     const bool speculative_enabled = DraftKind() != QwenDraftKind::kNone;
     return {
         .model_id = model_->GetConfig().model_name,
-        .state_abi = std::string(QwenStateAbi(
-            DraftKind(), execution_policy_.UsesFp16AttentionKv(),
-            execution_policy_.UsesBf16RecurrentState())),
+        .state_abi = std::string(
+            QwenStateAbi(DraftKind(), execution_policy_.UsesFp16AttentionKv(),
+                         execution_policy_.UsesBf16RecurrentState())),
         .max_context = max_context_,
         .capabilities =
             TextRunnerCapabilities{
