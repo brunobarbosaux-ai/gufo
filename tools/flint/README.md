@@ -14,7 +14,8 @@ in `libllama.so`, against the pinned artifact
 | `golden.py tokenize OUTDIR` | M0.6: `/tokenize` goldens for the whole corpus, `add_special` true and false |
 | `golden.py template OUTDIR` | M0.7: `/apply-template` goldens for the G2 fixtures (roles, reasoning, tools, malformed calls, escaping) |
 | `golden.py compare A.json B.json` | Token-id diff of two goldens; reports the first divergence with context |
-| `logit_dump.py OUTDIR --gpu` | M0.5: `llama-perplexity --save-all-logits` per depth, paired with `/tokenize` ids; Gufo's `flint_layer_probe` must emit the same layout |
+| `logit_dump.py OUTDIR [--gpu]` | M0.5: `llama-perplexity --save-all-logits` per depth; the `_logits_` u16 log-prob format is decoded and parsed (`parse_dump`/`dequant_row`); tokens cross-checked against `/tokenize` |
+| `compare_dumps.py A.f32 B.f32` | G3 comparator skeleton: dequantises two dumps and reports max \|Δ log p\| (head), cosine min/mean, argmax agreement, floor disagreements |
 
 Goldens are artifacts and stay outside Git; each run writes a sha256 into
 `OUTDIR/manifest.json` alongside the oracle build and model identity.
