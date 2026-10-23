@@ -10,7 +10,7 @@ in `libllama.so`, against the pinned artifact
 | Tool | Purpose |
 | --- | --- |
 | `oracle_server.sh [cpu\|gpu]` | Pinned oracle server, port 8098. `cpu` uses `--device none` (no GPU) and is enough for tokenize/template goldens; `gpu` full-offloads for logit dumps and G4 identity |
-| `corpus.py OUTDIR [--probe]` | Deterministic F-H2 corpus: 2 700 cases in nine classes, plus the G3 depth probes (32 / 600 / 4096 / 16384 tokens; 600 sits just past the 513 window) |
+| `corpus.py OUTDIR [--probe]` | Deterministic F-H2 corpus: 2 700 cases in nine classes, plus the G3 depth probes (64 / 600 / 4096 / 16384 nominal tokens; 600 sits just past the 513 window) |
 | `golden.py tokenize OUTDIR` | M0.6: `/tokenize` goldens for the whole corpus, `add_special` true and false |
 | `golden.py template OUTDIR` | M0.7: `/apply-template` goldens for the G2 fixtures (roles, reasoning, tools, malformed calls, escaping) |
 | `golden.py compare A.json B.json` | Token-id diff of two goldens; reports the first divergence with context |

@@ -9,9 +9,10 @@ Classes and counts (F-H2):
   ascii 500 / code 500 / cjk 300 / mixed 200 / numeric 200
   contraction 300 / whitespace 300 / tool_xml 200 / long 200
 
-Probe depths for the logit oracle (G3): 32 / 600 / 4096 / 16384 tokens.
-600 sits just past the 513 sliding window; 4096 and 16384 exercise
-window wrap-around at depth.
+Probe depths for the logit oracle (G3): 64 / 600 / 4096 / 16384 tokens (nominal -
+perplexity requires inputs of at least 2x context, so the actual count comes from
+/tokenize at dump time and the context is sized to n/2). 600 sits just past the
+513 sliding window; 4096 and 16384 exercise window wrap-around at depth.
 
 Usage:
   python3 tools/flint/corpus.py OUTDIR            # writes corpus.jsonl
@@ -37,7 +38,7 @@ COUNTS = {
     "long": 200,
 }
 
-PROBE_DEPTHS = (32, 600, 4096, 16384)
+PROBE_DEPTHS = (64, 600, 4096, 16384)
 
 ASCII_WORDS = (
     "alpha bravo charlie delta echo foxtrot hotel india juliet kilo lima"
@@ -192,9 +193,14 @@ _PROBE_SENTENCES = (
 
 
 def probe_text(depth):
-    """Filler text intended to reach roughly `depth` tokens (~1.4 chars/token)."""
+    """Filler text intended to reach roughly `depth` tokens.
+
+    English-heavy BPE runs ~5 chars/token on this mix; generate 10% extra
+    so the actual count lands at or above the nominal depth. The exact
+    count comes from /tokenize at dump time.
+    """
     rng = random.Random(SEED + depth)
-    n_chars = int(depth * 1.47)
+    n_chars = int(depth * 5.0 * 1.10)
     out = []
     size = 0
     i = 0
