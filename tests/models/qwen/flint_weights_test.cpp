@@ -5,8 +5,10 @@
 // The real-artifact walk (F-C3) runs when GUFO_FLINT_GGUF points at the
 // pinned flint GGUF; it mmaps the header only, so it costs no copies.
 
+#include "src/models/qwen/flint_forward.hpp"
 #include "src/models/qwen/state.hpp"
 
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -410,6 +412,44 @@ void TestScratchArenaHasNoSsmState() {
   std::cout << "TestScratchArenaHasNoSsmState ok\n";
 }
 
+// F-D5 CPU reference: the fixture model runs a token through every layer
+// (dense + MoE, windowed + global, rope + NoPE) and produces finite,
+// deterministic logits.
+void TestForwardModelSmoke() {
+  const auto bytes = BuildFlintFixture();
+  std::unique_ptr<gufo::core::GgufReader> reader;
+  std::string err;
+  auto* r = OpenFixture(bytes, reader, err);
+  Expect(r != nullptr, "fixture opens");
+  std::string load_err;
+  const auto weights =
+      gufo::models::FlintModelWeights::LoadFromGguf(*r, &load_err);
+  Expect(weights.has_value(), "loads: " + load_err);
+
+  gufo::models::QwenKvCache kv(kLayers, kKvHeads, 1024, kHeadDim);
+  gufo::models::FlintScratchArena arena(weights->config);
+  std::vector<float> logits(kVocab, 0.0F);
+
+  gufo::models::FlintForwardModel(0, 0, *weights, kv, arena, logits);
+  for (const float v : logits) {
+    Expect(std::isfinite(v), "logits finite at pos 0");
+  }
+  const std::vector<float> first_logits = logits;
+  // Second token extends the KV; still finite.
+  gufo::models::FlintForwardModel(5, 1, *weights, kv, arena, logits);
+  for (const float v : logits) {
+    Expect(std::isfinite(v), "logits finite at pos 1");
+  }
+  // A fresh replay of the same first token reproduces it bit-exactly.
+  std::vector<float> logits_again(kVocab, 0.0F);
+  gufo::models::QwenKvCache kv2(kLayers, kKvHeads, 1024, kHeadDim);
+  gufo::models::FlintScratchArena arena2(weights->config);
+  gufo::models::FlintForwardModel(0, 0, *weights, kv2, arena2, logits_again);
+  Expect(logits_again == first_logits,
+         "deterministic across identical replays");
+  std::cout << "TestForwardModelSmoke ok\n";
+}
+
 // F-C3: walk the pinned artifact's real header. Header-only mmap; runs
 // wherever GUFO_FLINT_GGUF is set (skipped elsewhere).
 void TestRealArtifactInventory() {
@@ -493,6 +533,7 @@ int main() {
   TestQwenRuntimeRefusesFlint();
   TestScratchArenaHasNoSsmState();
   TestFlintOptionGate();
+  TestForwardModelSmoke();
   TestRealArtifactInventory();
   std::cout << "flint_weights_test: all tests passed\n";
   return 0;

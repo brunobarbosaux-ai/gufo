@@ -9,6 +9,7 @@ target_sources(gufo_core PRIVATE
   ${PROJECT_SOURCE_DIR}/src/models/qwen/weights.cpp
   ${PROJECT_SOURCE_DIR}/src/models/qwen/ssm.cpp
   ${PROJECT_SOURCE_DIR}/src/models/qwen/forward.cpp
+  ${PROJECT_SOURCE_DIR}/src/models/qwen/flint_forward.cpp
   ${PROJECT_SOURCE_DIR}/src/models/qwen/modules/attention.cpp
   ${PROJECT_SOURCE_DIR}/src/models/qwen/modules/embed.cpp
   ${PROJECT_SOURCE_DIR}/src/models/qwen/modules/ffn.cpp

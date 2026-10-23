@@ -309,7 +309,12 @@ struct FlintScratchArena {
   /// Full sequence scores: global layers attend over every position, so
   /// this is sized to the context, not the window.
   std::span<float> attn_scores;
+  /// Attention context (num_heads * head_dim), pre-O-projection. Flint's
+  /// attention size (4096) exceeds the hidden size, so this is not the
+  /// hidden-width buffer the qwen arena uses.
   std::span<float> attn_out;
+  /// Post-O-projection activation (hidden width), fed to the residual add.
+  std::span<float> attn_proj;
   /// Sigmoid router logits and the renormalised top-k weights (F-E1).
   std::span<float> router_probs;
   std::span<float> expert_gate;
@@ -318,6 +323,9 @@ struct FlintScratchArena {
   std::span<float> shared_gate;
   std::span<float> shared_up;
   std::span<float> shared_act;
+  /// Per-expert down-projection output (hidden width), accumulated into
+  /// mlp_out with the renormalised routing weight.
+  std::span<float> expert_out;
   std::span<float> mlp_out;
   std::span<float> logits;
 };

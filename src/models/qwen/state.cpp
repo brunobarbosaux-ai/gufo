@@ -127,9 +127,9 @@ FlintScratchArena::FlintScratchArena(const core::ModelConfig& config) {
       std::max(expert_ff, shared_ff));
 
   const std::size_t total_size =
-      (hidden_size * 4) + q_size + (kv_size * 2) + max_context +
-      expert_count + (dense_ff * 3) + (shared_ff * 3) + hidden_size +
-      vocab_size;
+      (hidden_size * 4) + q_size + (kv_size * 2) + max_context + (q_size +
+      hidden_size) + expert_count + (dense_ff * 3) + (shared_ff * 3) +
+      (hidden_size * 2) + vocab_size;
   buffer.resize(total_size, 0.0F);
 
   std::size_t cur = 0;
@@ -145,7 +145,8 @@ FlintScratchArena::FlintScratchArena(const core::ModelConfig& config) {
   k = alloc_span(kv_size);
   v = alloc_span(kv_size);
   attn_scores = alloc_span(max_context);
-  attn_out = alloc_span(hidden_size);
+  attn_out = alloc_span(q_size);
+  attn_proj = alloc_span(hidden_size);
   router_probs = alloc_span(expert_count);
   expert_gate = alloc_span(dense_ff);
   expert_up = alloc_span(dense_ff);
@@ -153,6 +154,7 @@ FlintScratchArena::FlintScratchArena(const core::ModelConfig& config) {
   shared_gate = alloc_span(shared_ff);
   shared_up = alloc_span(shared_ff);
   shared_act = alloc_span(shared_ff);
+  expert_out = alloc_span(hidden_size);
   mlp_out = alloc_span(hidden_size);
   logits = alloc_span(vocab_size);
 }
