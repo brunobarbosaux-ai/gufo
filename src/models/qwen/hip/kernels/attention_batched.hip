@@ -79,8 +79,8 @@ __global__ void BatchedAttentionKernel(
     const __half* __restrict__ v_cache_f16, float* __restrict__ out_context,
     hip_bfloat16* __restrict__ out_context_bf16, std::uint32_t layer_idx,
     std::uint32_t start_pos, std::size_t batch_size, std::uint32_t max_context,
-    std::uint32_t num_heads, std::uint32_t num_kv_heads,
-    std::uint32_t head_dim) {
+    std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t head_dim,
+    detail::FlintKernelPolicy policy) {
   const std::uint32_t h = blockIdx.x;
   const std::uint32_t t = blockIdx.y;
   if (h >= num_heads || t >= batch_size) {
@@ -99,17 +99,26 @@ __global__ void BatchedAttentionKernel(
 
   const std::uint32_t cur_pos = start_pos + static_cast<std::uint32_t>(t);
   const std::size_t seq_len = static_cast<std::size_t>(cur_pos) + 1;
+  // F-D2: window-bounded key range with relative score indexing.
+  const std::size_t p_begin = (policy.window != 0 && seq_len > policy.window)
+                                  ? seq_len - policy.window
+                                  : 0;
+  const std::size_t span = seq_len - p_begin;
+  // F-D1: sink joins max and denominator, contributes no value.
+  const bool has_sink = policy.sinks != nullptr;
+  const float sink = has_sink ? policy.sinks[h] : 0.0F;
   const float* q_h =
       q + (t * num_heads * head_dim) + (static_cast<std::size_t>(h) * head_dim);
 
   const auto* q_h_vec = reinterpret_cast<const float4*>(q_h);
   const std::size_t num_vec = head_dim / 4;
   constexpr std::size_t wave_dot_min_sequence = 64;
-  if (seq_len >= wave_dot_min_sequence) {
+  if (span >= wave_dot_min_sequence) {
     const std::size_t lane_id = tid & 31U;
     const std::size_t wave_id = tid >> 5U;
     const std::size_t waves_per_block = blockDim.x >> 5U;
-    for (std::size_t p = wave_id; p < seq_len; p += waves_per_block) {
+    for (std::size_t rel = wave_id; rel < span; rel += waves_per_block) {
+      const std::size_t p = p_begin + rel;
       const std::size_t p_offset =
           (((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) *
                 max_context +
@@ -135,11 +144,12 @@ __global__ void BatchedAttentionKernel(
         dot += __shfl_xor(dot, offset);
       }
       if (lane_id == 0) {
-        s_scores[p] = dot * scale;
+        s_scores[rel] = dot * scale;
       }
     }
   } else {
-    for (std::size_t p = tid; p < seq_len; p += blockDim.x) {
+    for (std::size_t rel = tid; rel < span; rel += blockDim.x) {
+      const std::size_t p = p_begin + rel;
       const std::size_t p_offset =
           (((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) *
                 max_context +
@@ -161,14 +171,14 @@ __global__ void BatchedAttentionKernel(
             use_f16_cache ? LoadBatchedHalf4(k_p_f16 + (d * 4)) : k_p_vec[d];
         dot += (qv.x * kv.x) + (qv.y * kv.y) + (qv.z * kv.z) + (qv.w * kv.w);
       }
-      s_scores[p] = dot * scale;
+      s_scores[rel] = dot * scale;
     }
   }
   __syncthreads();
 
   // Step 2: Softmax
   float local_max = -1e30F;
-  for (std::size_t p = tid; p < seq_len; p += blockDim.x) {
+  for (std::size_t p = tid; p < span; p += blockDim.x) {
     local_max = fmaxf(local_max, s_scores[p]);
   }
   s_scratch[tid] = local_max;
@@ -179,14 +189,20 @@ __global__ void BatchedAttentionKernel(
     }
     __syncthreads();
   }
-  const float max_score = s_scratch[0];
+  float max_score = s_scratch[0];
+  if (has_sink) {
+    max_score = fmaxf(max_score, sink);
+  }
   __syncthreads();
 
   float local_sum = 0.0F;
-  for (std::size_t p = tid; p < seq_len; p += blockDim.x) {
+  for (std::size_t p = tid; p < span; p += blockDim.x) {
     const float e = expf(s_scores[p] - max_score);
     s_scores[p] = e;
     local_sum += e;
+  }
+  if (has_sink && tid == 0) {
+    local_sum += expf(sink - max_score);
   }
   s_scratch[tid] = local_sum;
   __syncthreads();
@@ -199,7 +215,7 @@ __global__ void BatchedAttentionKernel(
   const float inv_sum_exp = 1.0F / (s_scratch[0] + 1e-9F);
   __syncthreads();
 
-  for (std::size_t p = tid; p < seq_len; p += blockDim.x) {
+  for (std::size_t p = tid; p < span; p += blockDim.x) {
     s_scores[p] *= inv_sum_exp;
   }
   __syncthreads();
@@ -207,7 +223,7 @@ __global__ void BatchedAttentionKernel(
   // Step 3: Weighted sum of V
   if (tid < head_dim) {
     float ctx = 0.0F;
-    for (std::size_t p = 0; p < seq_len; ++p) {
+    for (std::size_t p = p_begin; p < seq_len; ++p) {
       const std::size_t p_offset =
           (((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) *
                 max_context +
@@ -218,9 +234,10 @@ __global__ void BatchedAttentionKernel(
             ((static_cast<std::size_t>(layer_idx) * max_context + p) *
              kv_width) +
             (static_cast<std::size_t>(kv_h) * head_dim);
-        ctx += s_scores[p] * __half2float(v_cache_f16[p_offset_f16 + tid]);
+        ctx +=
+            s_scores[p - p_begin] * __half2float(v_cache_f16[p_offset_f16 + tid]);
       } else {
-        ctx += s_scores[p] * v_cache[p_offset + tid];
+        ctx += s_scores[p - p_begin] * v_cache[p_offset + tid];
       }
     }
 
@@ -249,10 +266,21 @@ void LaunchBatchedAttention(const float* q, const float* k, const float* v,
                             std::uint32_t max_context, std::uint32_t num_heads,
                             std::uint32_t num_kv_heads, std::uint32_t head_dim,
                             hipStream_t stream, bool skip_kv_write,
-                            void* out_context_bf16) {
+                            void* out_context_bf16,
+                            const detail::FlintKernelPolicy* policy) {
+  const detail::FlintKernelPolicy kNoPolicy{nullptr, 0};
+  const detail::FlintKernelPolicy flint =
+      policy != nullptr ? *policy : kNoPolicy;
   const std::size_t max_seq_len =
       static_cast<std::size_t>(start_pos) + batch_size;
-  const bool online = !detail::BatchedAttentionScoresFitLds(max_seq_len);
+  // The window bounds the visible score row, so a windowed policy always
+  // fits the LDS budget; without one the row covers the full context.
+  const std::size_t max_span =
+      (flint.window != 0 && max_seq_len < flint.window) ? max_seq_len
+                                                        : flint.window;
+  const std::size_t score_span =
+      max_span != 0 ? max_span : max_seq_len;
+  const bool online = !detail::BatchedAttentionScoresFitLds(score_span);
   if (online && (head_dim != 256 || num_heads == 0 || num_kv_heads == 0 ||
                  num_heads % num_kv_heads != 0))
     throw std::invalid_argument(
@@ -271,19 +299,19 @@ void LaunchBatchedAttention(const float* q, const float* k, const float* v,
     LaunchCausalDecodeAttention(q, gate, k_cache, v_cache, k_cache_f16,
                                 v_cache_f16, out_context, layer_idx, start_pos,
                                 batch_size, max_context, num_heads,
-                                num_kv_heads, head_dim, stream);
+                                num_kv_heads, head_dim, stream, {}, policy);
     if (out_context_bf16 != nullptr)
       LaunchFloatToBfloat16(out_context, out_context_bf16,
                             batch_size * num_heads * head_dim, stream);
     return;
   }
   const dim3 attn_grid(num_heads, static_cast<unsigned int>(batch_size));
-  const std::size_t shared_scores_bytes = max_seq_len * sizeof(float);
+  const std::size_t shared_scores_bytes = score_span * sizeof(float);
   BatchedAttentionKernel<<<attn_grid, 256, shared_scores_bytes, stream>>>(
       q, gate, k_cache, v_cache, static_cast<const __half*>(k_cache_f16),
       static_cast<const __half*>(v_cache_f16), out_context,
       static_cast<hip_bfloat16*>(out_context_bf16), layer_idx, start_pos,
-      batch_size, max_context, num_heads, num_kv_heads, head_dim);
+      batch_size, max_context, num_heads, num_kv_heads, head_dim, flint);
 }
 
 __global__ void CausalSoftmaxKernel(float* __restrict__ scores,

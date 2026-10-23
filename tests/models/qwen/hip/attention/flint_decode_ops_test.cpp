@@ -365,6 +365,82 @@ void TestCausalDecodeBatchWithPolicy() {
   std::cout << "  causal decode batch with policy ok\n";
 }
 
+// Batched prefill with a policy: every token attends causally to its own
+// window-bounded prefix with the per-head sink in the denominator.
+void TestBatchedPrefillSinksWindow() {
+  const auto q_full = MakeQ();
+  const auto sinks = MakeSinks();
+  constexpr std::uint32_t kBatch = 5;
+  const std::uint32_t start_pos = 500;
+  const std::size_t seq_end = start_pos + kBatch;
+  const std::size_t begin = seq_end > kWindow ? seq_end - kWindow : 0;
+  const auto kv = MakeKv(static_cast<std::uint32_t>(begin));
+  auto cache = UploadCaches(kv);
+
+  // One prompt chunk: every token row uses the same q pattern scaled by
+  // its index so rows differ.
+  std::vector<float> q_rows(kBatch * kHeads * kHeadDim);
+  for (std::uint32_t t = 0; t < kBatch; ++t) {
+    for (std::size_t i = 0; i < q_full.size(); ++i) {
+      q_rows[t * q_full.size() + i] = q_full[i] * (1.0F + 0.05F * t);
+    }
+  }
+
+  float* d_q = nullptr;
+  float* d_out = nullptr;
+  float* d_sinks = nullptr;
+  HIP_CHECK(hipMalloc(&d_q, q_rows.size() * sizeof(float)));
+  HIP_CHECK(hipMemcpy(d_q, q_rows.data(), q_rows.size() * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMalloc(&d_out, q_rows.size() * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_sinks, kHeads * sizeof(float)));
+  HIP_CHECK(hipMemcpy(d_sinks, sinks.data(), kHeads * sizeof(float),
+                      hipMemcpyHostToDevice));
+
+  FlintKernelPolicy policy{d_sinks, kWindow};
+  // fp32 cache
+  gufo::hip::LaunchBatchedAttention(
+      d_q, nullptr, nullptr, nullptr, cache.d_k32, cache.d_v32, nullptr,
+      nullptr, d_out, kLayer, start_pos, kBatch, kMaxContext, kHeads, kKvHeads,
+      kHeadDim, nullptr, true, nullptr, &policy);
+  std::vector<float> out(q_rows.size());
+  HIP_CHECK(hipMemcpy(out.data(), d_out, q_rows.size() * sizeof(float),
+                      hipMemcpyDeviceToHost));
+  for (std::uint32_t t = 0; t < kBatch; ++t) {
+    const std::vector<float> row_q(q_rows.begin() + t * q_full.size(),
+                                   q_rows.begin() + (t + 1) * q_full.size());
+    std::vector<float> expected;
+    Reference(row_q, kv, false, sinks.data(), kWindow, start_pos + t,
+              expected);
+    const std::vector<float> actual(out.begin() + t * q_full.size(),
+                                    out.begin() + (t + 1) * q_full.size());
+    CheckClose(expected, actual, 2.0e-4F, "batched prefill row");
+  }
+
+  // f16 cache
+  gufo::hip::LaunchBatchedAttention(
+      d_q, nullptr, nullptr, nullptr, nullptr, nullptr, cache.d_k16,
+      cache.d_v16, d_out, kLayer, start_pos, kBatch, kMaxContext, kHeads,
+      kKvHeads, kHeadDim, nullptr, true, nullptr, &policy);
+  HIP_CHECK(hipMemcpy(out.data(), d_out, q_rows.size() * sizeof(float),
+                      hipMemcpyDeviceToHost));
+  for (std::uint32_t t = 0; t < kBatch; ++t) {
+    const std::vector<float> row_q(q_rows.begin() + t * q_full.size(),
+                                   q_rows.begin() + (t + 1) * q_full.size());
+    std::vector<float> expected;
+    Reference(row_q, kv, true, sinks.data(), kWindow, start_pos + t, expected);
+    const std::vector<float> actual(out.begin() + t * q_full.size(),
+                                    out.begin() + (t + 1) * q_full.size());
+    CheckClose(expected, actual, 4.0e-2F, "batched prefill row [f16 cache]");
+  }
+
+  hipFree(d_q);
+  hipFree(d_out);
+  hipFree(d_sinks);
+  FreeCache(cache);
+  std::cout << "  batched prefill sinks/window ok\n";
+}
+
 }  // namespace
 #endif  // defined(ENGINE_ENABLE_HIP)
 
@@ -378,6 +454,7 @@ int main() {
   }
   TestSinksAndWindow();
   TestCausalDecodeBatchWithPolicy();
+  TestBatchedPrefillSinksWindow();
   std::cout << "Flint decode ops test passed on gfx1151.\n";
   return 0;
 #else

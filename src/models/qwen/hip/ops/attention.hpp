@@ -89,6 +89,8 @@ void LaunchFusedQKNormRoPEKvWrite(
 /// written as BF16, which saves the caller a conversion launch when the next
 /// projection consumes BF16. Score rows exceeding the gfx1151 LDS budget
 /// use bounded online attention for supported 256-element GQA heads.
+/// `policy`, when non-null, applies flint per-head sinks and the sliding
+/// window (F-D1/F-D2); the window also bounds the LDS score row.
 void LaunchBatchedAttention(const float* q, const float* k, const float* v,
                             const float* gate, float* k_cache, float* v_cache,
                             void* k_cache_f16, void* v_cache_f16,
@@ -98,7 +100,8 @@ void LaunchBatchedAttention(const float* q, const float* k, const float* v,
                             std::uint32_t num_kv_heads, std::uint32_t head_dim,
                             hipStream_t stream = nullptr,
                             bool skip_kv_write = false,
-                            void* out_context_bf16 = nullptr);
+                            void* out_context_bf16 = nullptr,
+                            const detail::FlintKernelPolicy* policy = nullptr);
 
 /// Batched fuse of per-head Q/K RMSNorm, RoPE, and the KV-cache write across B
 /// tokens into one launch (opt-c010-qk-rope-kv). Writes the normed+roped Q into
