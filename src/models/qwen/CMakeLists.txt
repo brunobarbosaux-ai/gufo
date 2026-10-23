@@ -76,7 +76,9 @@ if (ENGINE_ENABLE_HIP)
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/batched_decode.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/decode.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/decode_step.cpp
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/detail/weight_regions.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/flint_decode_step.cpp
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/flint_gpu_model.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/executor.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/model_loader.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/prefill.cpp
