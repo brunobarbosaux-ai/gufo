@@ -389,6 +389,17 @@ std::optional<FlintModelWeights> FlintModelWeights::LoadFromGguf(
 
   FlintModelWeights weights;
   weights.config = *config_opt;
+  // The MoE top-k selection (FlintMoE) keeps its running set in fixed
+  // size-8 scratch; reject configs that would overflow it. Finding 13.
+  if (weights.config.expert_used_count == 0 ||
+      weights.config.expert_used_count > 8) {
+    if (error_msg != nullptr) {
+      *error_msg =
+          "flint expert_used_count must be in 1..8, found: " +
+          std::to_string(weights.config.expert_used_count);
+    }
+    return std::nullopt;
+  }
 
   const std::size_t hidden_size = weights.config.hidden_size;
   const std::size_t vocab_size = weights.config.vocab_size;

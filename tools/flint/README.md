@@ -18,6 +18,9 @@ in `libllama.so`, against the pinned artifact
 | `compare_dumps.py A.f32 B.f32` | G3 comparator skeleton: dequantises two dumps and reports max \|Δ log p\| (head), cosine min/mean, argmax agreement, floor disagreements |
 | `g1_cases.py GOLDEN.json OUT.bin` | Joins the regenerated corpus with the golden ids into the packed G1 case file (refuses to write if any case id drifts) |
 | `tokenizer_probe.cpp` | G1 probe: loads the GGUF tokenizer and compares to the golden (`MODEL.gguf CASES.bin`), or encodes one string (`MODEL.gguf --text TEXT`); exits 1 on any mismatch |
+| `template_probe.cpp` + `g2_cases.py` | G2 probe: renders the 12 template fixtures through `FlintChatTemplate` and compares bytes + token ids to the golden |
+| `flint_cpu_logit.cpp` | D4 CPU reference dump: runs the flint CPU forward over a probe text and writes vocab-wide f32 log-prob rows (`MODEL.gguf PROBE.txt OUT.raw [--max N]`) |
+| `compare_cpu_reference.py ORACLE.f32 GUFO.raw` | D4 validation: oracle chunk-0 rows (full prefix) vs the CPU reference rows; argmax agreement + cosine + max \|Δ log p\| at cross-implementation tolerance (§17.9) |
 
 Goldens are artifacts and stay outside Git; each run writes a sha256 into
 `OUTDIR/manifest.json` alongside the oracle build and model identity.

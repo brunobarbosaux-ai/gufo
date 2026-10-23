@@ -70,7 +70,7 @@ void FlintMoeForward(std::span<const float> x, const FlintLayerWeights& layer,
   // so the choice is deterministic. (Oracle tie-break confirmed at G3.)
   std::uint32_t selected[8] = {0, 0, 0, 0, 0, 0, 0, 0};
   float selected_weight[8] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
-  for (std::size_t e = 0; e < expert_count && e < 8; ++e) {
+  for (std::size_t e = 0; e < expert_count; ++e) {
     if (e < used) {
       selected[e] = static_cast<std::uint32_t>(e);
       selected_weight[e] = arena.router_probs[e];
