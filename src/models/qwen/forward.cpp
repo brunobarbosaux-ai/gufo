@@ -11,6 +11,7 @@
 
 #include "src/core/quant/ggml_dequant.hpp"
 #include "src/core/quant/ggml_gemm.hpp"
+#include "src/models/qwen/flint_attention.hpp"
 #include "src/models/qwen/gemm_route.hpp"
 #include "src/models/qwen/modules/attention.hpp"
 #include "src/models/qwen/modules/embed.hpp"
@@ -246,6 +247,67 @@ void ForwardAttention(std::span<const float> q, std::span<const float> k,
   } else {
     std::copy_n(context.data(), std::min(hidden_size, ctx_dim),
                 attn_out.data());
+  }
+}
+
+void FlintAttentionReference(const FlintAttentionPolicy& policy,
+                             const float* q, const QwenKvCache& kv,
+                             std::uint32_t layer, std::uint32_t pos,
+                             float* attn_scores_scratch,
+                             float* out) noexcept {
+  const std::uint32_t num_heads = policy.num_heads;
+  const std::uint32_t num_kv_heads = policy.num_kv_heads;
+  const std::uint32_t head_dim = policy.head_dim;
+  const std::uint32_t range_start = policy.KeyRangeStart(pos);
+  const std::size_t seq_len = static_cast<std::size_t>(pos) - range_start + 1;
+  const std::uint32_t group_size =
+      num_kv_heads > 0 ? num_heads / num_kv_heads : 1;
+  const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
+
+  for (std::uint32_t h = 0; h < num_heads; ++h) {
+    const std::uint32_t kv_h = h / group_size;
+    const float* const q_head = q + static_cast<std::size_t>(h) * head_dim;
+
+    // F-D6 order: scale -> sink -> softmax -> weighted sum. The sink logit
+    // seeds the running max and joins the denominator; it contributes no
+    // value vector (the ds4 sink pattern, llama.cpp flint semantics).
+    float max_score = policy.sinks != nullptr ? policy.sinks[h] : -1e30F;
+    for (std::size_t p = 0; p < seq_len; ++p) {
+      const auto k_p = kv.GetKeySlice(layer, kv_h, range_start + p);
+      double dot = 0.0;
+      for (std::size_t d = 0; d < head_dim; ++d) {
+        dot += static_cast<double>(q_head[d]) * static_cast<double>(k_p[d]);
+      }
+      const auto score = static_cast<float>(dot * scale);
+      attn_scores_scratch[p] = score;
+      max_score = std::max(score, max_score);
+    }
+
+    double sum_exp =
+        policy.sinks != nullptr
+            ? std::exp(static_cast<double>(policy.sinks[h] - max_score))
+            : 0.0;
+    for (std::size_t p = 0; p < seq_len; ++p) {
+      sum_exp +=
+          std::exp(static_cast<double>(attn_scores_scratch[p] - max_score));
+    }
+    const double inv_sum = 1.0 / sum_exp;
+
+    float* const out_head = out + static_cast<std::size_t>(h) * head_dim;
+    for (std::size_t d = 0; d < head_dim; ++d) {
+      out_head[d] = 0.0F;
+    }
+    for (std::size_t p = 0; p < seq_len; ++p) {
+      const auto v_p = kv.GetValueSlice(layer, kv_h, range_start + p);
+      const double weight =
+          std::exp(static_cast<double>(attn_scores_scratch[p] - max_score)) *
+          inv_sum;
+      for (std::size_t d = 0; d < head_dim; ++d) {
+        out_head[d] =
+            static_cast<float>(static_cast<double>(out_head[d]) +
+                               (weight * static_cast<double>(v_p[d])));
+      }
+    }
   }
 }
 
