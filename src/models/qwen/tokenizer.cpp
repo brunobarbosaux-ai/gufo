@@ -326,6 +326,204 @@ std::size_t Qwen35PieceEnd(std::string_view text, std::size_t offset) {
   return offset + first.length;
 }
 
+// --- Flint pre-tokenizer (F-F1) -------------------------------------------
+// The reference runs three regexes in sequence over every piece:
+//   1. \p{N}{1,3}
+//   2. [一-龥぀-ゟ゠-ヿ]+
+//   3. [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*
+//        [\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?:'s|'t|'re|'ve|'m|'ll|'d)?
+//     |[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+
+//        [\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?:'s|'t|'re|'ve|'m|'ll|'d)?
+//     | ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+// llama.cpp evaluates them with std::regex over a category-collapsed byte
+// string. In that collapse \p{Lu}, \p{Ll}, \p{Lt}, \p{Lm} and \p{Lo} all map
+// to the single LETTER byte (k_ucat_enum), which makes the two word
+// alternatives above identical: a case transition never splits a word. The
+// word alternative is therefore "optional non-letter/non-number prefix, then
+// a maximal letter-or-mark run, then an optional contraction", and the
+// predicates below encode the collapsed categories with ICU.
+
+bool IsPunctuationOrSymbol(UChar32 value) noexcept {
+  return (U_GET_GC_MASK(value) & (U_GC_P_MASK | U_GC_S_MASK)) != 0;
+}
+
+bool IsFlintCjkCodePoint(UChar32 value) noexcept {
+  return (value >= 0x4E00 && value <= 0x9FA5) ||  // 一-龥
+         (value >= 0x3040 && value <= 0x309F) ||  // ぀-ゟ
+         (value >= 0x30A0 && value <= 0x30FF);    // ゠-ヿ
+}
+
+/// `\p{N}{1,3}`: a number run of at most three code points.
+std::size_t FlintNumberEnd(std::string_view text, std::size_t offset) {
+  const Utf8CodePoint first = DecodeUtf8(text, offset);
+  if (!IsUnicodeNumber(first.value)) {
+    return offset;
+  }
+  std::size_t end = offset + first.length;
+  int count = 1;
+  while (count < 3 && end < text.size()) {
+    const Utf8CodePoint next = DecodeUtf8(text, end);
+    if (!IsUnicodeNumber(next.value)) {
+      break;
+    }
+    end += next.length;
+    ++count;
+  }
+  return end;
+}
+
+/// `[一-龥぀-ゟ゠-ヿ]+`: a maximal CJK run.
+std::size_t FlintCjkEnd(std::string_view text, std::size_t offset) {
+  const Utf8CodePoint first = DecodeUtf8(text, offset);
+  if (!IsFlintCjkCodePoint(first.value)) {
+    return offset;
+  }
+  std::size_t end = offset + first.length;
+  while (end < text.size()) {
+    const Utf8CodePoint next = DecodeUtf8(text, end);
+    if (!IsFlintCjkCodePoint(next.value)) {
+      break;
+    }
+    end += next.length;
+  }
+  return end;
+}
+
+/// Rule 3 of the flint pre-tokenizer. Returns `offset` when no alternative
+/// matches there; the splitter then treats the code point as unmatched text.
+std::size_t FlintPieceEnd(std::string_view text, std::size_t offset) {
+  const Utf8CodePoint first = DecodeUtf8(text, offset);
+
+  // Word alternative: an optional single non-letter/non-number prefix, then a
+  // maximal letter-or-mark run, then an optional contraction.
+  {
+    std::size_t start = offset;
+    if (!IsNewline(first.value) && !IsUnicodeLetter(first.value) &&
+        !IsUnicodeNumber(first.value)) {
+      start = offset + first.length;
+    }
+    std::size_t end = start;
+    while (end < text.size()) {
+      const Utf8CodePoint next = DecodeUtf8(text, end);
+      if (!IsUnicodeLetterOrMark(next.value)) {
+        break;
+      }
+      end += next.length;
+    }
+    if (end > start) {
+      if (end < text.size()) {
+        const std::size_t contraction = Qwen35ContractionEnd(text, end);
+        if (contraction != end) {
+          end = contraction;
+        }
+      }
+      return end;
+    }
+  }
+
+  // Alternative 3: optional space, then a punctuation/symbol run and any
+  // trailing newlines.
+  {
+    std::size_t punct_start = offset;
+    if (first.value == ' ' && offset + first.length < text.size()) {
+      const Utf8CodePoint next = DecodeUtf8(text, offset + first.length);
+      if (IsPunctuationOrSymbol(next.value)) {
+        punct_start = offset + first.length;
+      }
+    }
+    if (punct_start < text.size() &&
+        IsPunctuationOrSymbol(DecodeUtf8(text, punct_start).value)) {
+      std::size_t end = punct_start;
+      while (end < text.size()) {
+        const Utf8CodePoint next = DecodeUtf8(text, end);
+        if (!IsPunctuationOrSymbol(next.value)) {
+          break;
+        }
+        end += next.length;
+      }
+      while (end < text.size()) {
+        const Utf8CodePoint next = DecodeUtf8(text, end);
+        if (!IsNewline(next.value)) {
+          break;
+        }
+        end += next.length;
+      }
+      return end;
+    }
+  }
+
+  if (IsUnicodeWhitespace(first.value)) {
+    // Alternatives 4-6, in order: whitespace ending in a newline run, then
+    // trailing whitespace, then any whitespace run.
+    std::size_t end = offset;
+    std::size_t last_newline_end = offset;
+    std::size_t last_start = offset;
+    while (end < text.size()) {
+      const Utf8CodePoint next = DecodeUtf8(text, end);
+      if (!IsUnicodeWhitespace(next.value)) {
+        break;
+      }
+      last_start = end;
+      end += next.length;
+      if (IsNewline(next.value)) {
+        last_newline_end = end;
+      }
+    }
+    if (last_newline_end != offset) {
+      // `\s*[\r\n]+`: consume the run of newlines that ends the last
+      // newline-bearing stretch of whitespace.
+      std::size_t newline_end = last_newline_end;
+      while (newline_end < text.size()) {
+        const Utf8CodePoint next = DecodeUtf8(text, newline_end);
+        if (!IsNewline(next.value)) {
+          break;
+        }
+        newline_end += next.length;
+      }
+      return newline_end;
+    }
+    if (end < text.size()) {
+      // `\s+(?!\S)` backtracks one code point when non-whitespace follows so
+      // the next piece can own its prefix; a single whitespace code point
+      // falls through to `\s+`.
+      return last_start > offset ? last_start : end;
+    }
+    return end;
+  }
+
+  return offset;
+}
+
+/// Applies one regex rule to every piece, mirroring std::regex_iterator:
+/// unmatched gaps and matches are emitted left to right.
+template<typename EndFn>
+std::vector<std::string_view> SplitPiecesByRule(
+    const std::vector<std::string_view>& pieces, EndFn end_fn) {
+  std::vector<std::string_view> out;
+  for (const std::string_view piece : pieces) {
+    std::size_t pos = 0;
+    while (pos < piece.size()) {
+      std::size_t match = pos;
+      while (match < piece.size() && end_fn(piece, match) == match) {
+        match += DecodeUtf8(piece, match).length;
+      }
+      if (match >= piece.size()) {
+        if (match > pos) {
+          out.push_back(piece.substr(pos));
+        }
+        break;
+      }
+      if (match > pos) {
+        out.push_back(piece.substr(pos, match - pos));
+      }
+      const std::size_t end = end_fn(piece, match);
+      out.push_back(piece.substr(match, end - match));
+      pos = end;
+    }
+  }
+  return out;
+}
+
 }  // namespace
 
 std::unique_ptr<QwenTokenizer> QwenTokenizer::CreateFromGguf(
@@ -369,14 +567,33 @@ std::unique_ptr<QwenTokenizer> QwenTokenizer::CreateFromGguf(
     }
   }
 
+  const auto tokenizer_pre = reader.GetMetadataString("tokenizer.ggml.pre");
+  const bool is_flint =
+      tokenizer_pre == std::optional<std::string_view>{"flint"};
+  if (is_flint) {
+    // F-F3: flint's special set is the vocabulary's own control, user-defined
+    // and unknown token types — 144 entries in the 40B artifact, including the
+    // `<arg_key>`-style tool markers a text heuristic would miss.
+    special_tokens.clear();
+    const auto token_types =
+        reader.GetMetadataIntArray("tokenizer.ggml.token_type");
+    for (std::size_t i = 0; i < tokens.size() && i < token_types.size(); ++i) {
+      // GGUF token types: 2 = unknown, 3 = control, 4 = user-defined.
+      if (token_types[i] == 2 || token_types[i] == 3 || token_types[i] == 4) {
+        special_tokens[tokens[i]] = static_cast<TokenId>(i);
+      }
+    }
+  }
+
   auto tokenizer =
       CreateFromVocabulary(tokens, merges, special_tokens, error_msg);
   if (tokenizer == nullptr) {
     return nullptr;
   }
-  if (reader.GetMetadataString("tokenizer.ggml.pre") ==
-      std::optional<std::string_view>{"qwen35"}) {
+  if (tokenizer_pre == std::optional<std::string_view>{"qwen35"}) {
     tokenizer->pre_tokenizer_ = PreTokenizer::kQwen35;
+  } else if (is_flint) {
+    tokenizer->pre_tokenizer_ = PreTokenizer::kFlint;
   }
 
   if (auto eos = reader.GetMetadataUint32("tokenizer.ggml.eos_token_id")) {
@@ -401,6 +618,18 @@ std::unique_ptr<QwenTokenizer> QwenTokenizer::CreateFromGguf(
   } else if (auto it = special_tokens.find(std::string(kEndOfText));
              it != special_tokens.end()) {
     tokenizer->pad_token_id_ = it->second;
+  }
+
+  if (is_flint) {
+    // F-F4: the artifact carries an explicit end-of-generation set
+    // (<|end_of_text|>, <|user|>, <|observation|>, <|developer|>); stopping on
+    // eos alone would run past a turn boundary.
+    for (const auto id :
+         reader.GetMetadataIntArray("tokenizer.ggml.eog_token_ids")) {
+      if (id >= 0 && static_cast<std::size_t>(id) < tokens.size()) {
+        tokenizer->stop_token_ids_.push_back(static_cast<TokenId>(id));
+      }
+    }
   }
 
   return tokenizer;
@@ -625,8 +854,23 @@ std::vector<TokenId> QwenTokenizer::BpeMergeChunk(
 }
 
 std::vector<TokenId> QwenTokenizer::BpeEncodeText(std::string_view text) const {
-  if (pre_tokenizer_ != PreTokenizer::kQwen35) {
+  if (pre_tokenizer_ == PreTokenizer::kNone) {
     return BpeMergeChunk(text);
+  }
+
+  if (pre_tokenizer_ == PreTokenizer::kFlint) {
+    // F-F1/F-F2: three regex rules chained per piece, no NFC. Pieces are views
+    // into `text`, which owns the bytes for the whole call.
+    std::vector<std::string_view> pieces{text};
+    pieces = SplitPiecesByRule(pieces, FlintNumberEnd);
+    pieces = SplitPiecesByRule(pieces, FlintCjkEnd);
+    pieces = SplitPiecesByRule(pieces, FlintPieceEnd);
+    std::vector<TokenId> tokens;
+    for (const std::string_view piece : pieces) {
+      const auto piece_tokens = BpeMergeChunk(piece);
+      tokens.insert(tokens.end(), piece_tokens.begin(), piece_tokens.end());
+    }
+    return tokens;
   }
 
   // Qwen's tokenizer.json normalizes each non-special span before applying

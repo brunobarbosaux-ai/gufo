@@ -64,6 +64,18 @@ public:
     metadata_count_++;
   }
 
+  void AddMetadataInt32Array(std::string_view key,
+                             const std::vector<std::int32_t>& arr) {
+    AppendString(key);
+    AppendPod(static_cast<std::uint32_t>(gufo::core::GgufValueType::kArray));
+    AppendPod(static_cast<std::uint32_t>(gufo::core::GgufValueType::kInt32));
+    AppendPod(static_cast<std::uint64_t>(arr.size()));
+    for (const auto v : arr) {
+      AppendPod(v);
+    }
+    metadata_count_++;
+  }
+
   std::vector<std::uint8_t> Build() {
     std::memcpy(buffer_.data() + metadata_count_pos_, &metadata_count_,
                 sizeof(metadata_count_));
@@ -361,6 +373,127 @@ void TestCorpusConformance() {
   }
 }
 
+void TestFlintTokenizerSpecialAndStops() {
+  // F-F3/F-F4: flint declares its special tokens through the token-type table
+  // and its generation terminators through eog_token_ids. `<arg_key>` is the
+  // case a text heuristic misses; the EOG set is wider than eos alone.
+  const std::vector<std::string> vocab = {
+      "a",                // 0
+      "b",                // 1
+      "<|end_of_text|>",  // 2
+      "<|user|>",         // 3
+      "<|developer|>",    // 4
+      "<|observation|>",  // 5
+      "<arg_key>",        // 6
+      "</arg_key>",       // 7
+      "<tool_call>",      // 8
+      "</tool_call>",     // 9
+  };
+  // GGUF token types: 3 = control, 4 = user-defined, 1 = normal.
+  const std::vector<std::int32_t> types = {1, 1, 3, 3, 3, 3, 4, 4, 4, 4};
+
+  GgufTokenizerBuilder builder;
+  builder.AddMetadataString("tokenizer.ggml.model", "gpt2");
+  builder.AddMetadataString("tokenizer.ggml.pre", "flint");
+  builder.AddMetadataUint32("tokenizer.ggml.eos_token_id", 2U);
+  builder.AddMetadataUint32("tokenizer.ggml.bos_token_id", 2U);
+  builder.AddMetadataStringArray("tokenizer.ggml.tokens", vocab);
+  builder.AddMetadataStringArray("tokenizer.ggml.merges", {});
+  builder.AddMetadataInt32Array("tokenizer.ggml.token_type", types);
+  builder.AddMetadataInt32Array("tokenizer.ggml.eog_token_ids", {2, 3, 4, 5});
+
+  auto binary = builder.Build();
+  std::string err;
+  auto reader =
+      gufo::core::GgufReader::OpenMemory(binary.data(), binary.size(), &err);
+  Expect(reader != nullptr, "flint reader open succeeds: " + err);
+  auto tok = gufo::tokenization::QwenTokenizer::CreateFromGguf(*reader, &err);
+  Expect(tok != nullptr, "flint tokenizer created: " + err);
+
+  Expect(tok->IsSpecialToken(6) && tok->IsSpecialToken(7) &&
+             tok->IsSpecialToken(8) && tok->IsSpecialToken(9),
+         "user-defined tool markers are special from their token type");
+  Expect(tok->IsSpecialToken(3) && tok->IsSpecialToken(4),
+         "control markers are special from their token type");
+  Expect(!tok->IsSpecialToken(0) && !tok->IsSpecialToken(1),
+         "ordinary tokens are not special");
+
+  Expect(tok->IsStopToken(2) && tok->IsStopToken(3) && tok->IsStopToken(4) &&
+             tok->IsStopToken(5),
+         "every eog_token_ids entry ends generation");
+  Expect(!tok->IsStopToken(0) && !tok->IsStopToken(6),
+         "ordinary and tool-marker ids do not end generation");
+  Expect(tok->GetEosTokenId() == 2U, "eos comes from the metadata");
+
+  const auto encoded = tok->Encode("a<arg_key>b");
+  Expect(encoded.size() == 3 && encoded[1] == 6,
+         "user-defined marker is emitted as one token");
+}
+
+void TestFlintPreTokenizerRules() {
+  // F-F1: numbers split into groups of three and a contraction stays inside
+  // its word. Both are observable through merges that only fire within a
+  // piece: "123 4" must never apply, and "don 't" must apply.
+  std::vector<std::string> vocab;
+  vocab.reserve(256 + 7);
+  for (int i = 0; i < 256; ++i) {
+    vocab.emplace_back(1, static_cast<char>(i));
+  }
+  using gufo::tokenization::TokenId;
+  const auto id_12 = static_cast<TokenId>(vocab.size());
+  vocab.emplace_back("12");
+  const auto id_123 = static_cast<TokenId>(vocab.size());
+  vocab.emplace_back("123");
+  const auto id_1234 = static_cast<TokenId>(vocab.size());
+  vocab.emplace_back("1234");
+  const auto id_do = static_cast<TokenId>(vocab.size());
+  vocab.emplace_back("do");
+  const auto id_don = static_cast<TokenId>(vocab.size());
+  vocab.emplace_back("don");
+  const auto id_apostrophe_t = static_cast<TokenId>(vocab.size());
+  vocab.emplace_back("'t");
+  const auto id_dont = static_cast<TokenId>(vocab.size());
+  vocab.emplace_back("don't");
+  (void)id_do;
+  (void)id_don;
+  (void)id_apostrophe_t;
+
+  const std::vector<std::string> merges = {
+      "d o",     // -> do
+      "' t",     // -> 't
+      "do n",    // -> don
+      "don 't",  // -> don't
+      "1 2",     // -> 12
+      "12 3",    // -> 123
+      "123 4",   // -> 1234
+  };
+
+  GgufTokenizerBuilder builder;
+  builder.AddMetadataString("tokenizer.ggml.model", "gpt2");
+  builder.AddMetadataString("tokenizer.ggml.pre", "flint");
+  builder.AddMetadataUint32("tokenizer.ggml.eos_token_id", 2U);
+  builder.AddMetadataStringArray("tokenizer.ggml.tokens", vocab);
+  builder.AddMetadataStringArray("tokenizer.ggml.merges", merges);
+  builder.AddMetadataInt32Array("tokenizer.ggml.token_type",
+                                std::vector<std::int32_t>(vocab.size(), 1));
+
+  auto binary = builder.Build();
+  std::string err;
+  auto reader =
+      gufo::core::GgufReader::OpenMemory(binary.data(), binary.size(), &err);
+  Expect(reader != nullptr, "flint rules reader opens: " + err);
+  auto tok = gufo::tokenization::QwenTokenizer::CreateFromGguf(*reader, &err);
+  Expect(tok != nullptr, "flint rules tokenizer created: " + err);
+
+  Expect(tok->Encode("don't") == std::vector<TokenId>{id_dont},
+         "contraction stays inside the word piece");
+  // "1234" splits as "123" + "4", so the "123 4" merge can never fire.
+  Expect(tok->Encode("1234") == std::vector<TokenId>{id_123, 52},
+         "digit runs split in groups of three");
+  Expect(tok->Encode("123") == std::vector<TokenId>{id_123},
+         "a three-digit run stays one piece");
+}
+
 }  // namespace
 
 int main() {
@@ -371,6 +504,8 @@ int main() {
   TestUnicodeContractionBoundary();
   TestEmptyAndSpecialEdgeCases();
   TestCorpusConformance();
+  TestFlintTokenizerSpecialAndStops();
+  TestFlintPreTokenizerRules();
   std::cout << "All QwenTokenizer tests passed successfully!\n";
   return 0;
 }

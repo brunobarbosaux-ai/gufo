@@ -78,8 +78,15 @@ public:
   [[nodiscard]] TokenId GetBosTokenId() const noexcept { return bos_token_id_; }
   [[nodiscard]] TokenId GetPadTokenId() const noexcept { return pad_token_id_; }
   [[nodiscard]] bool IsStopToken(TokenId token) const noexcept {
-    return token != kInvalidTokenId &&
-           (token == eos_token_id_ || token == endoftext_token_id_);
+    if (token == kInvalidTokenId) {
+      return false;
+    }
+    for (const TokenId stop : stop_token_ids_) {
+      if (token == stop) {
+        return true;
+      }
+    }
+    return token == eos_token_id_ || token == endoftext_token_id_;
   }
 
   [[nodiscard]] std::optional<TokenId> FindSpecialToken(
@@ -97,6 +104,7 @@ private:
   enum class PreTokenizer : std::uint8_t {
     kNone,
     kQwen35,
+    kFlint,
   };
 
   struct PairHash {
@@ -130,6 +138,9 @@ private:
   std::unordered_map<TokenId, bool> is_special_token_;
 
   std::array<TokenId, 256> byte_tokens_{};
+  /// Explicit end-of-generation set (F-F4), e.g. flint's four EOG ids. Empty
+  /// for vocabularies that rely on eos alone.
+  std::vector<TokenId> stop_token_ids_;
   TokenId bos_token_id_{kInvalidTokenId};
   TokenId eos_token_id_{kInvalidTokenId};
   TokenId endoftext_token_id_{kInvalidTokenId};
