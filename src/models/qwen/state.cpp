@@ -107,4 +107,54 @@ QwenScratchArena::QwenScratchArena(const core::ModelConfig& config) {
   logits = alloc_span(vocab_size);
 }
 
+FlintScratchArena::FlintScratchArena(const core::ModelConfig& config) {
+  const std::size_t hidden_size = config.hidden_size;
+  const std::size_t q_size = config.AttentionSize();
+  const std::size_t kv_size =
+      static_cast<std::size_t>(config.num_key_value_heads) * config.head_dim;
+  // Global layers attend over every position, so scores are sized to the
+  // full context; at 262 144 positions this is still only 1 MiB.
+  const std::size_t max_context =
+      config.context_length > 0 ? config.context_length : 4096;
+  const std::size_t vocab_size = config.vocab_size;
+  const std::size_t expert_count = config.expert_count;
+  const std::size_t expert_ff = config.expert_feed_forward_length;
+  const std::size_t shared_ff = config.expert_shared_feed_forward_length;
+  // Dense lead layers reuse the shared-expert scratch when wider than the
+  // expert width; the dense intermediate is the upper bound.
+  const std::size_t dense_ff = std::max(
+      static_cast<std::size_t>(config.intermediate_size),
+      std::max(expert_ff, shared_ff));
+
+  const std::size_t total_size =
+      (hidden_size * 4) + q_size + (kv_size * 2) + max_context +
+      expert_count + (dense_ff * 3) + (shared_ff * 3) + hidden_size +
+      vocab_size;
+  buffer.resize(total_size, 0.0F);
+
+  std::size_t cur = 0;
+  auto alloc_span = [&](std::size_t sz) {
+    auto sp = std::span<float>(&buffer[cur], sz);
+    cur += sz;
+    return sp;
+  };
+
+  hidden = alloc_span(hidden_size);
+  normed = alloc_span(hidden_size);
+  q = alloc_span(q_size);
+  k = alloc_span(kv_size);
+  v = alloc_span(kv_size);
+  attn_scores = alloc_span(max_context);
+  attn_out = alloc_span(hidden_size);
+  router_probs = alloc_span(expert_count);
+  expert_gate = alloc_span(dense_ff);
+  expert_up = alloc_span(dense_ff);
+  expert_act = alloc_span(dense_ff);
+  shared_gate = alloc_span(shared_ff);
+  shared_up = alloc_span(shared_ff);
+  shared_act = alloc_span(shared_ff);
+  mlp_out = alloc_span(hidden_size);
+  logits = alloc_span(vocab_size);
+}
+
 }  // namespace gufo::models

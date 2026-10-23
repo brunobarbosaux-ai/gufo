@@ -39,6 +39,8 @@ enum class TensorRole : std::uint8_t {
   kNorm,
   kProjection,
   kSsmParameter,
+  kRouter,
+  kAttentionSink,
 };
 
 [[nodiscard]] constexpr std::string_view TensorRoleName(
@@ -52,6 +54,10 @@ enum class TensorRole : std::uint8_t {
       return "projection";
     case TensorRole::kSsmParameter:
       return "SSM parameter";
+    case TensorRole::kRouter:
+      return "router";
+    case TensorRole::kAttentionSink:
+      return "attention sink";
   }
   return "unknown";
 }
@@ -85,6 +91,15 @@ enum class TensorRole : std::uint8_t {
              type == core::GgmlType::kQ4_K || type == core::GgmlType::kQ3_K ||
              type == core::GgmlType::kIQ4_NL ||
              type == core::GgmlType::kIQ4_XS || type == core::GgmlType::kIQ3_S;
+    case TensorRole::kRouter:
+      // flint.ffn_gate_inp is BF16 in this artifact (F-C2). The router must
+      // read F32/BF16/F16 exactly: a quantized router would silently
+      // reorder the top-6 selection and change which experts run.
+      return type == core::GgmlType::kF32 || type == core::GgmlType::kBF16 ||
+             type == core::GgmlType::kF16;
+    case TensorRole::kAttentionSink:
+      // Sink logits join the softmax max directly (F-D6); F32 only.
+      return type == core::GgmlType::kF32;
   }
   return false;
 }
@@ -94,7 +109,7 @@ bool ValidateTensor(const QwenTensorRef& tensor, std::size_t expected_elements,
                     std::string* error_msg, std::size_t row_elements = 0) {
   if (tensor.empty()) {
     if (error_msg != nullptr) {
-      *error_msg = "Missing required Qwen tensor: " + std::string(name);
+      *error_msg = "Missing required tensor: " + std::string(name);
     }
     return false;
   }
@@ -146,12 +161,12 @@ std::optional<QwenModelWeights> QwenModelWeights::LoadFromGguf(
   }
   if (config_opt->IsFlintArch()) {
     // D3 policy gate: the qwen runtime serves Qwen3.5/3.8 and Flash-Next.
-    // Flint loads through its own path once the AR port lands (F-B1) — never
+    // Flint loads through FlintModelWeights::LoadFromGguf (F-B1) — never
     // silently through DeltaNet-shaped code.
     if (error_msg != nullptr) {
       *error_msg =
-          "flint architecture is not loadable by the qwen runtime; its AR "
-          "path is not implemented yet";
+          "flint architecture is not loadable by the qwen runtime; use "
+          "FlintModelWeights::LoadFromGguf";
     }
     return std::nullopt;
   }
@@ -343,6 +358,176 @@ std::optional<QwenModelWeights> QwenModelWeights::LoadFromGguf(
           !ValidateTensor(l.ssm_out, hidden_size * inner_size,
                           TensorRole::kProjection, prefix + "ssm_out.weight",
                           error_msg, inner_size)) {
+        return std::nullopt;
+      }
+    }
+  }
+
+  return weights;
+}
+
+std::optional<FlintModelWeights> FlintModelWeights::LoadFromGguf(
+    const core::GgufReader& reader, std::string* error_msg) {
+  const auto config_opt = reader.ExtractModelConfig(error_msg);
+  if (!config_opt.has_value()) {
+    return std::nullopt;
+  }
+  if (!config_opt->IsFlintArch()) {
+    if (error_msg != nullptr) {
+      *error_msg =
+          "FlintModelWeights requires the flint architecture, found: " +
+          config_opt->architecture;
+    }
+    return std::nullopt;
+  }
+  // ExtractModelConfig already judges IsValidFlint() and the
+  // leading_dense_block_count inventory agreement (F-A5); re-check so this
+  // loader cannot be fed a hand-built config that bypassed the reader.
+  if (!config_opt->IsValidFlint(error_msg)) {
+    return std::nullopt;
+  }
+
+  FlintModelWeights weights;
+  weights.config = *config_opt;
+
+  const std::size_t hidden_size = weights.config.hidden_size;
+  const std::size_t vocab_size = weights.config.vocab_size;
+  const std::size_t attention_size = weights.config.AttentionSize();
+  const std::size_t kv_size =
+      static_cast<std::size_t>(weights.config.num_key_value_heads) *
+      weights.config.head_dim;
+
+  weights.token_embd = ExtractTensorRef(reader, "token_embd.weight");
+  weights.output_norm = ExtractTensorRef(reader, "output_norm.weight");
+  weights.output = ExtractTensorRef(reader, "output.weight");
+  if (weights.output.empty()) {
+    // F-C4: no silent tied-head fallback. This artifact ships output.weight;
+    // a file without it is not the file this loader was verified against.
+    if (error_msg != nullptr) {
+      *error_msg =
+          "Missing required tensor: output.weight (flint requires an "
+          "untied LM head)";
+    }
+    return std::nullopt;
+  }
+  if (!ValidateTensor(weights.token_embd, vocab_size * hidden_size,
+                      TensorRole::kEmbedding, "token_embd.weight", error_msg,
+                      hidden_size) ||
+      !ValidateTensor(weights.output_norm, hidden_size, TensorRole::kNorm,
+                      "output_norm.weight", error_msg) ||
+      !ValidateTensor(weights.output, vocab_size * hidden_size,
+                      TensorRole::kProjection, "output.weight", error_msg,
+                      hidden_size)) {
+    return std::nullopt;
+  }
+
+  weights.layers.resize(weights.config.num_layers);
+  for (std::uint32_t i = 0; i < weights.config.num_layers; ++i) {
+    const std::string prefix = "blk." + std::to_string(i) + ".";
+    auto& l = weights.layers[i];
+    l.attrs.windowed = weights.config.IsWindowedLayer(i);
+    l.attrs.rope = weights.config.IsRopeLayer(i);
+    l.attrs.dense_ffn = i < weights.config.leading_dense_block_count;
+
+    l.attn_norm = ExtractTensorRef(reader, prefix + "attn_norm.weight");
+    l.attn_q = ExtractTensorRef(reader, prefix + "attn_q.weight");
+    l.attn_k = ExtractTensorRef(reader, prefix + "attn_k.weight");
+    l.attn_v = ExtractTensorRef(reader, prefix + "attn_v.weight");
+    l.attn_output = ExtractTensorRef(reader, prefix + "attn_output.weight");
+    l.attn_q_norm = ExtractTensorRef(reader, prefix + "attn_q_norm.weight");
+    l.attn_k_norm = ExtractTensorRef(reader, prefix + "attn_k_norm.weight");
+    l.attn_sinks = ExtractTensorRef(reader, prefix + "attn_sinks.weight");
+    l.ffn_norm = ExtractTensorRef(reader, prefix + "ffn_norm.weight");
+
+    if (!ValidateTensor(l.attn_norm, hidden_size, TensorRole::kNorm,
+                        prefix + "attn_norm.weight", error_msg) ||
+        !ValidateTensor(l.attn_q, attention_size * hidden_size,
+                        TensorRole::kProjection, prefix + "attn_q.weight",
+                        error_msg, hidden_size) ||
+        !ValidateTensor(l.attn_k, kv_size * hidden_size,
+                        TensorRole::kProjection, prefix + "attn_k.weight",
+                        error_msg, hidden_size) ||
+        !ValidateTensor(l.attn_v, kv_size * hidden_size,
+                        TensorRole::kProjection, prefix + "attn_v.weight",
+                        error_msg, hidden_size) ||
+        !ValidateTensor(l.attn_output, hidden_size * attention_size,
+                        TensorRole::kProjection,
+                        prefix + "attn_output.weight", error_msg,
+                        attention_size) ||
+        !ValidateTensor(l.attn_q_norm, weights.config.head_dim,
+                        TensorRole::kNorm, prefix + "attn_q_norm.weight",
+                        error_msg) ||
+        !ValidateTensor(l.attn_k_norm, weights.config.head_dim,
+                        TensorRole::kNorm, prefix + "attn_k_norm.weight",
+                        error_msg) ||
+        !ValidateTensor(l.attn_sinks, weights.config.num_attention_heads,
+                        TensorRole::kAttentionSink,
+                        prefix + "attn_sinks.weight", error_msg) ||
+        !ValidateTensor(l.ffn_norm, hidden_size, TensorRole::kNorm,
+                        prefix + "ffn_norm.weight", error_msg)) {
+      return std::nullopt;
+    }
+
+    if (l.attrs.dense_ffn) {
+      const std::size_t intermediate_size = weights.config.intermediate_size;
+      l.ffn_gate = ExtractTensorRef(reader, prefix + "ffn_gate.weight");
+      l.ffn_up = ExtractTensorRef(reader, prefix + "ffn_up.weight");
+      l.ffn_down = ExtractTensorRef(reader, prefix + "ffn_down.weight");
+      if (!ValidateTensor(l.ffn_gate, intermediate_size * hidden_size,
+                          TensorRole::kProjection, prefix + "ffn_gate.weight",
+                          error_msg, hidden_size) ||
+          !ValidateTensor(l.ffn_up, intermediate_size * hidden_size,
+                          TensorRole::kProjection, prefix + "ffn_up.weight",
+                          error_msg, hidden_size) ||
+          !ValidateTensor(l.ffn_down, hidden_size * intermediate_size,
+                          TensorRole::kProjection, prefix + "ffn_down.weight",
+                          error_msg, intermediate_size)) {
+        return std::nullopt;
+      }
+    } else {
+      const std::size_t expert_count = weights.config.expert_count;
+      const std::size_t expert_ff =
+          weights.config.expert_feed_forward_length;
+      const std::size_t shared_ff =
+          weights.config.expert_shared_feed_forward_length;
+      l.ffn_gate_inp = ExtractTensorRef(reader, prefix + "ffn_gate_inp.weight");
+      l.ffn_gate_exps =
+          ExtractTensorRef(reader, prefix + "ffn_gate_exps.weight");
+      l.ffn_up_exps = ExtractTensorRef(reader, prefix + "ffn_up_exps.weight");
+      l.ffn_down_exps =
+          ExtractTensorRef(reader, prefix + "ffn_down_exps.weight");
+      l.ffn_gate_shexp =
+          ExtractTensorRef(reader, prefix + "ffn_gate_shexp.weight");
+      l.ffn_up_shexp = ExtractTensorRef(reader, prefix + "ffn_up_shexp.weight");
+      l.ffn_down_shexp =
+          ExtractTensorRef(reader, prefix + "ffn_down_shexp.weight");
+      if (!ValidateTensor(l.ffn_gate_inp, hidden_size * expert_count,
+                          TensorRole::kRouter, prefix + "ffn_gate_inp.weight",
+                          error_msg, hidden_size) ||
+          !ValidateTensor(l.ffn_gate_exps, expert_ff * expert_count * hidden_size,
+                          TensorRole::kProjection,
+                          prefix + "ffn_gate_exps.weight", error_msg,
+                          hidden_size) ||
+          !ValidateTensor(l.ffn_up_exps, expert_ff * expert_count * hidden_size,
+                          TensorRole::kProjection,
+                          prefix + "ffn_up_exps.weight", error_msg,
+                          hidden_size) ||
+          !ValidateTensor(l.ffn_down_exps, hidden_size * expert_ff * expert_count,
+                          TensorRole::kProjection,
+                          prefix + "ffn_down_exps.weight", error_msg,
+                          expert_ff) ||
+          !ValidateTensor(l.ffn_gate_shexp, shared_ff * hidden_size,
+                          TensorRole::kProjection,
+                          prefix + "ffn_gate_shexp.weight", error_msg,
+                          hidden_size) ||
+          !ValidateTensor(l.ffn_up_shexp, shared_ff * hidden_size,
+                          TensorRole::kProjection,
+                          prefix + "ffn_up_shexp.weight", error_msg,
+                          hidden_size) ||
+          !ValidateTensor(l.ffn_down_shexp, hidden_size * shared_ff,
+                          TensorRole::kProjection,
+                          prefix + "ffn_down_shexp.weight", error_msg,
+                          shared_ff)) {
         return std::nullopt;
       }
     }

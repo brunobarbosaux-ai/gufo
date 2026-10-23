@@ -16,12 +16,14 @@
 #include "src/cli/arg_parser.hpp"
 #include "src/cli/sampling_options.hpp"
 #include "src/core/crypto/sha256.hpp"
+#include "src/core/flint_options.hpp"
 #include "src/core/gguf_reader.hpp"
 #include "src/core/image.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/generator.hpp"
+#include "src/models/qwen/state.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -1050,6 +1052,33 @@ int RunPrompt(std::span<const char* const> args) {
         tokenizer, rendered_prompt, 0, rendered_prompt.size(), content_spans,
         {});
   };
+
+  if (reader->GetMetadataString("general.architecture") == "flint") {
+    // F-A4 load branch: flint is registered explicitly so it never falls
+    // through to the qwen or deepseek runtimes. The autoregressive forward
+    // lands in M2; until then the CLI loads and validates the full tensor
+    // inventory, then stops with an actionable message.
+    std::string flint_err;
+    if (!core::ValidateFlintOptions(
+            !opt.vision_model_path.empty() || !opt.image_paths.empty(),
+            !opt.speculative_backend.empty(), !opt.mtp_model_path.empty(),
+            !opt.dflash_model_path.empty(), !opt.dspark_model_path.empty(),
+            &flint_err)) {
+      std::cerr << "Error: " << flint_err << "\n";
+      return 1;
+    }
+    std::string flint_load_err;
+    const auto flint_weights =
+        models::FlintModelWeights::LoadFromGguf(*reader, &flint_load_err);
+    if (!flint_weights.has_value()) {
+      std::cerr << "Error loading flint weights: " << flint_load_err << "\n";
+      return 1;
+    }
+    PrintModelLoadTime(model_load_start);
+    std::cerr << "Error: the flint autoregressive forward is not implemented "
+                 "yet; this build validates the load path only.\n";
+    return 1;
+  }
 
 #if defined(ENGINE_ENABLE_HIP)
   if (reader->GetMetadataString("general.architecture") == "qwen4exp") {

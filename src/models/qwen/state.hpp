@@ -157,6 +157,70 @@ struct QwenLayerWeights {
   QwenTensorRef ffn_down;
 };
 
+/// Per-layer stack attributes for the flint attention-only stack (F-B1).
+/// Flint runs attention on every layer; these switches select the attention
+/// variant and the FFN kind. No flint layer is an SSM layer, and nothing in
+/// the flint load path allocates recurrent state.
+struct FlintLayerAttributes {
+  /// sliding_window_pattern[i]: the layer attends through the sliding window
+  /// (F-D2 bounds the key range); false means global attention.
+  bool windowed = false;
+  /// rope_pattern[i]: the layer applies RoPE; false means NoPE (F-D3).
+  bool rope = false;
+  /// i < leading_dense_block_count: plain SwiGLU FFN instead of MoE (F-B2).
+  bool dense_ffn = false;
+};
+
+/// Tensor weight references for one flint layer: attention tensors on every
+/// layer, dense SwiGLU on the lead layers, sigmoid-router MoE plus one
+/// shared expert on the rest (F-C1 inventory).
+struct FlintLayerWeights {
+  FlintLayerAttributes attrs;
+
+  QwenTensorRef attn_norm;
+  QwenTensorRef attn_q;
+  QwenTensorRef attn_k;
+  QwenTensorRef attn_v;
+  QwenTensorRef attn_output;
+  QwenTensorRef attn_q_norm;
+  QwenTensorRef attn_k_norm;
+  /// Learned f32 sink logit per query head ([num_attention_heads]); added to
+  /// the attention scores before softmax (F-D1).
+  QwenTensorRef attn_sinks;
+
+  QwenTensorRef ffn_norm;
+
+  // Dense SwiGLU FFN (attrs.dense_ffn only).
+  QwenTensorRef ffn_gate;
+  QwenTensorRef ffn_up;
+  QwenTensorRef ffn_down;
+
+  // MoE (attrs.dense_ffn == false only): sigmoid router over expert_count,
+  // expert stack, and one ungated shared expert (F-E1/F-E3).
+  QwenTensorRef ffn_gate_inp;
+  QwenTensorRef ffn_gate_exps;
+  QwenTensorRef ffn_up_exps;
+  QwenTensorRef ffn_down_exps;
+  QwenTensorRef ffn_gate_shexp;
+  QwenTensorRef ffn_up_shexp;
+  QwenTensorRef ffn_down_shexp;
+};
+
+/// Flint tensor references mapped directly from GGUF storage.
+struct FlintModelWeights {
+  core::ModelConfig config;
+  QwenTensorRef token_embd;
+  std::vector<FlintLayerWeights> layers;
+  QwenTensorRef output_norm;
+  QwenTensorRef output;
+
+  /// Loads and binds the exact flint tensor inventory from a GgufReader
+  /// (F-C1). Every tensor the stack needs is required (F-C4); the error
+  /// names the layer and tensor on any miss.
+  [[nodiscard]] static std::optional<FlintModelWeights> LoadFromGguf(
+      const core::GgufReader& reader, std::string* error_msg = nullptr);
+};
+
 /// Full model tensor references mapped directly from GGUF storage.
 struct QwenModelWeights {
   core::ModelConfig config;
@@ -226,6 +290,35 @@ struct QwenScratchArena {
   std::span<float> ssm_qkv;
   std::span<float> ssm_gate;
   std::span<float> ssm_out_buf;
+  std::span<float> logits;
+};
+
+/// Preallocated activation scratch for the flint attention-only stack
+/// (F-B1). Mirrors QwenScratchArena minus every SSM span; adds the MoE
+/// routing and expert scratch. A flint decode step never touches recurrent
+/// state, so no such span exists here.
+struct FlintScratchArena {
+  explicit FlintScratchArena(const core::ModelConfig& config);
+
+  std::vector<float> buffer;
+  std::span<float> hidden;
+  std::span<float> normed;
+  std::span<float> q;
+  std::span<float> k;
+  std::span<float> v;
+  /// Full sequence scores: global layers attend over every position, so
+  /// this is sized to the context, not the window.
+  std::span<float> attn_scores;
+  std::span<float> attn_out;
+  /// Sigmoid router logits and the renormalised top-k weights (F-E1).
+  std::span<float> router_probs;
+  std::span<float> expert_gate;
+  std::span<float> expert_up;
+  std::span<float> expert_act;
+  std::span<float> shared_gate;
+  std::span<float> shared_up;
+  std::span<float> shared_act;
+  std::span<float> mlp_out;
   std::span<float> logits;
 };
 

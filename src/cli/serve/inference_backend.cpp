@@ -27,12 +27,14 @@
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
 #include "src/core/gguf_identity.hpp"
+#include "src/core/flint_options.hpp"
 #include "src/core/gguf_reader.hpp"
 #include "src/core/json.hpp"
 #include "src/core/sampling.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/control_tokens.hpp"
 #include "src/models/qwen/generator.hpp"
+#include "src/models/qwen/state.hpp"
 #include "src/models/qwen/vision/image_cache.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -3111,6 +3113,34 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     return load(std::move(model), error, max_context, session_count,
                 prefill_policy, scheduler_policy, speculative_config,
                 std::move(resolved_disk_cache_config), ram_cache_config);
+  }
+  if (architecture == "flint") {
+    // F-A4 load branch: flint is registered explicitly so it never falls
+    // through to another runtime. F-B3/F-B4 close drafting and vision; the
+    // autoregressive forward lands in M2, so until then the server loads
+    // and validates the full tensor inventory and refuses with an
+    // actionable message instead of serving garbage.
+    std::string flint_err;
+    if (!core::ValidateFlintOptions(
+            !vision_model_path.empty(),
+            speculative_config.backend != TextSpeculativeBackend::kDisabled ||
+                !speculative_config.draft_model_path.empty(),
+            /*has_mtp_model=*/false, /*has_dflash_model=*/false,
+            /*has_dspark_model=*/false, &flint_err)) {
+      SetError(error, flint_err);
+      return false;
+    }
+    std::string flint_load_err;
+    const auto flint_weights =
+        models::FlintModelWeights::LoadFromGguf(*reader, &flint_load_err);
+    if (flint_weights.has_value()) {
+      SetError(error,
+               "the flint autoregressive forward is not implemented yet; "
+               "the tensor inventory loaded and validated cleanly");
+    } else {
+      SetError(error, "Failed to load flint weights: " + flint_load_err);
+    }
+    return false;
   }
   if (reader->GetMetadataString("general.architecture") == "qwen4exp") {
     if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&

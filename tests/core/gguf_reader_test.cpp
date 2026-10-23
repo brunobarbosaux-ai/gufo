@@ -697,10 +697,16 @@ void TestFlintConfigParsing() {
 
   builder.AddTensor("token_embd.weight", {64, 8}, gufo::core::GgmlType::kBF16,
                     0);
-  builder.AddTensor("blk.0.ffn_gate_inp.weight", {64, 8},
-                    gufo::core::GgmlType::kBF16, 64);
+  // Routers belong to the MoE layers (1-3 here; leading_dense_block_count=1
+  // makes layer 0 dense with no router).
+  builder.AddTensor("blk.1.ffn_gate_inp.weight", {64, 8},
+                    gufo::core::GgmlType::kBF16, 2048);
+  builder.AddTensor("blk.2.ffn_gate_inp.weight", {64, 8},
+                    gufo::core::GgmlType::kBF16, 3072);
+  builder.AddTensor("blk.3.ffn_gate_inp.weight", {64, 8},
+                    gufo::core::GgmlType::kBF16, 4096);
   builder.AddTensor("blk.1.ffn_gate.weight", {64, 8},
-                    gufo::core::GgmlType::kQ8_0, 128);
+                    gufo::core::GgmlType::kQ8_0, 5120);
 
   auto binary = builder.Build(512);
   std::string err;

@@ -994,6 +994,10 @@ std::optional<ModelConfig> GgufReader::ExtractModelConfig(
   // per-layer window/RoPE switches. Absent keys keep their zero defaults,
   // which IsValidFlint() then judges.
   if (config.architecture == "flint") {
+    // Every flint layer is a full-attention layer (F-B1). With the interval
+    // at 1, FullAttentionLayerCount() == block_count and SsmLayerCount() == 0,
+    // so KV sizing covers all layers and no SSM state is ever derived.
+    config.full_attention_interval = 1;
     if (auto val = GetMetadataUint32(prefix + "expert_count")) {
       config.expert_count = *val;
     }
@@ -1080,12 +1084,13 @@ std::optional<ModelConfig> GgufReader::ExtractModelConfig(
       return std::nullopt;
     }
     // Fail closed when the dense lead disagrees with the tensor inventory:
-    // a wrong count would silently load dense FFNs where experts are
-    // expected, or refuse routers the file actually carries.
+    // routers live on the MoE layers only (layer >= leading_dense_block_count).
+    // A wrong count would silently load dense FFNs where experts are expected,
+    // or refuse routers the file actually carries.
     for (std::uint32_t layer = 0; layer < config.num_layers; ++layer) {
       const std::string name =
           "blk." + std::to_string(layer) + ".ffn_gate_inp.weight";
-      if ((layer < config.leading_dense_block_count) != HasTensor(name)) {
+      if ((layer >= config.leading_dense_block_count) != HasTensor(name)) {
         if (error_msg != nullptr) {
           *error_msg = "flint.leading_dense_block_count=" +
                        std::to_string(config.leading_dense_block_count) +

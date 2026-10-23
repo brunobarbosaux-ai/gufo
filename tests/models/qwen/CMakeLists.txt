@@ -20,6 +20,10 @@ target_compile_definitions(qwen_chat_template_test PRIVATE
   GUFO_QWEN38_CHAT_TEMPLATE_REFERENCE="${PROJECT_SOURCE_DIR}/src/models/qwen/reference/chat_template.jinja"
   GUFO_CHAT_TEMPLATE_HF_GOLDENS="${PROJECT_SOURCE_DIR}/tests/fixtures/chat_template_hf_goldens.json")
 
+add_qwen_cpu_test(qwen_flint_weights_test
+  tests/models/qwen/flint_weights_test.cpp
+  "cpu;models;qwen;flint;weights")
+
 add_qwen_cpu_test(qwen_cpu_oracles_test
   tests/models/qwen/cpu/oracles_test.cpp
   "cpu;models;qwen;oracles")
