@@ -286,6 +286,39 @@ private:
   Profile profile_{Profile::kLegacyChatMl};
 };
 
+/// Flint (RecursiveSI) turn framing. The artifact ships a Jinja template; its
+/// behaviour is compiled here, not interpreted, and `ValidateGgufTemplate`
+/// refuses any artifact whose embedded template differs from the pinned one.
+/// Framing: `<|system|>` / `<|user|>` / `<|assistant|>` / `<|observation|>`,
+/// no ChatML im_start tokens and no injected BOS.
+class FlintChatTemplate {
+ public:
+  /// SHA-256 of the flint `tokenizer.chat_template` this renderer reproduces.
+  [[nodiscard]] static std::string_view PinnedTemplateSha256() noexcept;
+
+  /// True when the artifact embeds exactly the pinned flint template (F-G2).
+  [[nodiscard]] static bool ValidateGgufTemplate(
+      const core::GgufReader& reader, std::string* error_msg = nullptr);
+
+  /// Renders `messages` with the flint framing. The tools preamble is emitted
+  /// as its own system turn immediately before the first non-system message.
+  [[nodiscard]] static std::optional<std::string> Render(
+      std::span<const ChatMessage> messages, std::span<const ChatTool> tools,
+      const ChatTemplateOptions& options = {},
+      std::string* error_msg = nullptr);
+
+  /// Renders and tokenizes in one step, matching the oracle's `/apply-template`
+  /// followed by `/tokenize` pair.
+  [[nodiscard]] static std::optional<std::vector<TokenId>> RenderAndTokenize(
+      const QwenTokenizer& tokenizer, std::span<const ChatMessage> messages,
+      std::span<const ChatTool> tools, const ChatTemplateOptions& options = {},
+      std::string* error_msg = nullptr);
+
+  [[nodiscard]] static std::string_view GetTemplateId() noexcept {
+    return "flint-compiled-v1";
+  }
+};
+
 }  // namespace gufo::tokenization
 
 #endif  // GUFO_TOKENIZATION_QWEN_CHAT_TEMPLATE_HPP_

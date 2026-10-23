@@ -16,6 +16,8 @@ in `libllama.so`, against the pinned artifact
 | `golden.py compare A.json B.json` | Token-id diff of two goldens; reports the first divergence with context |
 | `logit_dump.py OUTDIR [--gpu]` | M0.5: `llama-perplexity --save-all-logits` per depth; the `_logits_` u16 log-prob format is decoded and parsed (`parse_dump`/`dequant_row`); tokens cross-checked against `/tokenize` |
 | `compare_dumps.py A.f32 B.f32` | G3 comparator skeleton: dequantises two dumps and reports max \|Δ log p\| (head), cosine min/mean, argmax agreement, floor disagreements |
+| `g1_cases.py GOLDEN.json OUT.bin` | Joins the regenerated corpus with the golden ids into the packed G1 case file (refuses to write if any case id drifts) |
+| `tokenizer_probe.cpp` | G1 probe: loads the GGUF tokenizer and compares to the golden (`MODEL.gguf CASES.bin`), or encodes one string (`MODEL.gguf --text TEXT`); exits 1 on any mismatch |
 
 Goldens are artifacts and stay outside Git; each run writes a sha256 into
 `OUTDIR/manifest.json` alongside the oracle build and model identity.
