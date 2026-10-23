@@ -95,6 +95,9 @@ if (ENGINE_ENABLE_HIP)
   add_qwen_hip_test(qwen_flint_decode_ops_test
     tests/models/qwen/hip/attention/flint_decode_ops_test.cpp
     "hip;gpu;kernels;qwen;flint;attention;decode;slow")
+  add_qwen_hip_test(qwen_flint_decode_step_test
+    tests/models/qwen/hip/flint_decode_step_test.cpp
+    "hip;gpu;kernels;qwen;flint;decode;step;slow")
   add_qwen_hip_test(qwen_attention_long_context_ops_test
     tests/models/qwen/hip/attention/long_context_ops_test.cpp
     "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;attention;decode;long-context")
