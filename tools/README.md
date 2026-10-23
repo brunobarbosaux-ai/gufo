@@ -18,6 +18,7 @@ benchmark/tuning executables; Python tools run from this source tree.
 | `audio/` | Audio reference and quality tools |
 | `ci/` | Repository, dependency, and documentation checks |
 | `llama_parity/` | Regenerates the llama.cpp tool-grammar verdicts `json_constraint_test` replays |
+| `flint/` | Flint 40B oracle harness against pinned llama.cpp b11804; tokenizer/template/logit goldens (G1–G3) |
 | `gufo/` | Shared Python helpers and model-specific reference implementations |
 
 `gufo/gguf.py` reads metadata and decodes existing GGUF tensors for independent
