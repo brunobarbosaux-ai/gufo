@@ -663,6 +663,185 @@ void TestMappedPrefetch() {
   close(fd);
 }
 
+void TestFlintConfigParsing() {
+  // Positive: a synthetic flint artifact with the full flint.* key set.
+  GgufBuilder builder;
+  builder.AddMetadataString("general.architecture", "flint");
+  builder.AddMetadataString("general.name", "flint-40b-test");
+  builder.AddMetadataUint32("flint.block_count", 4);
+  builder.AddMetadataUint32("flint.embedding_length", 64);
+  builder.AddMetadataUint32("flint.feed_forward_length", 128);
+  builder.AddMetadataUint32("flint.attention.head_count", 4);
+  builder.AddMetadataUint32("flint.attention.head_count_kv", 2);
+  builder.AddMetadataUint32("flint.attention.key_length", 16);
+  builder.AddMetadataUint32("flint.context_length", 512);
+  builder.AddMetadataFloat32("flint.rope.freq_base", 10000.0F);
+  builder.AddMetadataUint32("flint.expert_count", 8);
+  builder.AddMetadataUint32("flint.expert_used_count", 2);
+  builder.AddMetadataUint32("flint.expert_gating_func", 2);
+  builder.AddMetadataUint32("flint.expert_feed_forward_length", 32);
+  builder.AddMetadataUint32("flint.expert_shared_count", 1);
+  builder.AddMetadataUint32("flint.expert_shared_feed_forward_length", 64);
+  builder.AddMetadataBool("flint.expert_weights_norm", true);
+  builder.AddMetadataFloat32("flint.expert_weights_scale", 1.0F);
+  builder.AddMetadataUint32("flint.leading_dense_block_count", 1);
+  builder.AddMetadataUint32("flint.attention.sliding_window", 8);
+  builder.AddMetadataArray("flint.attention.sliding_window_pattern",
+                           gufo::core::GgufValueType::kBool,
+                           std::vector<std::uint8_t>{0, 1, 1, 1});
+  builder.AddMetadataArray("flint.attention.rope_pattern",
+                           gufo::core::GgufValueType::kBool,
+                           std::vector<std::uint8_t>{0, 1, 1, 1});
+  builder.AddMetadataInt32Array("tokenizer.ggml.eog_token_ids",
+                                {150001, 150003, 150005, 150018});
+
+  builder.AddTensor("token_embd.weight", {64, 8}, gufo::core::GgmlType::kBF16,
+                    0);
+  builder.AddTensor("blk.0.ffn_gate_inp.weight", {64, 8},
+                    gufo::core::GgmlType::kBF16, 64);
+  builder.AddTensor("blk.1.ffn_gate.weight", {64, 8},
+                    gufo::core::GgmlType::kQ8_0, 128);
+
+  auto binary = builder.Build(512);
+  std::string err;
+  auto reader =
+      gufo::core::GgufReader::OpenMemory(binary.data(), binary.size(), &err);
+  Expect(reader != nullptr, "flint reader open succeeds: " + err);
+
+  Expect(reader->GetMetadataIntArray("tokenizer.ggml.eog_token_ids") ==
+             std::vector<std::int64_t>({150001, 150003, 150005, 150018}),
+         "int32 array getter widens eog ids");
+
+  auto config = reader->ExtractModelConfig(&err);
+  Expect(config.has_value(), "flint ExtractModelConfig succeeds: " + err);
+  Expect(config->IsFlintArch(), "architecture is flint");
+  Expect(config->num_layers == 4, "4 layers");
+  Expect(config->hidden_size == 64, "64 hidden");
+  Expect(config->head_dim == 16, "16 head dim");
+  Expect(config->rotary_dim == 16, "rotary_dim defaults to head_dim");
+  Expect(config->expert_count == 8 && config->expert_used_count == 2,
+         "expert geometry parsed");
+  Expect(config->expert_gating_func == 2, "sigmoid gating func parsed");
+  Expect(config->expert_weights_norm && config->expert_weights_scale == 1.0F,
+         "weight norm/scale parsed");
+  Expect(config->leading_dense_block_count == 1, "dense lead parsed");
+  Expect(config->sliding_window == 8, "sliding window parsed");
+  Expect(config->sliding_window_pattern.size() == 4, "window pattern length");
+  Expect(config->IsMoe(), "IsMoe true");
+  Expect(config->IsValidFlint(&err), "IsValidFlint true: " + err);
+  Expect(!config->IsWindowedLayer(0) && config->IsWindowedLayer(1) &&
+             config->IsWindowedLayer(3),
+         "window pattern accessors match");
+  Expect(!config->IsRopeLayer(0) && config->IsRopeLayer(2),
+         "rope pattern accessors match");
+  Expect(config->mtp_num_layers == 0, "no MTP for flint");
+
+  // Negative: a short rope_pattern is rejected, naming the key.
+  GgufBuilder bad_rope;
+  bad_rope.AddMetadataString("general.architecture", "flint");
+  bad_rope.AddMetadataUint32("flint.block_count", 4);
+  bad_rope.AddMetadataUint32("flint.embedding_length", 64);
+  bad_rope.AddMetadataUint32("flint.feed_forward_length", 128);
+  bad_rope.AddMetadataUint32("flint.attention.head_count", 4);
+  bad_rope.AddMetadataUint32("flint.attention.head_count_kv", 2);
+  bad_rope.AddMetadataUint32("flint.attention.key_length", 16);
+  bad_rope.AddMetadataUint32("flint.context_length", 512);
+  bad_rope.AddMetadataUint32("flint.expert_count", 8);
+  bad_rope.AddMetadataUint32("flint.expert_used_count", 2);
+  bad_rope.AddMetadataUint32("flint.expert_gating_func", 2);
+  bad_rope.AddMetadataUint32("flint.expert_feed_forward_length", 32);
+  bad_rope.AddMetadataArray("flint.attention.sliding_window_pattern",
+                            gufo::core::GgufValueType::kBool,
+                            std::vector<std::uint8_t>{0, 1, 1, 1});
+  bad_rope.AddMetadataArray("flint.attention.rope_pattern",
+                            gufo::core::GgufValueType::kBool,
+                            std::vector<std::uint8_t>{0, 1, 1});
+  bad_rope.AddTensor("token_embd.weight", {64, 8}, gufo::core::GgmlType::kBF16,
+                     0);
+  bad_rope.AddTensor("blk.0.ffn_gate_inp.weight", {64, 8},
+                     gufo::core::GgmlType::kBF16, 64);
+  auto bad_binary = bad_rope.Build(512);
+  auto bad_reader = gufo::core::GgufReader::OpenMemory(bad_binary.data(),
+                                                       bad_binary.size(), &err);
+  Expect(bad_reader != nullptr, "bad-pattern reader opens");
+  std::string reject_reason;
+  Expect(!bad_reader->ExtractModelConfig(&reject_reason).has_value(),
+         "short rope_pattern rejected");
+  Expect(
+      reject_reason.find("flint.attention.rope_pattern") != std::string::npos,
+      "rejection names flint.attention.rope_pattern: " + reject_reason);
+
+  // Negative: an unknown gating function fails closed (F-A5).
+  GgufBuilder bad_gating;
+  bad_gating.AddMetadataString("general.architecture", "flint");
+  bad_gating.AddMetadataUint32("flint.block_count", 4);
+  bad_gating.AddMetadataUint32("flint.embedding_length", 64);
+  bad_gating.AddMetadataUint32("flint.feed_forward_length", 128);
+  bad_gating.AddMetadataUint32("flint.attention.head_count", 4);
+  bad_gating.AddMetadataUint32("flint.attention.head_count_kv", 2);
+  bad_gating.AddMetadataUint32("flint.attention.key_length", 16);
+  bad_gating.AddMetadataUint32("flint.context_length", 512);
+  bad_gating.AddMetadataUint32("flint.expert_count", 8);
+  bad_gating.AddMetadataUint32("flint.expert_used_count", 2);
+  bad_gating.AddMetadataUint32("flint.expert_gating_func", 1);
+  bad_gating.AddMetadataUint32("flint.expert_feed_forward_length", 32);
+  bad_gating.AddMetadataArray("flint.attention.sliding_window_pattern",
+                              gufo::core::GgufValueType::kBool,
+                              std::vector<std::uint8_t>{0, 1, 1, 1});
+  bad_gating.AddMetadataArray("flint.attention.rope_pattern",
+                              gufo::core::GgufValueType::kBool,
+                              std::vector<std::uint8_t>{0, 1, 1, 1});
+  bad_gating.AddTensor("token_embd.weight", {64, 8},
+                       gufo::core::GgmlType::kBF16, 0);
+  bad_gating.AddTensor("blk.0.ffn_gate_inp.weight", {64, 8},
+                       gufo::core::GgmlType::kBF16, 64);
+  auto gating_binary = bad_gating.Build(512);
+  auto gating_reader = gufo::core::GgufReader::OpenMemory(
+      gating_binary.data(), gating_binary.size(), &err);
+  Expect(gating_reader != nullptr, "bad-gating reader opens");
+  std::string gating_reason;
+  Expect(!gating_reader->ExtractModelConfig(&gating_reason).has_value(),
+         "softmax gating func rejected");
+  Expect(gating_reason.find("flint.expert_gating_func") != std::string::npos,
+         "rejection names flint.expert_gating_func: " + gating_reason);
+
+  // Negative: a dense lead that disagrees with the tensor inventory (F-A5).
+  GgufBuilder bad_dense;
+  bad_dense.AddMetadataString("general.architecture", "flint");
+  bad_dense.AddMetadataUint32("flint.block_count", 4);
+  bad_dense.AddMetadataUint32("flint.embedding_length", 64);
+  bad_dense.AddMetadataUint32("flint.feed_forward_length", 128);
+  bad_dense.AddMetadataUint32("flint.attention.head_count", 4);
+  bad_dense.AddMetadataUint32("flint.attention.head_count_kv", 2);
+  bad_dense.AddMetadataUint32("flint.attention.key_length", 16);
+  bad_dense.AddMetadataUint32("flint.context_length", 512);
+  bad_dense.AddMetadataUint32("flint.expert_count", 8);
+  bad_dense.AddMetadataUint32("flint.expert_used_count", 2);
+  bad_dense.AddMetadataUint32("flint.expert_gating_func", 2);
+  bad_dense.AddMetadataUint32("flint.expert_feed_forward_length", 32);
+  bad_dense.AddMetadataUint32("flint.leading_dense_block_count", 2);
+  bad_dense.AddMetadataArray("flint.attention.sliding_window_pattern",
+                             gufo::core::GgufValueType::kBool,
+                             std::vector<std::uint8_t>{0, 1, 1, 1});
+  bad_dense.AddMetadataArray("flint.attention.rope_pattern",
+                             gufo::core::GgufValueType::kBool,
+                             std::vector<std::uint8_t>{0, 1, 1, 1});
+  bad_dense.AddTensor("token_embd.weight", {64, 8}, gufo::core::GgmlType::kBF16,
+                      0);
+  bad_dense.AddTensor("blk.0.ffn_gate_inp.weight", {64, 8},
+                      gufo::core::GgmlType::kBF16, 64);
+  auto dense_binary = bad_dense.Build(512);
+  auto dense_reader = gufo::core::GgufReader::OpenMemory(
+      dense_binary.data(), dense_binary.size(), &err);
+  Expect(dense_reader != nullptr, "bad-dense reader opens");
+  std::string dense_reason;
+  Expect(!dense_reader->ExtractModelConfig(&dense_reason).has_value(),
+         "dense lead without a matching router tensor rejected");
+  Expect(
+      dense_reason.find("flint.leading_dense_block_count") != std::string::npos,
+      "rejection names flint.leading_dense_block_count: " + dense_reason);
+}
+
 }  // namespace
 
 int main() {
@@ -673,6 +852,7 @@ int main() {
   std::cout << "Running GgufReader unit tests...\n";
   TestBasicGgufParsing();
   TestQwen38_27BParsing();
+  TestFlintConfigParsing();
   TestSplitGgufDiscovery();
   TestVisionExclusionValidation();
   TestQuantizationLabel();

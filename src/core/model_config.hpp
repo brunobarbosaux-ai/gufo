@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace gufo::core {
 
@@ -33,6 +34,28 @@ struct ModelConfig {
   float rope_scale{1.0F};
   bool is_text_only{true};
 
+  // Mixture-of-experts geometry (flint.*). Zero-valued for dense artifacts;
+  // only judged when expert_count > 0.
+  std::uint32_t expert_count{0};
+  std::uint32_t expert_used_count{0};
+  std::uint32_t expert_feed_forward_length{0};
+  std::uint32_t expert_shared_count{0};
+  std::uint32_t expert_shared_feed_forward_length{0};
+  std::uint32_t expert_gating_func{
+      0};  ///< 2 = sigmoid over the full expert set
+  float expert_weights_scale{1.0F};
+  bool expert_weights_norm{false};
+  std::uint32_t leading_dense_block_count{0};
+
+  // Per-layer attention switches (flint.attention.*). Required for flint:
+  // sliding_window_pattern[i] = true means layer i attends through the
+  // sliding window, false means full attention; rope_pattern[i] = true means
+  // the layer applies RoPE, false means NoPE. Read independently (F-A2) even
+  // when an artifact carries identical arrays.
+  std::uint32_t sliding_window{0};
+  std::vector<bool> sliding_window_pattern;
+  std::vector<bool> rope_pattern;
+
   [[nodiscard]] constexpr std::uint32_t AttentionSize() const noexcept {
     return num_attention_heads * head_dim;
   }
@@ -61,6 +84,95 @@ struct ModelConfig {
 
   [[nodiscard]] constexpr std::uint32_t SsmQkvSize() const noexcept {
     return (2 * ssm_group_count * ssm_state_size) + ssm_inner_size;
+  }
+
+  [[nodiscard]] constexpr bool IsFlintArch() const noexcept {
+    return architecture == "flint";
+  }
+
+  [[nodiscard]] constexpr bool IsMoe() const noexcept {
+    return expert_count > 0;
+  }
+
+  /// Sliding-window membership; out-of-range layers are full attention.
+  [[nodiscard]] bool IsWindowedLayer(std::uint32_t layer) const noexcept {
+    return layer < sliding_window_pattern.size() &&
+           sliding_window_pattern[layer];
+  }
+
+  /// RoPE membership; out-of-range layers apply rope (conservative default).
+  [[nodiscard]] bool IsRopeLayer(std::uint32_t layer) const noexcept {
+    return layer < rope_pattern.size() && rope_pattern[layer];
+  }
+
+  /// Returns true if this configuration conforms to the flint structural
+  /// rules. Every rejection writes a message naming the offending metadata
+  /// key so load failures are diagnosable without a debugger.
+  bool IsValidFlint(std::string* error_msg = nullptr) const {
+    const auto reject = [error_msg](const std::string& message) {
+      if (error_msg != nullptr) {
+        *error_msg = message;
+      }
+      return false;
+    };
+    if (num_layers == 0) {
+      return reject("flint.block_count: must be positive");
+    }
+    if (hidden_size == 0 || intermediate_size == 0) {
+      return reject(
+          "flint.embedding_length and flint.feed_forward_length: must be "
+          "positive");
+    }
+    if (num_attention_heads == 0 || num_key_value_heads == 0) {
+      return reject(
+          "flint.attention.head_count and flint.attention.head_count_kv: "
+          "must be positive");
+    }
+    if (head_dim == 0) {
+      return reject("flint.attention.key_length: must be positive");
+    }
+    if (vocab_size == 0 || context_length == 0) {
+      return reject("flint.context_length: must be positive");
+    }
+    if (sliding_window_pattern.size() != num_layers) {
+      return reject("flint.attention.sliding_window_pattern: expected " +
+                    std::to_string(num_layers) + " entries, got " +
+                    std::to_string(sliding_window_pattern.size()));
+    }
+    if (rope_pattern.size() != num_layers) {
+      return reject("flint.attention.rope_pattern: expected " +
+                    std::to_string(num_layers) + " entries, got " +
+                    std::to_string(rope_pattern.size()));
+    }
+    if (IsMoe()) {
+      if (expert_used_count == 0 || expert_used_count > expert_count) {
+        return reject(
+            "flint.expert_used_count: must be in (0, flint.expert_count]");
+      }
+      if (expert_feed_forward_length == 0) {
+        return reject(
+            "flint.expert_feed_forward_length: must be positive when "
+            "flint.expert_count > 0");
+      }
+      if (expert_shared_count > 0 && expert_shared_feed_forward_length == 0) {
+        return reject(
+            "flint.expert_shared_feed_forward_length: must be positive when "
+            "flint.expert_shared_count > 0");
+      }
+      if (expert_gating_func != 2) {
+        // Fail closed: an unknown gating function must never fall back to
+        // softmax silently.
+        return reject(
+            "flint.expert_gating_func: only 2 (sigmoid) is "
+            "supported, got " +
+            std::to_string(expert_gating_func));
+      }
+      if (leading_dense_block_count > num_layers) {
+        return reject(
+            "flint.leading_dense_block_count: exceeds flint.block_count");
+      }
+    }
+    return true;
   }
 
   /// Returns true if this configuration conforms to the Qwen3.5/3.8 repeating

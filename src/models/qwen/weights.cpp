@@ -144,6 +144,17 @@ std::optional<QwenModelWeights> QwenModelWeights::LoadFromGguf(
   if (!config_opt.has_value()) {
     return std::nullopt;
   }
+  if (config_opt->IsFlintArch()) {
+    // D3 policy gate: the qwen runtime serves Qwen3.5/3.8 and Flash-Next.
+    // Flint loads through its own path once the AR port lands (F-B1) — never
+    // silently through DeltaNet-shaped code.
+    if (error_msg != nullptr) {
+      *error_msg =
+          "flint architecture is not loadable by the qwen runtime; its AR "
+          "path is not implemented yet";
+    }
+    return std::nullopt;
+  }
 
   QwenModelWeights weights;
   weights.config = *config_opt;

@@ -199,6 +199,12 @@ public:
       std::string_view key) const noexcept;
   [[nodiscard]] std::vector<std::string_view> GetMetadataStringArray(
       std::string_view key) const;
+  /// Widened unsigned/boolean integer array (GGUF u8/u16/u32/u64/bool items).
+  [[nodiscard]] std::vector<std::uint64_t> GetMetadataUintArray(
+      std::string_view key) const;
+  /// Widened signed integer array (GGUF i8/i16/i32/i64 items).
+  [[nodiscard]] std::vector<std::int64_t> GetMetadataIntArray(
+      std::string_view key) const;
   /// Tensor lookup helpers
   [[nodiscard]] const GgufTensorInfo* FindTensor(
       std::string_view name) const noexcept;
