@@ -6,6 +6,7 @@
 #include <span>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/vision/rope.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -28,7 +29,9 @@ void LaunchFusedQKVProjections(const void* q_w, core::GgmlType q_type,
 /// on GPU. Production supplies canonical FP16 K/V; the independent validation
 /// fallback supplies FP32 K/V. Tests may supply both representations. When
 /// skip_kv_write is true the selected KV cache is assumed already written
-/// (e.g. by the fused QK norm+RoPE kernel, opt-c010-qk-rope-kv).
+/// (e.g. by the fused QK norm+RoPE kernel, opt-c010-qk-rope-kv). `policy`,
+/// when non-null, applies flint per-head sinks and the sliding window
+/// (F-D1/F-D2) and gates dispatch to the sink-capable baseline kernels.
 void LaunchAttention(const float* q, const float* k, const float* v,
                      const float* gate, float* k_cache, float* v_cache,
                      void* k_cache_f16, void* v_cache_f16, float* out_context,
@@ -37,20 +40,24 @@ void LaunchAttention(const float* q, const float* k, const float* v,
                      std::uint32_t num_kv_heads, std::uint32_t head_dim,
                      hipStream_t stream = nullptr,
                      float* split_k_scratch = nullptr,
-                     bool skip_kv_write = false);
+                     bool skip_kv_write = false,
+                     const detail::FlintKernelPolicy* policy = nullptr);
 
 /// Runs consecutive verification queries with scalar decode arithmetic.
 /// The selected KV cache must already contain all rows. Each row sees only
 /// its causal prefix. Scratch for batch_size rows batches split-K too; a
 /// smaller span retains the scalar split-K fallback. Without scratch,
 /// supported GQA heads use bounded online attention at every causal depth.
+/// `policy` carries flint sinks/window (F-D1/F-D2); non-null gates to the
+/// baseline kernels.
 void LaunchCausalDecodeAttention(
     const float* q, const float* gate, float* k_cache, float* v_cache,
     void* k_cache_f16, void* v_cache_f16, float* out_context,
     std::uint32_t layer_idx, std::uint32_t start_pos, std::size_t batch_size,
     std::uint32_t max_context, std::uint32_t num_heads,
     std::uint32_t num_kv_heads, std::uint32_t head_dim,
-    hipStream_t stream = nullptr, std::span<float> split_k_scratch = {});
+    hipStream_t stream = nullptr, std::span<float> split_k_scratch = {},
+    const detail::FlintKernelPolicy* policy = nullptr);
 
 /// Computes Grouped-Query Softmax Attention reading position from device memory
 void LaunchAttention(const float* q, const float* k, const float* v,

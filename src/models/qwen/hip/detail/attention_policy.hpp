@@ -24,6 +24,18 @@ inline constexpr std::uint32_t kFusedQkNormMaxHeadDim{256};
   return sequence_length <= (64 * 1024 / sizeof(float) - 256);
 }
 
+/// Device-copyable per-layer attention policy for the flint stack
+/// (F-D1/F-D2). `sinks` points at the per-query-head float32 attention
+/// sinks ([num_heads], raw logit space — comparable to the scaled scores)
+/// or is null; `window` is the sliding-window key count, 0 = unbounded.
+/// Sinks join the softmax denominator with no value contribution; the
+/// launchers gate shapes whose kernels carry no sink support, so a
+/// non-null policy always reaches a sink-capable kernel.
+struct FlintKernelPolicy {
+  const float* sinks{nullptr};
+  std::uint32_t window{0};
+};
+
 struct AttentionSupportParams {
   std::size_t batch_size{0};
   std::uint32_t start_pos{0};

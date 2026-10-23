@@ -92,6 +92,9 @@ if (ENGINE_ENABLE_HIP)
   add_qwen_hip_test(qwen_attention_decode_ops_test
     tests/models/qwen/hip/attention/backend_ops_test.cpp
     "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;attention;decode;backend")
+  add_qwen_hip_test(qwen_flint_decode_ops_test
+    tests/models/qwen/hip/attention/flint_decode_ops_test.cpp
+    "hip;gpu;kernels;qwen;flint;attention;decode;slow")
   add_qwen_hip_test(qwen_attention_long_context_ops_test
     tests/models/qwen/hip/attention/long_context_ops_test.cpp
     "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;attention;decode;long-context")
