@@ -49,6 +49,7 @@
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
+#include "src/models/qwen/hip/flint_gpu_model.hpp"
 #include "src/models/qwen38_flash_next/continuation_adapter.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
 #endif
@@ -2312,6 +2313,259 @@ std::vector<std::int32_t> QwenFlashNextEngineTokens(
   return converted;
 }
 
+// ── Flint ────────────────────────────────────────────────────────────────
+// The flint runner drives the GPU decode step directly: no component cache,
+// no snapshots, no batched plans. One FlintGpuArena per request state owns
+// the step scratch and the fp32 KV cache. The KV cache is written position by
+// position and only ever read at [0, pos], so an exact-prefix reuse state can
+// continue without a reset (the arena has no reset to call).
+
+constexpr std::string_view kFlintStateAbi = "flint-kv-f32-v1";
+
+class FlintTextRunnerState final : public TextRunnerState {
+public:
+  FlintTextRunnerState(const hip::FlintGpuModel& model,
+                       std::uint32_t max_context)
+      : arena_(model.GetConfig(), max_context),
+        buffers_(arena_.GetBuffers()),
+        logits_(model.GetConfig().vocab_size, 0.0F) {}
+
+  void Invalidate() noexcept override {
+    position_ = 0;
+    has_frontier_logits_ = false;
+  }
+
+  [[nodiscard]] TextRunnerMeasuredResources MeasuredResources()
+      const noexcept override {
+    return {.per_request_state_bytes = arena_.GetScratchBytes()};
+  }
+
+  [[nodiscard]] hip::FlintGpuStepBuffers buffers() const noexcept {
+    return buffers_;
+  }
+  [[nodiscard]] std::size_t position() const noexcept { return position_; }
+  void set_position(std::size_t position) noexcept { position_ = position; }
+  [[nodiscard]] std::vector<float>& logits() noexcept { return logits_; }
+  [[nodiscard]] bool has_frontier_logits() const noexcept {
+    return has_frontier_logits_;
+  }
+  void mark_frontier() noexcept { has_frontier_logits_ = true; }
+  void clear_frontier() noexcept { has_frontier_logits_ = false; }
+
+private:
+  hip::FlintGpuArena arena_;
+  hip::FlintGpuStepBuffers buffers_{};
+  std::vector<float> logits_;
+  std::size_t position_{0};
+  bool has_frontier_logits_{false};
+};
+
+FlintTextRunnerState& RequireFlintState(TextRunnerState& state) {
+  auto* flint = dynamic_cast<FlintTextRunnerState*>(&state);
+  if (flint == nullptr) {
+    throw std::logic_error("text runner state is not flint");
+  }
+  return *flint;
+}
+
+const FlintTextRunnerState& RequireFlintState(const TextRunnerState& state) {
+  const auto* flint = dynamic_cast<const FlintTextRunnerState*>(&state);
+  if (flint == nullptr) {
+    throw std::logic_error("text runner state is not flint");
+  }
+  return *flint;
+}
+
+class FlintTextRunner final : public HipTextModelRunner {
+public:
+  FlintTextRunner(std::shared_ptr<const hip::FlintGpuModel> model,
+                  std::shared_ptr<const tokenization::QwenTokenizer> tokenizer,
+                  std::uint32_t max_context)
+      : model_(std::move(model)),
+        tokenizer_(std::move(tokenizer)),
+        max_context_(max_context) {
+    if (model_ == nullptr || tokenizer_ == nullptr) {
+      throw std::invalid_argument(
+          "the flint runner requires a model and a tokenizer");
+    }
+  }
+
+  [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
+    return {
+        .model_id = model_->GetConfig().model_name,
+        .state_abi = std::string(kFlintStateAbi),
+        .max_context = max_context_,
+        .capabilities =
+            TextRunnerCapabilities{
+                .incremental_prefill = true,
+                .snapshot = false,
+                .fork = false,
+                .final_token_advance_required = true,
+                .incremental_text_is_exact = true,
+                .multi_token_decode = false,
+                .batched_multi_token_decode = false,
+                .prefix_reuse = true,
+                .partial_prefill_retention = false,
+                .prefill_rollback = false,
+            },
+        .persistence = std::nullopt,
+    };
+  }
+
+  [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
+    std::size_t free_bytes = 0;
+    std::size_t total_bytes = 0;
+    std::optional<std::size_t> capacity;
+    if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess) {
+      capacity = free_bytes;
+    }
+    return {
+        .resident_weights_bytes = model_->GetResidentBytes(),
+        .state_capacity_bytes = capacity,
+        .per_request_state_bytes = std::nullopt,
+        .temporary_scratch_bytes = std::nullopt,
+        .retained_snapshot_capacity_bytes = std::nullopt,
+        .retained_snapshot_ceiling_bytes = std::nullopt,
+        .requires_device_runtime_lock = true,
+    };
+  }
+
+  [[nodiscard]] std::vector<TextExecutionPlan> SupportedPlans() const override {
+    return {
+        {
+            .kind = TextExecutionPlanKind::kSerial,
+            .physical_width = 1,
+        },
+    };
+  }
+
+  [[nodiscard]] std::shared_ptr<const sampling::ConstraintVocabulary>
+  BuildConstraintVocabulary() const override {
+    return std::make_shared<const sampling::ConstraintVocabulary>(
+        tokenizer_->GetVocabSize(), [this](std::uint32_t id) {
+          return sampling::ConstraintVocabulary::Piece{
+              tokenizer_->DecodeTokenCopy(id), tokenizer_->IsStopToken(id)};
+        });
+  }
+
+  [[nodiscard]] std::uint32_t VocabularySize() const override {
+    return static_cast<std::uint32_t>(tokenizer_->GetVocabSize());
+  }
+
+  [[nodiscard]] std::vector<TextRunnerToken> Tokenize(
+      std::string_view text) const override {
+    return tokenizer_->Encode(text);
+  }
+
+  [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
+      const ChatRequest& request) const override {
+    const auto tools =
+        request.tool_choice == ChatRequest::ToolChoice::kNone
+            ? std::span<const tokenization::ChatTool>{}
+            : std::span<const tokenization::ChatTool>{request.tools};
+    auto options = tokenization::ChatTemplateOptions{};
+    options.max_output_bytes =
+        tokenization::RenderedPromptBoundBytes(max_context_);
+    return tokenization::FlintChatTemplate::RenderAndTokenize(
+        *tokenizer_, request.messages, tools, options);
+  }
+
+  [[nodiscard]] std::string Decode(
+      std::span<const TextRunnerToken> tokens) const override {
+    return tokenizer_->Decode(tokens);
+  }
+
+  [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
+    return std::make_unique<FlintTextRunnerState>(*model_, max_context_);
+  }
+
+  [[nodiscard]] TextPrefillStep Prefill(
+      TextRunnerState& state, std::span<const TextRunnerToken> prompt,
+      std::size_t offset, std::size_t max_input_tokens) const override {
+    auto& flint = RequireFlintState(state);
+    if (offset != flint.position()) {
+      throw std::logic_error(
+          "flint prefill offset does not match retained state");
+    }
+    if (offset >= prompt.size()) {
+      throw std::logic_error("flint prefill has no remaining input");
+    }
+    const std::size_t consumed =
+        std::min(max_input_tokens, prompt.size() - offset);
+    if (offset + consumed > max_context_) {
+      throw std::invalid_argument("flint prompt exceeds the served context");
+    }
+    const bool last_chunk = offset + consumed == prompt.size();
+    for (std::size_t i = 0; i < consumed; ++i) {
+      // Steps queue on the arena stream: consecutive tokens need no host
+      // round-trip, and only the final prompt token needs the logits.
+      const bool compute_logits = last_chunk && i + 1 == consumed;
+      hip::ExecuteFlintDecodeStep(
+          model_->GetWeights(), prompt[offset + i],
+          static_cast<std::uint32_t>(offset + i), compute_logits,
+          flint.buffers());
+      if (compute_logits) {
+        HIP_CHECK(hipStreamSynchronize(flint.buffers().stream));
+        HIP_CHECK(hipMemcpy(flint.logits().data(), flint.buffers().logits,
+                            flint.logits().size() * sizeof(float),
+                            hipMemcpyDeviceToHost));
+        flint.mark_frontier();
+      }
+    }
+    flint.set_position(offset + consumed);
+    return {
+        .consumed_tokens = consumed,
+        .decode_ready = last_chunk,
+    };
+  }
+
+  [[nodiscard]] TextDecodeSelection SelectNext(
+      TextRunnerState& state, sampling::SamplerState& sampler) const override {
+    auto& flint = RequireFlintState(state);
+    if (flint.position() >= max_context_) {
+      return {.stop = true, .piece = {}};
+    }
+    if (!flint.has_frontier_logits()) {
+      throw std::logic_error("flint selection has no frontier logits");
+    }
+    const auto token = sampler.Sample(flint.logits());
+    if (flint.stop_at_eos() && tokenizer_->IsStopToken(token)) {
+      return {.stop = true, .token = 0, .piece = {}};
+    }
+    return {
+        .stop = false,
+        .token = static_cast<TextRunnerToken>(token),
+        .piece = std::string(tokenizer_->DecodeToken(token)),
+    };
+  }
+
+  void Advance(TextRunnerState& state, TextRunnerToken token) const override {
+    auto& flint = RequireFlintState(state);
+    if (flint.position() >= max_context_) {
+      throw std::logic_error("flint decode exceeds the served context");
+    }
+    hip::ExecuteFlintDecodeStep(model_->GetWeights(), token,
+                                static_cast<std::uint32_t>(flint.position()),
+                                /*compute_logits=*/true, flint.buffers());
+    HIP_CHECK(hipStreamSynchronize(flint.buffers().stream));
+    HIP_CHECK(hipMemcpy(flint.logits().data(), flint.buffers().logits,
+                        flint.logits().size() * sizeof(float),
+                        hipMemcpyDeviceToHost));
+    flint.mark_frontier();
+    flint.set_position(flint.position() + 1);
+  }
+
+  [[nodiscard]] std::size_t CheckpointPosition(
+      const TextRunnerState& state) const override {
+    return RequireFlintState(state).position();
+  }
+
+private:
+  std::shared_ptr<const hip::FlintGpuModel> model_;
+  std::shared_ptr<const tokenization::QwenTokenizer> tokenizer_;
+  std::uint32_t max_context_;
+};
+
 class QwenFlashNextTextRunnerState final : public TextRunnerState {
 public:
   QwenFlashNextTextRunnerState(QwenFlashNextSession& session,
@@ -3117,9 +3371,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   if (architecture == "flint") {
     // F-A4 load branch: flint is registered explicitly so it never falls
     // through to another runtime. F-B3/F-B4 close drafting and vision; the
-    // autoregressive forward lands in M2, so until then the server loads
-    // and validates the full tensor inventory and refuses with an
-    // actionable message instead of serving garbage.
+    // GPU decode step serves autoregressive requests through the flint
+    // runner (F-L1), which owns one arena per request state.
     std::string flint_err;
     if (!core::ValidateFlintOptions(
             !vision_model_path.empty(),
@@ -3130,17 +3383,26 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
       SetError(error, flint_err);
       return false;
     }
-    std::string flint_load_err;
-    const auto flint_weights =
-        models::FlintModelWeights::LoadFromGguf(*reader, &flint_load_err);
-    if (flint_weights.has_value()) {
-      SetError(error,
-               "the flint autoregressive forward is not implemented yet; "
-               "the tensor inventory loaded and validated cleanly");
-    } else {
-      SetError(error, "Failed to load flint weights: " + flint_load_err);
+    if (!tokenization::FlintChatTemplate::ValidateGgufTemplate(*reader,
+                                                               &flint_err)) {
+      SetError(error, "Unsupported flint chat template: " + flint_err);
+      return false;
     }
-    return false;
+    std::shared_ptr<const tokenization::QwenTokenizer> flint_tokenizer =
+        tokenization::QwenTokenizer::CreateFromGguf(*reader, &flint_err);
+    if (!flint_tokenizer) {
+      SetError(error, "Failed to load flint tokenizer: " + flint_err);
+      return false;
+    }
+    auto flint_model = hip::FlintGpuModel::CreateFromGguf(reader, &flint_err);
+    if (flint_model == nullptr) {
+      SetError(error, "Failed to create flint GPU model: " + flint_err);
+      return false;
+    }
+    return load(std::move(flint_model), std::move(flint_tokenizer), error,
+                max_context, session_count, prefill_policy, scheduler_policy,
+                speculative_config, std::move(resolved_disk_cache_config),
+                ram_cache_config);
   }
   if (reader->GetMetadataString("general.architecture") == "qwen4exp") {
     if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
@@ -3402,6 +3664,65 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
     auto runner_pool = std::make_shared<TextRunnerPool>(
         std::move(runner), session_count, std::move(runner_disk_cache),
         ram_cache_config);
+    new_state->scheduler = std::make_shared<TextGenerationScheduler>(
+        std::move(runner_pool), prefill_policy, scheduler_policy);
+    {
+      const std::lock_guard<std::mutex> lock(impl_->state_mutex);
+      impl_->state = std::move(new_state);
+    }
+    return true;
+  } catch (const std::exception& exception) {
+    SetError(error, exception.what());
+    return false;
+  }
+}
+
+bool InferenceBackend::load(
+    std::shared_ptr<const hip::FlintGpuModel> model,
+    std::shared_ptr<const tokenization::QwenTokenizer> tokenizer,
+    std::string* error, std::uint32_t max_context, std::size_t session_count,
+    TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
+    TextSpeculativeConfig speculative_config,
+    TextDiskCacheConfig disk_cache_config,
+    TextRunnerRamCacheOptions ram_cache_config) {
+  if (model == nullptr || tokenizer == nullptr) {
+    SetError(error, "flint model and tokenizer must not be null");
+    return false;
+  }
+  const auto native_context = model->GetConfig().context_length;
+  if (max_context == 0) {
+    max_context = std::min(native_context, core::kFlintServedContextCap);
+  }
+  if (max_context < 2 || max_context > core::kFlintServedContextCap) {
+    SetError(error, "HTTP context exceeds the flint build cap (" +
+                        std::to_string(core::kFlintServedContextCap) +
+                        " tokens; fp32 full-KV cache, F-I1)");
+    return false;
+  }
+  if (session_count == 0) {
+    SetError(error, "HTTP session count must be at least one");
+    return false;
+  }
+  if (speculative_config.backend != TextSpeculativeBackend::kDisabled ||
+      !speculative_config.draft_model_path.empty()) {
+    SetError(error, "flint does not support speculative decoding");
+    return false;
+  }
+  if (DiskCacheEnabled(disk_cache_config)) {
+    SetError(error, "the flint runner does not support the disk cache yet");
+    return false;
+  }
+
+  try {
+    auto new_state = std::make_shared<Impl::State>();
+    new_state->sampling_defaults.model = sampling::TextModelPreset::kFlint;
+    new_state->sampling_defaults.supplied = {};
+    auto runner = std::make_shared<FlintTextRunner>(
+        std::move(model), std::move(tokenizer), max_context);
+    new_state->model_id = runner->Descriptor().model_id;
+    new_state->max_context = max_context;
+    auto runner_pool = std::make_shared<TextRunnerPool>(
+        std::move(runner), session_count, std::nullopt, ram_cache_config);
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
         std::move(runner_pool), prefill_policy, scheduler_policy);
     {

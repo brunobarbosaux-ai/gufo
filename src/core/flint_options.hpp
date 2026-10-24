@@ -1,9 +1,15 @@
 #ifndef GUFO_CORE_FLINT_OPTIONS_HPP_
 #define GUFO_CORE_FLINT_OPTIONS_HPP_
 
+#include <cstdint>
 #include <string>
 
 namespace gufo::core {
+
+/// Served-context cap for the fp32 full-KV flint cache (F-I1): 32k positions
+/// cost ~6.3 GB per session, so the build serves at most this window until a
+/// window-aware cache exists.
+inline constexpr std::uint32_t kFlintServedContextCap = 32768;
 
 /// Closes every runtime option the flint architecture cannot serve (F-B3,
 /// F-B4): no MTP/nextn, no DFlash2, no DSpark drafting, and no vision

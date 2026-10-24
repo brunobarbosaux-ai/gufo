@@ -1,0 +1,5 @@
+# Build artifacts are produced inside the builder stage; shipping the host's
+# build/ directory would add several GB to the build context.
+build/
+.git
+*.gguf
