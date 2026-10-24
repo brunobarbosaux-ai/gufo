@@ -842,11 +842,21 @@ int main(int argc, char** argv) {
   }
 
   if (chunk) {
+    // Optional third arg: token count for the chunk-size sweep (tuning item
+    // 2.5 — 181/512; capacity is 512 so larger is clamped). Default is the
+    // full 512-token capacity.
+    const std::size_t want =
+        argc > 3
+            ? static_cast<std::size_t>(std::atoi(argv[3]))
+            : gufo::hip::kFlintPrefillBatchCapacity;
+    const std::size_t count = std::min<std::size_t>(
+        want, gufo::hip::kFlintPrefillBatchCapacity);
+    Expect(count > 1, "chunk token count must be at least two");
     std::vector<gufo::tokenization::TokenId> tokens;
-    while (tokens.size() < gufo::hip::kFlintPrefillBatchCapacity) {
+    while (tokens.size() < count) {
       tokens.insert(tokens.end(), prompt_tokens.begin(), prompt_tokens.end());
     }
-    tokens.resize(gufo::hip::kFlintPrefillBatchCapacity);
+    tokens.resize(count);
     // Optional second arg: arena max_context (default 4096). The serve path
     // runs 32768 — the 6.6 GB KV plane changes the allocation landscape, so
     // the chunk must be checked there too.
