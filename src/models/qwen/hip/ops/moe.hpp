@@ -96,7 +96,9 @@ void LaunchFlintFusedMoEDown(const void* down_stack,
 // ---------------------------------------------------------------------------
 
 /// logits[t, e] = x[t] . W_router[e] for the whole chunk. `type` must be
-/// kF32, kF16 or kBF16 (the router tensor's storage type).
+/// kF32, kF16 or kBF16 (the router tensor's storage type). Uses the tiled
+/// LDS kernel when hidden % 64 == 0 (GUFO_FLINT_ROUTER_SCALAR=1 forces the
+/// scalar fallback for A/B measurements).
 void LaunchFlintRouterBatch(const float* x, std::size_t n_tokens,
                             const void* w, core::GgmlType type,
                             std::size_t expert_count, std::size_t hidden,
