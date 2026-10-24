@@ -247,8 +247,8 @@ void ExecuteFlintPrefillChunk(const models::FlintModelWeights& weights,
                          static_cast<const float*>(layer.attn_norm.data),
                          prefill.normed, nullptr, n, hidden, kFlintRmsEps,
                          stream);
-    // normed is read by five projections this layer (q/k/v, shared gate/up,
-    // and the MoE gather) — quantize it once (2.4).
+    // normed (attention norm) feeds q/k/v — quantize it once for the three
+    // readers (2.4). The FFN-side readers re-quantize after the FFN norm.
     LaunchQuantizeActivationQ8_1FromFp32(prefill.normed, prefill.q8_normed, n,
                                          hidden, stream);
     mark(kNorm);
@@ -317,6 +317,12 @@ void ExecuteFlintPrefillChunk(const models::FlintModelWeights& weights,
       const std::size_t shared_ff = config.expert_shared_feed_forward_length;
       const std::size_t expert_slab = expert_ff * hidden;
 
+      // The FFN norm overwrote normed, so the FFN-side q8_1 readers (shared
+      // expert gate/up and the WMMA MoE gather) need codes from THIS norm —
+      // re-quantize here. The QKV readers consumed the attention-norm codes
+      // earlier in the layer, which is why one shared buffer is not enough.
+      LaunchQuantizeActivationQ8_1FromFp32(prefill.normed, prefill.q8_normed, n,
+                                           hidden, stream);
       // Router and device-side slot compaction.
       LaunchFlintRouterBatch(prefill.normed, n, layer.ffn_gate_inp.data,
                              layer.ffn_gate_inp.type, config.expert_count,

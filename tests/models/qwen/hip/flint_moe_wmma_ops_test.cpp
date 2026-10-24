@@ -16,7 +16,9 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
 #include <iostream>
+#include <numeric>
 #include <vector>
 
 #include "src/core/quant/ggml_dequant.hpp"
@@ -62,10 +64,13 @@ float Uniform(std::uint32_t* state, float scale) {
 }
 
 // Full-mantissa, non-power-of-two scales so summation order matters (the
-// kquant_gemv rationale): a power of two hides reassociation bugs.
+// kquant_gemv rationale): a power of two hides reassociation bugs. Small
+// values keep the synthetic SwiGLU outputs from spanning enough dynamic range
+// that the down-projection dot cancels catastrophically (f32 rounding of the
+// kernel is then the dominant error term, not the kernel's structure).
 std::uint16_t TestScaleHalf(std::size_t block) noexcept {
-  static constexpr std::uint16_t kScales[4] = {0x3555U, 0x2E67U, 0x39ABU,
-                                               0x3123U};
+  static constexpr std::uint16_t kScales[4] = {0x2AAAU, 0x28CCU, 0x2B33U,
+                                               0x2955U};
   return kScales[block % 4];
 }
 
@@ -316,6 +321,12 @@ int RunCase(std::size_t n, std::size_t used, std::size_t experts,
       d_gate, d_up, GgmlType::kQ6_K, d_slotq, d_gate_out, d_up_out, d_offsets,
       d_tile_expert, d_tile_slot0, d_tile_count, tiles_bound, experts,
       expert_ff, hidden, slab_gate);
+  // Snapshot gate/up before the in-place SwiGLU rewrites d_gate_out.
+  std::vector<float> h_gate_out(cap * expert_ff), h_up_out(cap * expert_ff);
+  HIP_CHECK(hipMemcpy(h_gate_out.data(), d_gate_out,
+                      cap * expert_ff * sizeof(float), hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(h_up_out.data(), d_up_out,
+                      cap * expert_ff * sizeof(float), hipMemcpyDeviceToHost));
   gufo::hip::LaunchBatchedSwiGLUActivation(d_gate_out, d_up_out, d_gate_out,
                                            nullptr, cap * expert_ff);
   gufo::hip::LaunchQuantizeActivationQ8_1FromFp32(d_gate_out, d_actq, cap,
@@ -395,12 +406,6 @@ int RunCase(std::size_t n, std::size_t used, std::size_t experts,
   HIP_CHECK(hipMemcpy(h_xq.data(), d_xq, xq_bytes, hipMemcpyDeviceToHost));
   const std::vector<float> xq = DecodeTiledQ8(h_xq, n, hidden);
 
-  std::vector<float> h_gate_out(cap * expert_ff), h_up_out(cap * expert_ff);
-  HIP_CHECK(hipMemcpy(h_gate_out.data(), d_gate_out,
-                      cap * expert_ff * sizeof(float), hipMemcpyDeviceToHost));
-  HIP_CHECK(hipMemcpy(h_up_out.data(), d_up_out, cap * expert_ff * sizeof(float),
-                      hipMemcpyDeviceToHost));
-
   // gate/up per real slot.
   std::vector<double> worst_gate(2, 0.0);
   for (std::size_t e = 0; e < experts; ++e) {
@@ -426,8 +431,33 @@ int RunCase(std::size_t n, std::size_t used, std::size_t experts,
   }
   std::cout << "  gate/up: max_rel=" << worst_gate[0] << " / "
             << worst_gate[1] << "\n";
-  Expect(worst_gate[0] < 5e-3 && worst_gate[1] < 5e-3,
-         "grouped gate/up must match the dequantized reference");
+  if (!(worst_gate[0] < 5e-3 && worst_gate[1] < 5e-3)) {
+    // First mismatch details, to steer debugging fast.
+    std::size_t e0 = experts, r0 = 0, t0 = 0;
+    double got0 = 0, ref0 = 0;
+    for (std::size_t e = 0; e < experts && e0 == experts; ++e) {
+      for (int s = offsets[e]; s < offsets[e] + counts[e] && e0 == experts; ++s) {
+        const std::size_t t = static_cast<std::size_t>(slot_tokens[s]);
+        for (std::size_t r = 0; r < expert_ff && e0 == experts; ++r) {
+          const double rg = DotF64(
+              w_gate.data() + (e * expert_ff + r) * hidden,
+              xq.data() + t * hidden, hidden);
+          const double got =
+              h_gate_out[static_cast<std::size_t>(s) * expert_ff + r];
+          if (std::fabs(got - rg) > 5e-3 * (1.0 + std::fabs(rg))) {
+            e0 = e;
+            r0 = r;
+            t0 = t;
+            got0 = got;
+            ref0 = rg;
+          }
+        }
+      }
+    }
+    std::cout << "    first gate mismatch: e=" << e0 << " s-slot r=" << r0
+              << " tok=" << t0 << " got=" << got0 << " ref=" << ref0 << "\n";
+    Expect(false, "grouped gate/up must match the dequantized reference");
+  }
 
   // SwiGLU + requantize + down. The device SwiGLU ran over all padded rows;
   // reference rows exist only for real slots.
@@ -444,28 +474,80 @@ int RunCase(std::size_t n, std::size_t used, std::size_t experts,
   }
   const std::vector<float> ref_actq = QuantizeDequantCpu(ref_act, expert_ff);
 
+  // The device's own quantized activations: the kernel-only down reference
+  // (the CPU requantize of the SwiGLU output differs from the device quantize
+  // by 1-ulp expf rounding, which flips a code near a .5 boundary and costs
+  // ~1 code over the k-dot — quantisation noise, not kernel error).
+  std::vector<std::uint8_t> h_actq(actq_bytes);
+  HIP_CHECK(hipMemcpy(h_actq.data(), d_actq, actq_bytes, hipMemcpyDeviceToHost));
+  const std::vector<float> actq_dev = DecodeTiledQ8(h_actq, cap, expert_ff);
+
   std::vector<float> h_down_out(cap * hidden);
   HIP_CHECK(hipMemcpy(h_down_out.data(), d_down_out,
                       cap * hidden * sizeof(float), hipMemcpyDeviceToHost));
+  // Normalise by the computation's own magnitude (sum of per-block partial
+  // magnitudes), not by |ref|: the k-dot can cancel several orders of
+  // magnitude on synthetic data, and f32 rounding of the terms then dwarfs
+  // |ref|. A structural bug (wrong expert/row/stage/slot) still produces an
+  // O(1) error under this metric; f32 rounding sits at ~1e-7.
   double worst_down = 0.0;
-  for (std::size_t e = 0; e < experts; ++e) {
-    for (int s = offsets[e]; s < offsets[e] + counts[e]; ++s) {
-      for (std::size_t r = 0; r < hidden; ++r) {
-        const double rd = slot_weights[s] *
-                          DotF64(w_down.data() + (e * hidden + r) * expert_ff,
-                                 ref_actq.data() +
-                                     static_cast<std::size_t>(s) * expert_ff,
-                                 expert_ff);
-        const double ed = std::fabs(
-                              rd - h_down_out[static_cast<std::size_t>(s) *
-                                              hidden + r]) /
-                          (1.0 + std::fabs(rd));
-        worst_down = std::fmax(worst_down, ed);
+  {
+    const std::size_t nb = expert_ff / 32;
+    for (std::size_t e = 0; e < experts; ++e) {
+      for (int s = offsets[e]; s < offsets[e] + counts[e]; ++s) {
+        for (std::size_t r = 0; r < hidden; ++r) {
+          const float* w = w_down.data() + (e * hidden + r) * expert_ff;
+          const float* a =
+              actq_dev.data() + static_cast<std::size_t>(s) * expert_ff;
+          double ref = 0.0;
+          double scale = 0.0;
+          for (std::size_t b = 0; b < nb; ++b) {
+            const double p = DotF64(w + b * 32, a + b * 32, 32);
+            ref += p;
+            scale += std::fabs(p);
+          }
+          ref *= slot_weights[s];
+          const double got =
+              h_down_out[static_cast<std::size_t>(s) * hidden + r];
+          const double ed = std::fabs(got - ref) / (1.0 + scale);
+          worst_down = std::fmax(worst_down, ed);
+        }
       }
     }
   }
-  std::cout << "  down: max_rel=" << worst_down << "\n";
-  Expect(worst_down < 5e-3, "grouped down must match the dequantized reference");
+  std::cout << "  down: max_err=" << worst_down << "\n";
+  Expect(worst_down < 1e-5,
+         "grouped down must match the dequantized reference");
+  // Chain check: the device quantize of the device SwiGLU output against the
+  // CPU mirror. They may differ by one code per element (expf rounding);
+  // more than one code means the SwiGLU or quantize diverged.
+  {
+    const std::size_t nb = expert_ff / 32;
+    std::size_t flips = 0;
+    for (std::size_t e = 0; e < experts; ++e) {
+      for (int s = offsets[e]; s < offsets[e] + counts[e]; ++s) {
+        for (std::size_t b = 0; b < nb; ++b) {
+          float d_cpu = 0.0F;
+          for (std::size_t j = 0; j < 32; ++j) {
+            d_cpu = std::fmax(
+                d_cpu, std::fabs(ref_act[static_cast<std::size_t>(s) *
+                                              expert_ff +
+                                          b * 32 + j]));
+          }
+          d_cpu /= 127.0F;
+          for (std::size_t j = 0; j < 32; ++j) {
+            const std::size_t idx =
+                static_cast<std::size_t>(s) * expert_ff + b * 32 + j;
+            if (std::fabs(actq_dev[idx] - ref_actq[idx]) > 1.5F * d_cpu) {
+              ++flips;
+            }
+          }
+        }
+      }
+    }
+    std::cout << "  actq chain: >1-code flips=" << flips << "\n";
+    Expect(flips == 0, "SwiGLU+quantize chain must match the CPU mirror");
+  }
 
   // Combine in selection order.
   std::vector<float> h_mlp(n * hidden);
