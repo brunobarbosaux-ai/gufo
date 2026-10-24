@@ -426,7 +426,6 @@ __launch_bounds__(WavesPerBlock * 32, 4) __global__
       }
       sum_g0 += dg0 * blk_g0;
       sum_u0 += du0 * blk_u0;
-
       if (g1_blocks != nullptr && u1_blocks != nullptr) {
         const Q8_0Block& gb1 = g1_blocks[b];
         const Q8_0Block& ub1 = u1_blocks[b];

@@ -66,6 +66,16 @@ void RunSwiGLU(const models::QwenTensorRef& gate,
                         intermediate_size, hidden_size, stream);
 }
 
+/// Types the fused MoE kernels can decode: exactly the switch in
+/// QuantWarpBlockDot (Q8_0 plus the sub-16 decoded set). Anything else
+/// (f32 fixtures, BF16, Q8_K) must stay on the legacy readback path.
+[[nodiscard]] bool FusedMoESupported(core::GgmlType t) noexcept {
+  return t == core::GgmlType::kQ8_0 || t == core::GgmlType::kQ4_K ||
+         t == core::GgmlType::kQ5_K || t == core::GgmlType::kQ6_K ||
+         t == core::GgmlType::kQ3_K || t == core::GgmlType::kIQ4_NL ||
+         t == core::GgmlType::kIQ4_XS || t == core::GgmlType::kIQ3_S;
+}
+
 void RunFlintLayer(const models::FlintModelWeights& weights,
                    const models::FlintLayerWeights& layer,
                    std::uint32_t layer_idx, std::uint32_t pos,
@@ -132,49 +142,100 @@ void RunFlintLayer(const models::FlintModelWeights& weights,
   } else {
     const std::size_t expert_ff = config.expert_feed_forward_length;
     const std::size_t expert_slab = expert_ff * hidden_size;
+    const std::size_t shared_ff = config.expert_shared_feed_forward_length;
     const std::uint32_t used = config.expert_used_count;
 
     LaunchGEMV(layer.ffn_gate_inp.data, layer.ffn_gate_inp.type, b.normed,
                b.router_logits, config.expert_count, hidden_size, b.stream);
-    LaunchFlintRouterTopK(b.router_logits, config.expert_count, used,
-                          config.expert_weights_norm,
-                          config.expert_weights_scale, b.selected,
-                          b.expert_weights, b.stream);
 
-    // Read the selection back so the host can offset expert slabs for the
-    // per-expert GEMV launches. Optimization target: device-side fused MoE
-    // dispatch removes this per-layer sync.
-    std::vector<std::uint32_t> h_selected(kMaxSelectedExperts);
-    std::vector<float> h_weights(kMaxSelectedExperts);
-    HIP_CHECK(hipMemcpyAsync(h_selected.data(), b.selected,
-                             used * sizeof(std::uint32_t), hipMemcpyDeviceToHost,
-                             b.stream));
-    HIP_CHECK(hipMemcpyAsync(h_weights.data(), b.expert_weights,
-                             used * sizeof(float), hipMemcpyDeviceToHost,
-                             b.stream));
-    HIP_CHECK(hipStreamSynchronize(b.stream));
+    // F-J1 fused dispatch: the router writes the full weight array on
+    // device and compacts the selected ids into the job list; the two
+    // fused kernels index experts through the job list (shared expert
+    // included) — no readback sync, no per-selected-expert launches, and
+    // grids spanning only real jobs. Four launches for the whole branch.
+    // Per-kernel type consistency only: the SwiGLU kernel decodes both
+    // routed stacks with one type (gate == up), the down kernel uses the
+    // down type, and each shared matrix decodes with its own type.
+    // UD-Q6_K_XL is mixed like this on every MoE layer (gate/up Q6_K,
+    // down Q8_0, shared Q8_0).
+    const bool fused =
+        layer.ffn_gate_exps.type == layer.ffn_up_exps.type &&
+        FusedMoESupported(layer.ffn_gate_exps.type) &&
+        FusedMoESupported(layer.ffn_down_exps.type) &&
+        FusedMoESupported(layer.ffn_gate_shexp.type) &&
+        FusedMoESupported(layer.ffn_up_shexp.type) &&
+        FusedMoESupported(layer.ffn_down_shexp.type) &&
+        used + 1 <= kFlintMoeMaxJobs &&
+        b.expert_weights_full != nullptr && b.act_moe != nullptr &&
+        b.expert_job_list != nullptr;
+    if (fused) {
+      const std::size_t swiglu_slab_bytes =
+          quant::EncodedSizeBytes(layer.ffn_gate_exps.type, expert_slab);
+      const std::size_t down_slab_bytes =
+          quant::EncodedSizeBytes(layer.ffn_down_exps.type, expert_slab);
+      LaunchFlintRouterTopKFull(b.router_logits, config.expert_count, used,
+                                config.expert_weights_norm,
+                                config.expert_weights_scale,
+                                b.expert_weights_full, 1.0F, b.mlp_out,
+                                hidden_size, b.expert_job_list, b.stream);
+      LaunchFlintFusedMoESwiGLU(layer.ffn_gate_exps.data,
+                                layer.ffn_up_exps.data,
+                                layer.ffn_gate_shexp.data,
+                                layer.ffn_up_shexp.data,
+                                layer.ffn_gate_exps.type,
+                                layer.ffn_gate_shexp.type,
+                                layer.ffn_up_shexp.type, b.normed, b.act_moe,
+                                b.expert_weights_full, b.expert_job_list,
+                                used + 1, config.expert_count,
+                                expert_ff, shared_ff, hidden_size,
+                                swiglu_slab_bytes, b.stream);
+      LaunchFlintFusedMoEDown(layer.ffn_down_exps.data,
+                              layer.ffn_down_shexp.data,
+                              layer.ffn_down_exps.type,
+                              layer.ffn_down_shexp.type, b.act_moe, b.mlp_out,
+                              b.expert_weights_full, b.expert_job_list,
+                              used + 1, config.expert_count,
+                              expert_ff, shared_ff, hidden_size,
+                              down_slab_bytes, b.stream);
+    } else {
+      // Legacy readback path (f32 fixtures, mixed types): the selection is
+      // read back so the host can offset expert slabs for the per-expert
+      // GEMV launches.
+      LaunchFlintRouterTopK(b.router_logits, config.expert_count, used,
+                            config.expert_weights_norm,
+                            config.expert_weights_scale, b.selected,
+                            b.expert_weights, b.stream);
+      std::vector<std::uint32_t> h_selected(kMaxSelectedExperts);
+      std::vector<float> h_weights(kMaxSelectedExperts);
+      HIP_CHECK(hipMemcpyAsync(h_selected.data(), b.selected,
+                               used * sizeof(std::uint32_t),
+                               hipMemcpyDeviceToHost, b.stream));
+      HIP_CHECK(hipMemcpyAsync(h_weights.data(), b.expert_weights,
+                               used * sizeof(float), hipMemcpyDeviceToHost,
+                               b.stream));
+      HIP_CHECK(hipStreamSynchronize(b.stream));
 
-    LaunchFlintZero(b.mlp_out, hidden_size, b.stream);
-    for (std::uint32_t i = 0; i < used; ++i) {
-      const std::size_t expert = h_selected[i];
-      RunSwiGLU(SlabRef(layer.ffn_gate_exps, expert, expert_slab),
-                SlabRef(layer.ffn_up_exps, expert, expert_slab), b.normed,
-                b.act, b.act_gate, expert_ff, hidden_size, b.stream);
-      LaunchGEMV(ExpertSlabData(layer.ffn_down_exps, expert, expert_slab),
-                 layer.ffn_down_exps.type, b.act, b.expert_out, hidden_size,
-                 expert_ff, b.stream);
-      LaunchFlintExpertAccumulate(b.mlp_out, b.expert_out, h_weights[i],
-                                  hidden_size, b.stream);
+      LaunchFlintZero(b.mlp_out, hidden_size, b.stream);
+      for (std::uint32_t i = 0; i < used; ++i) {
+        const std::size_t expert = h_selected[i];
+        RunSwiGLU(SlabRef(layer.ffn_gate_exps, expert, expert_slab),
+                  SlabRef(layer.ffn_up_exps, expert, expert_slab), b.normed,
+                  b.act, b.act_gate, expert_ff, hidden_size, b.stream);
+        LaunchGEMV(ExpertSlabData(layer.ffn_down_exps, expert, expert_slab),
+                   layer.ffn_down_exps.type, b.act, b.expert_out, hidden_size,
+                   expert_ff, b.stream);
+        LaunchFlintExpertAccumulate(b.mlp_out, b.expert_out, h_weights[i],
+                                    hidden_size, b.stream);
+      }
+
+      // Shared expert: ungated, unit weight (F-E3).
+      RunSwiGLU(layer.ffn_gate_shexp, layer.ffn_up_shexp, b.normed, b.act,
+                b.act_gate, shared_ff, hidden_size, b.stream);
+      LaunchGEMV(layer.ffn_down_shexp.data, layer.ffn_down_shexp.type, b.act,
+                 b.expert_out, hidden_size, shared_ff, b.stream);
+      LaunchFlintExpertAccumulate(b.mlp_out, b.expert_out, 1.0F, hidden_size,
+                                  b.stream);
     }
-
-    // Shared expert: ungated, unit weight (F-E3).
-    const std::size_t shared_ff = config.expert_shared_feed_forward_length;
-    RunSwiGLU(layer.ffn_gate_shexp, layer.ffn_up_shexp, b.normed, b.act,
-              b.act_gate, shared_ff, hidden_size, b.stream);
-    LaunchGEMV(layer.ffn_down_shexp.data, layer.ffn_down_shexp.type, b.act,
-               b.expert_out, hidden_size, shared_ff, b.stream);
-    LaunchFlintExpertAccumulate(b.mlp_out, b.expert_out, 1.0F, hidden_size,
-                                b.stream);
   }
   LaunchResidualAdd(b.hidden, b.mlp_out, b.hidden, hidden_size, b.stream);
 }

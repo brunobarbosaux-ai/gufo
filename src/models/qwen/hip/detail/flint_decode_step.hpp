@@ -39,6 +39,17 @@ struct FlintGpuStepBuffers {
   float* router_logits = nullptr;
   std::uint32_t* selected = nullptr;
   float* expert_weights = nullptr;
+  /// Fused-dispatch (F-J1): renormalised weight per expert, zero for
+  /// non-selected, shared expert at slot expert_count. expert_count + 1.
+  float* expert_weights_full = nullptr;
+  /// Fused-dispatch (F-J1): per-expert SwiGLU activations,
+  /// expert_count * expert_ff + shared_ff floats.
+  float* act_moe = nullptr;
+  /// Fused-dispatch (F-J1): compacted job list written by the router
+  /// (selected ids in top-k order, shared expert last, -1 padded),
+  /// kFlintMoeMaxJobs ints. The fused kernels index experts through it so
+  /// their grids span only real jobs.
+  int* expert_job_list = nullptr;
   float* logits = nullptr;
 
   float* k_cache = nullptr;

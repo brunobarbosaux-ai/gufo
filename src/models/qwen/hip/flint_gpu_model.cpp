@@ -7,6 +7,7 @@
 
 #include "src/core/hip/hip_utils.hpp"
 #include "src/models/qwen/hip/detail/weight_regions.hpp"
+#include "src/models/qwen/hip/ops/moe.hpp"
 
 namespace gufo::hip {
 
@@ -111,7 +112,11 @@ FlintGpuArena::FlintGpuArena(const core::ModelConfig& config,
       kv_size * 2 +  // k, v
       max_ff * 2 +  // act, act_gate
       config.expert_count +  // router logits
-      8 +  // expert weights
+      8 +  // expert weights (legacy readback)
+      config.expert_count + 1 +  // expert weights full (F-J1 fused)
+      (static_cast<std::size_t>(config.expert_count) *
+           config.expert_feed_forward_length +
+       config.expert_shared_feed_forward_length) +  // act_moe (F-J1 fused)
       config.vocab_size +  // logits
       plane * 2;  // k/v cache
   scratch_bytes_ = scratch_floats * sizeof(float) +
@@ -140,6 +145,11 @@ FlintGpuArena::FlintGpuArena(const core::ModelConfig& config,
   buffers_.expert_out = alloc(hidden_size);
   buffers_.mlp_out = alloc(hidden_size);
   buffers_.router_logits = alloc(config.expert_count);
+  buffers_.expert_weights_full = alloc(config.expert_count + 1);
+  buffers_.act_moe = alloc(
+      static_cast<std::size_t>(config.expert_count) *
+          config.expert_feed_forward_length +
+      config.expert_shared_feed_forward_length);
   buffers_.logits = alloc(config.vocab_size);
   buffers_.k_cache = alloc(plane);
   buffers_.v_cache = alloc(plane);
@@ -148,6 +158,8 @@ FlintGpuArena::FlintGpuArena(const core::ModelConfig& config,
                       8 * sizeof(std::uint32_t)));
   HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&buffers_.d_out_token),
                       sizeof(std::uint32_t)));
+  HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&buffers_.expert_job_list),
+                      gufo::hip::kFlintMoeMaxJobs * sizeof(int)));
   buffers_.max_context = max_context;
   HIP_CHECK(hipStreamCreate(&buffers_.stream));
 }
@@ -185,6 +197,9 @@ void FlintGpuArena::FreeAll() noexcept {
   }
   if (buffers_.d_out_token != nullptr) {
     (void)hipFree(buffers_.d_out_token);
+  }
+  if (buffers_.expert_job_list != nullptr) {
+    (void)hipFree(buffers_.expert_job_list);
   }
   if (buffers_.stream != nullptr) {
     (void)hipStreamDestroy(buffers_.stream);
