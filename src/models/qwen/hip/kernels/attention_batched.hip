@@ -220,10 +220,43 @@ __global__ void BatchedAttentionKernel(
   }
   __syncthreads();
 
-  // Step 3: Weighted sum of V
+  // Step 3: Weighted sum of V. The p-loop is a serial accumulation chain per
+  // thread, so it runs four positions per iteration with independent
+  // accumulators; the fixed 4-way grouping keeps each output's summation
+  // order independent of the chunk size (G6 split-exactness).
   if (tid < head_dim) {
-    float ctx = 0.0F;
-    for (std::size_t p = p_begin; p < seq_len; ++p) {
+    float c0 = 0.0F, c1 = 0.0F, c2 = 0.0F, c3 = 0.0F;
+    std::size_t p = p_begin;
+    const std::size_t p_quad_end =
+        p_begin + ((seq_len - p_begin) & ~std::size_t(3));
+    for (; p < p_quad_end; p += 4) {
+      const std::size_t p_offset =
+          (((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) *
+                max_context +
+            p) *
+           head_dim);
+      const std::size_t p_offset_f16 =
+          ((static_cast<std::size_t>(layer_idx) * max_context + p) *
+           kv_width) +
+          (static_cast<std::size_t>(kv_h) * head_dim);
+      if (use_f16_cache) {
+        c0 += s_scores[p - p_begin] *
+              __half2float(v_cache_f16[p_offset_f16 + tid]);
+        c1 += s_scores[p + 1 - p_begin] *
+              __half2float(v_cache_f16[p_offset_f16 + kv_width + tid]);
+        c2 += s_scores[p + 2 - p_begin] *
+              __half2float(v_cache_f16[p_offset_f16 + 2 * kv_width + tid]);
+        c3 += s_scores[p + 3 - p_begin] *
+              __half2float(v_cache_f16[p_offset_f16 + 3 * kv_width + tid]);
+      } else {
+        c0 += s_scores[p - p_begin] * v_cache[p_offset + tid];
+        c1 += s_scores[p + 1 - p_begin] * v_cache[p_offset + head_dim + tid];
+        c2 += s_scores[p + 2 - p_begin] * v_cache[p_offset + 2 * head_dim + tid];
+        c3 += s_scores[p + 3 - p_begin] * v_cache[p_offset + 3 * head_dim + tid];
+      }
+    }
+    float ctx = (c0 + c1) + (c2 + c3);
+    for (; p < seq_len; ++p) {
       const std::size_t p_offset =
           (((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) *
                 max_context +
