@@ -90,14 +90,18 @@ namespace {
 }
 
 /// Tiled Q8_1 activation bytes (prefill_quant_gemm's layout: 16-token tiles of
-/// 576-byte K blocks with the fp32 scales inline). Mirrored here because that
-/// header carries device code and cannot be included from a host unit.
+/// 576-byte K blocks with the fp32 scales inline) PLUS the fp32 activation-sum
+/// sidecar the quantizer writes behind the tiled payload. Mirrored here
+/// because that header carries device code and cannot be included from a host
+/// unit. (The sidecar is easy to miss: only the Q4_K/Q5_K GEMMs read it, but
+/// the quantizer always writes it.)
 [[nodiscard]] std::size_t FlintQ8ActBytes(std::size_t batch,
                                           std::size_t k) noexcept {
   constexpr std::size_t kTileTokens = 16;
   constexpr std::size_t kTileBytes = 576;
+  constexpr std::size_t kSumTileBytes = kTileTokens * sizeof(float);
   const std::size_t tiles = (batch + kTileTokens - 1) / kTileTokens;
-  return tiles * (k / 32) * kTileBytes;
+  return tiles * (k / 32) * (kTileBytes + kSumTileBytes);
 }
 
 }  // namespace
@@ -182,18 +186,21 @@ FlintGpuArena::FlintGpuArena(const core::ModelConfig& config,
   // chunk immediately.
   const std::size_t cap = kFlintPrefillBatchCapacity;
   const std::size_t used = config.expert_used_count;
-  const std::size_t slots = cap * used;
+  const std::size_t slots =
+      kFlintPrefillSlotCapacity(cap, used, config.expert_count);
+  const std::size_t tiles = slots / 16;  // host bound on the tile table
   const std::size_t ffn_act = std::max<std::size_t>(
       config.intermediate_size, config.expert_shared_feed_forward_length);
   const std::size_t prefill_floats =
       cap * (hidden_size * 5 + attention_size * 2 + kv_size * 2 +
              ffn_act * 2 + config.expert_count + used) +
-      slots * (1 + config.expert_feed_forward_length + hidden_size);
+      slots * (1 + config.expert_feed_forward_length * 2 + hidden_size);
   const std::size_t prefill_ints =
       cap +  // d_tokens staging
       cap * used +  // selected
       config.expert_count * 3 + 1 +  // counts, cursors, offsets
-      slots * 2;  // slot_tokens, token_slots
+      slots * 2 +                    // slot_tokens, token_slots
+      tiles * 2 + 1;                 // tile_expert, tile_slot0, tile_count
 
   float* prefill_block = nullptr;
   HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&prefill_block),
@@ -221,6 +228,7 @@ FlintGpuArena::FlintGpuArena(const core::ModelConfig& config,
   prefill_.sel_weights = prefill_alloc(cap * used);
   prefill_.slot_weights = prefill_alloc(slots);
   prefill_.act_slots = prefill_alloc(slots * config.expert_feed_forward_length);
+  prefill_.up_slots = prefill_alloc(slots * config.expert_feed_forward_length);
   prefill_.down_slots = prefill_alloc(slots * hidden_size);
 
   int* prefill_int_block = nullptr;
@@ -240,14 +248,27 @@ FlintGpuArena::FlintGpuArena(const core::ModelConfig& config,
   prefill_.slot_tokens = int_cursor;
   int_cursor += slots;
   prefill_.token_slots = int_cursor;
+  int_cursor += slots;
+  prefill_.tile_expert = int_cursor;
+  int_cursor += tiles;
+  prefill_.tile_slot0 = int_cursor;
+  int_cursor += tiles;
+  prefill_.tile_count = int_cursor;
 
   const std::size_t q8_k = std::max<std::size_t>(
       std::max<std::size_t>(hidden_size, attention_size), ffn_act);
+  const std::size_t expert_ff = config.expert_feed_forward_length;
   HIP_CHECK(hipMalloc(&prefill_.q8_act, FlintQ8ActBytes(cap, q8_k)));
+  HIP_CHECK(hipMalloc(&prefill_.q8_normed, FlintQ8ActBytes(cap, hidden_size)));
+  HIP_CHECK(hipMalloc(&prefill_.slot_q8, FlintQ8ActBytes(slots, hidden_size)));
+  HIP_CHECK(hipMalloc(&prefill_.act_q8, FlintQ8ActBytes(slots, expert_ff)));
 
   scratch_bytes_ += prefill_floats * sizeof(float) +
                     prefill_ints * sizeof(int) +
-                    FlintQ8ActBytes(cap, q8_k);
+                    FlintQ8ActBytes(cap, q8_k) +
+                    FlintQ8ActBytes(cap, hidden_size) +
+                    FlintQ8ActBytes(slots, hidden_size) +
+                    FlintQ8ActBytes(slots, expert_ff);
 }
 
 FlintGpuArena::~FlintGpuArena() { FreeAll(); }
@@ -299,6 +320,15 @@ void FlintGpuArena::FreeAll() noexcept {
   }
   if (prefill_.q8_act != nullptr) {
     (void)hipFree(prefill_.q8_act);
+  }
+  if (prefill_.q8_normed != nullptr) {
+    (void)hipFree(prefill_.q8_normed);
+  }
+  if (prefill_.slot_q8 != nullptr) {
+    (void)hipFree(prefill_.slot_q8);
+  }
+  if (prefill_.act_q8 != nullptr) {
+    (void)hipFree(prefill_.act_q8);
   }
   if (buffers_.stream != nullptr) {
     (void)hipStreamDestroy(buffers_.stream);

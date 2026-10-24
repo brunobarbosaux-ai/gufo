@@ -25,9 +25,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
+#include <type_traits>
 
 #include "src/core/gguf_reader.hpp"
 #include "src/core/hip/hip_utils.hpp"
+#include "src/models/qwen/hip/kernels/prefill_quant_gemm.hpp"
 #include "src/models/qwen/hip/ops/moe.hpp"
 #include "src/models/qwen/hip/quant_ops.hpp"
 
@@ -39,6 +41,10 @@ constexpr int kFlintBatchRowsPerWarp = 2;  // weight rows per warp
 constexpr int kFlintBatchTokens = 8;       // tokens sharing one weight read
 constexpr int kFlintRouterWarps = 8;       // experts per router block
 constexpr int kFlintRouterTokens = 8;      // tokens per router block
+
+/// WMMA token tile: expert buckets are padded to a multiple of this so one
+/// activation tile never straddles two experts (F-L4 grouped WMMA route).
+constexpr int kFlintSlotTile = 16;
 
 // ---------------------------------------------------------------------------
 // Router: logits[N, E] = x[N, H] * W[E, H]^T for the whole chunk.
@@ -185,20 +191,45 @@ __global__ void FlintMoeCountKernel(const std::uint32_t* __restrict__ selected,
   }
 }
 
+// Bucket starts are padded to the 16-row WMMA token tile (F-L4 tuning) so a
+// tile never straddles two experts: the grouped WMMA kernels address their
+// activation tiles directly by `slot0 / 16`. The same single-threaded pass
+// emits the tile table the grouped kernels index (tile -> expert, slot base)
+// and zeroes the padding rows of the slot tables so the kernels that still
+// walk buckets by rows (the scalar grouped pair) read row 0 instead of an
+// uninitialized index.
 __global__ void FlintMoeOffsetsKernel(const int* __restrict__ counts,
                                       int* __restrict__ offsets,
                                       int* __restrict__ cursors,
+                                      int* __restrict__ slot_tokens,
+                                      float* __restrict__ slot_weights,
+                                      int* __restrict__ tile_expert,
+                                      int* __restrict__ tile_slot0,
+                                      int* __restrict__ tile_count,
                                       int expert_count) {
-  if (threadIdx.x != 0) {
+  if (threadIdx.x != 0 || blockIdx.x != 0) {
     return;
   }
   int running = 0;
+  int tiles = 0;
   for (int e = 0; e < expert_count; ++e) {
+    const int c = counts[e];
+    const int padded = (c + kFlintSlotTile - 1) & ~(kFlintSlotTile - 1);
     offsets[e] = running;
     cursors[e] = running;
-    running += counts[e];
+    for (int s = running + c; s < running + padded; ++s) {
+      slot_tokens[s] = 0;
+      slot_weights[s] = 0.0F;
+    }
+    for (int lt = 0; lt < padded; lt += kFlintSlotTile) {
+      tile_expert[tiles] = e;
+      tile_slot0[tiles] = running + lt;
+      ++tiles;
+    }
+    running += padded;
   }
   offsets[expert_count] = running;
+  tile_count[0] = tiles;
 }
 
 __global__ void FlintMoeScatterKernel(
@@ -524,6 +555,431 @@ __global__ void FlintMoeCombineKernel(const float* __restrict__ shared_out,
   }
 }
 
+// ---------------------------------------------------------------------------
+// Grouped WMMA route (F-L4 tuning).
+//
+// The scalar grouped kernels above decode each weight row with scalar FMAs,
+// which held the routed MoE at ~2 TFLOP/s while every projection in the same
+// chunk already runs on int8 tensor cores. These kernels move the expert
+// buckets onto the same WMMA arithmetic as WKQuantA8BlockedWmmaGEMMKernel,
+// specialized to ONE 16-token activation tile (BN = 16): bucket starts are
+// padded to the tile, so a block owns (tile, weight rows, expert) and reads
+// its activation tile contiguously. The tile table comes from the compaction
+// pass; blocks past the device-side tile count exit.
+//
+// Pad rows of a bucket are never zeroed in the Q8_1 staging (they hold stale
+// rows from the previous layer); their outputs are never read — the combine
+// walks token_slots, which only references real slots.
+// ---------------------------------------------------------------------------
+
+/// Copies the tiled Q8_1 rows of `x_q8` (token-major) into slot order:
+/// dst tile (slot/16, kb) row (slot%16) <- src tile (token/16, kb) row
+/// (token%16). One thread per (slot, k-block).
+__global__ void FlintGatherQ8ActKernel(const int* __restrict__ slot_tokens,
+                                       const int* __restrict__ offsets,
+                                       int expert_count,
+                                       const std::int8_t* __restrict__ src,
+                                       std::int8_t* __restrict__ dst,
+                                       int num_blocks) {
+  const int s = static_cast<int>(blockIdx.x);
+  if (s >= offsets[expert_count]) {
+    return;
+  }
+  const int tok = slot_tokens[s];
+  const int kb = static_cast<int>(threadIdx.x);
+  if (kb >= num_blocks) {
+    return;
+  }
+  const std::size_t stt = static_cast<std::size_t>(tok) >> 4;
+  const std::size_t stl = static_cast<std::size_t>(tok) & 15;
+  const std::size_t dtt = static_cast<std::size_t>(s) >> 4;
+  const std::size_t dtl = static_cast<std::size_t>(s) & 15;
+  const std::int8_t* s_tile = src + ((stt * num_blocks + kb) * kQ8ActTileBytes);
+  std::int8_t* d_tile = dst + ((dtt * num_blocks + kb) * kQ8ActTileBytes);
+  reinterpret_cast<int32x4_t*>(d_tile + dtl * 16)[0] =
+      reinterpret_cast<const int32x4_t*>(s_tile + stl * 16)[0];
+  reinterpret_cast<int32x4_t*>(d_tile + 256 + dtl * 16)[0] =
+      reinterpret_cast<const int32x4_t*>(s_tile + 256 + stl * 16)[0];
+  reinterpret_cast<float*>(d_tile + kQ8ActScaleOffset)[dtl] =
+      reinterpret_cast<const float*>(s_tile + kQ8ActScaleOffset)[stl];
+}
+
+/// Grouped gate/up GEMM over the expert buckets on WMMA int8 tensor cores:
+/// gate_out[slot, r] = gate_e[r] . x[slot], up likewise, for the 16 slots of
+/// the block's tile. Mirrors WKQuantA8BlockedWmmaGEMMKernel's stage/accumulate
+/// structure with BM=128 rows x BN=16 slots, 8 waves (one 16-row tile each),
+/// BK 32-element K blocks per stage.
+template <core::GgmlType WType>
+__launch_bounds__(256, 2) __global__ void FlintMoeGroupedGateUpWmmaKernel(
+    const void* __restrict__ gate_stack, const void* __restrict__ up_stack,
+    const void* __restrict__ slot_q8, float* __restrict__ gate_out,
+    float* __restrict__ up_out, const int* __restrict__ offsets,
+    const int* __restrict__ tile_expert, const int* __restrict__ tile_slot0,
+    const int* __restrict__ tile_count, int expert_ff, int hidden,
+    std::size_t slab_bytes) {
+  constexpr int BM = 128;
+  constexpr int BK = 2;
+  constexpr int kRowTiles = BM / 16;
+  constexpr bool PerHalfScale =
+      WType == core::GgmlType::kQ6_K || WType == core::GgmlType::kQ3_K;
+  constexpr int kScaleHalves = PerHalfScale ? 2 : 1;
+
+  const int t = static_cast<int>(blockIdx.x);
+  if (t >= tile_count[0]) {
+    return;
+  }
+  const int e = tile_expert[t];
+  const std::size_t slot0 = static_cast<std::size_t>(tile_slot0[t]);
+  const std::size_t r_block = static_cast<std::size_t>(blockIdx.y) * BM;
+
+  const int tid = static_cast<int>(threadIdx.x);
+  const int wave_id = tid >> 5;
+  const int lane_id = tid & 31;
+  const int sub_lane = lane_id & 15;
+  const int half_id = lane_id >> 4;
+
+  const std::size_t num_blocks = static_cast<std::size_t>(hidden) / 32;
+  const std::size_t row_bytes = QuantRowBytes(WType, hidden);
+  const std::uint8_t* grow = static_cast<const std::uint8_t*>(gate_stack) +
+                             static_cast<std::size_t>(e) * slab_bytes;
+  const std::uint8_t* urow = static_cast<const std::uint8_t*>(up_stack) +
+                             static_cast<std::size_t>(e) * slab_bytes;
+
+  __shared__ int32x4_t s_g[BK][kRowTiles][32];
+  __shared__ int32x4_t s_u[BK][kRowTiles][32];
+  __shared__ float s_dwg[BK][kScaleHalves][kRowTiles][16];
+  __shared__ float s_dwu[BK][kScaleHalves][kRowTiles][16];
+  __shared__ int32x4_t s_b[BK][1][32];
+  __shared__ float s_dx[BK][1][16];
+
+  // One (row, kb) weight unit per thread: BM * BK == 256 threads.
+  const int rr = tid / BK;
+  const int kk = tid % BK;
+  const int rl = rr % 16;
+  const int scale_slot = (rl % 2 == 0) ? (rl / 2) : (8 + (rl / 2));
+  const std::uint8_t* gline =
+      grow + (r_block + static_cast<std::size_t>(rr)) * row_bytes;
+  const std::uint8_t* uline =
+      urow + (r_block + static_cast<std::size_t>(rr)) * row_bytes;
+
+  // Wave 0 stages the single token tile (32 lanes cover both k-half runs).
+  const std::int8_t* b_base =
+      static_cast<const std::int8_t*>(slot_q8) +
+      ((slot0 >> 4) * num_blocks * kQ8ActTileBytes);
+
+  float acc_g[8];
+  float acc_u[8];
+#pragma unroll
+  for (int l = 0; l < 8; ++l) {
+    acc_g[l] = 0.0F;
+    acc_u[l] = 0.0F;
+  }
+
+  int32x4_t r_qg0, r_qg1, r_qu0, r_qu1;
+  float r_dwg0, r_dwg1, r_dwu0, r_dwu1;
+  int32x4_t r_b[BK];
+  float r_dx[BK];
+
+  const auto fetch_stage = [&](int kb0) {
+    const int kb = kb0 + kk;
+    QuantSub16 lo, hi;
+    DecodeQuantSub16(WType, gline, static_cast<std::size_t>(kb) * 2, lo);
+    DecodeQuantSub16(WType, gline, static_cast<std::size_t>(kb) * 2 + 1, hi);
+    __builtin_memcpy(&r_qg0, lo.q, 16);
+    __builtin_memcpy(&r_qg1, hi.q, 16);
+    r_dwg0 = lo.scale;
+    r_dwg1 = hi.scale;
+    DecodeQuantSub16(WType, uline, static_cast<std::size_t>(kb) * 2, lo);
+    DecodeQuantSub16(WType, uline, static_cast<std::size_t>(kb) * 2 + 1, hi);
+    __builtin_memcpy(&r_qu0, lo.q, 16);
+    __builtin_memcpy(&r_qu1, hi.q, 16);
+    r_dwu0 = lo.scale;
+    r_dwu1 = hi.scale;
+    if (wave_id == 0) {
+#pragma unroll
+      for (int i = 0; i < BK; ++i) {
+        const std::int8_t* tile =
+            b_base + static_cast<std::size_t>(kb0 + i) * kQ8ActTileBytes;
+        r_b[i] = reinterpret_cast<const int32x4_t*>(tile)[lane_id];
+        r_dx[i] =
+            reinterpret_cast<const float*>(tile + kQ8ActScaleOffset)[lane_id & 15];
+      }
+    }
+  };
+
+  const auto commit_stage = [&]() {
+    s_g[kk][rr / 16][rl] = r_qg0;
+    s_g[kk][rr / 16][16 + rl] = r_qg1;
+    s_u[kk][rr / 16][rl] = r_qu0;
+    s_u[kk][rr / 16][16 + rl] = r_qu1;
+    s_dwg[kk][0][rr / 16][scale_slot] = r_dwg0;
+    s_dwu[kk][0][rr / 16][scale_slot] = r_dwu0;
+    if constexpr (PerHalfScale) {
+      s_dwg[kk][1][rr / 16][scale_slot] = r_dwg1;
+      s_dwu[kk][1][rr / 16][scale_slot] = r_dwu1;
+    }
+    if (wave_id == 0) {
+#pragma unroll
+      for (int i = 0; i < BK; ++i) {
+        s_b[i][0][lane_id] = r_b[i];
+        if (lane_id < 16) {
+          s_dx[i][0][lane_id] = r_dx[i];
+        }
+      }
+    }
+  };
+
+  const int num_kb = static_cast<int>(num_blocks);
+  fetch_stage(0);
+  for (int kb0 = 0; kb0 < num_kb; kb0 += BK) {
+    commit_stage();
+    __syncthreads();
+    if (kb0 + BK < num_kb) {
+      fetch_stage(kb0 + BK);
+    }
+#pragma unroll
+    for (int kb = 0; kb < BK; ++kb) {
+      const int rs = wave_id;
+      const int32x4_t ag0 = s_g[kb][rs][sub_lane];
+      const int32x4_t ag1 = s_g[kb][rs][16 + sub_lane];
+      const int32x4_t au0 = s_u[kb][rs][sub_lane];
+      const int32x4_t au1 = s_u[kb][rs][16 + sub_lane];
+      float dwg0[8], dwu0[8], dwg1[PerHalfScale ? 8 : 1],
+          dwu1[PerHalfScale ? 8 : 1];
+      const float4 g_lo =
+          *reinterpret_cast<const float4*>(&s_dwg[kb][0][rs][half_id * 8]);
+      const float4 g_up =
+          *reinterpret_cast<const float4*>(&s_dwg[kb][0][rs][(half_id * 8) + 4]);
+      const float4 u_lo =
+          *reinterpret_cast<const float4*>(&s_dwu[kb][0][rs][half_id * 8]);
+      const float4 u_up =
+          *reinterpret_cast<const float4*>(&s_dwu[kb][0][rs][(half_id * 8) + 4]);
+      dwg0[0] = g_lo.x; dwg0[1] = g_lo.y; dwg0[2] = g_lo.z; dwg0[3] = g_lo.w;
+      dwg0[4] = g_up.x; dwg0[5] = g_up.y; dwg0[6] = g_up.z; dwg0[7] = g_up.w;
+      dwu0[0] = u_lo.x; dwu0[1] = u_lo.y; dwu0[2] = u_lo.z; dwu0[3] = u_lo.w;
+      dwu0[4] = u_up.x; dwu0[5] = u_up.y; dwu0[6] = u_up.z; dwu0[7] = u_up.w;
+      if constexpr (PerHalfScale) {
+        const float4 h_glo =
+            *reinterpret_cast<const float4*>(&s_dwg[kb][1][rs][half_id * 8]);
+        const float4 h_gup =
+            *reinterpret_cast<const float4*>(&s_dwg[kb][1][rs][(half_id * 8) + 4]);
+        const float4 h_ulo =
+            *reinterpret_cast<const float4*>(&s_dwu[kb][1][rs][half_id * 8]);
+        const float4 h_uup =
+            *reinterpret_cast<const float4*>(&s_dwu[kb][1][rs][(half_id * 8) + 4]);
+        dwg1[0] = h_glo.x; dwg1[1] = h_glo.y; dwg1[2] = h_glo.z; dwg1[3] = h_glo.w;
+        dwg1[4] = h_gup.x; dwg1[5] = h_gup.y; dwg1[6] = h_gup.z; dwg1[7] = h_gup.w;
+        dwu1[0] = h_ulo.x; dwu1[1] = h_ulo.y; dwu1[2] = h_ulo.z; dwu1[3] = h_ulo.w;
+        dwu1[4] = h_uup.x; dwu1[5] = h_uup.y; dwu1[6] = h_uup.z; dwu1[7] = h_uup.w;
+      }
+      const int32x4_t b0 = s_b[kb][0][sub_lane];
+      const int32x4_t b1 = s_b[kb][0][16 + sub_lane];
+      const float dx = s_dx[kb][0][sub_lane];
+      if constexpr (PerHalfScale) {
+        int32x8_t cg0 = {0, 0, 0, 0, 0, 0, 0, 0};
+        int32x8_t cg1 = {0, 0, 0, 0, 0, 0, 0, 0};
+        int32x8_t cu0 = {0, 0, 0, 0, 0, 0, 0, 0};
+        int32x8_t cu1 = {0, 0, 0, 0, 0, 0, 0, 0};
+        cg0 = WmmaQuant<32>(ag0, b0, cg0);
+        cg1 = WmmaQuant<32>(ag1, b1, cg1);
+        cu0 = WmmaQuant<32>(au0, b0, cu0);
+        cu1 = WmmaQuant<32>(au1, b1, cu1);
+#pragma unroll
+        for (int l = 0; l < 8; ++l) {
+          acc_g[l] += (dwg0[l] * dx) * static_cast<float>(cg0[l]) +
+                      (dwg1[l] * dx) * static_cast<float>(cg1[l]);
+          acc_u[l] += (dwu0[l] * dx) * static_cast<float>(cu0[l]) +
+                      (dwu1[l] * dx) * static_cast<float>(cu1[l]);
+        }
+      } else {
+        int32x8_t cg = {0, 0, 0, 0, 0, 0, 0, 0};
+        int32x8_t cu = {0, 0, 0, 0, 0, 0, 0, 0};
+        cg = WmmaQuant<32>(ag0, b0, cg);
+        cg = WmmaQuant<32>(ag1, b1, cg);
+        cu = WmmaQuant<32>(au0, b0, cu);
+        cu = WmmaQuant<32>(au1, b1, cu);
+#pragma unroll
+        for (int l = 0; l < 8; ++l) {
+          acc_g[l] += (dwg0[l] * dx) * static_cast<float>(cg[l]);
+          acc_u[l] += (dwu0[l] * dx) * static_cast<float>(cu[l]);
+        }
+      }
+      __builtin_amdgcn_sched_barrier(0);
+    }
+    __syncthreads();
+  }
+
+  // Transpose each 16x16 tile through LDS (one scratch per accumulator set)
+  // and write f32 rows indexed by global slot. All 16 rows of the tile are
+  // written; pad rows are never read downstream.
+  __syncthreads();
+  float* sc_g = reinterpret_cast<float*>(&s_g[0][0][0]) + (wave_id * 256);
+  float* sc_u = reinterpret_cast<float*>(&s_u[0][0][0]) + (wave_id * 256);
+#pragma unroll
+  for (int l = 0; l < 8; ++l) {
+    sc_g[(sub_lane * 16) + (2 * l) + half_id] = acc_g[l];
+    sc_u[(sub_lane * 16) + (2 * l) + half_id] = acc_u[l];
+  }
+  __builtin_amdgcn_wave_barrier();
+  const std::size_t r0 = r_block + static_cast<std::size_t>(wave_id * 16);
+#pragma unroll
+  for (int s = 0; s < 8; ++s) {
+    const int flat = (s * 32) + lane_id;
+    const std::size_t out = (slot0 + static_cast<std::size_t>(flat >> 4)) *
+                                static_cast<std::size_t>(expert_ff) +
+                            r0 + static_cast<std::size_t>(flat & 15);
+    gate_out[out] = sc_g[flat];
+    up_out[out] = sc_u[flat];
+  }
+  __builtin_amdgcn_wave_barrier();
+}
+
+/// Grouped down projection over Q8_0 expert stacks (flint's routed down
+/// tensors are Q8_0): weight rows are already int8, so the stage reads
+/// block_q8_0 directly. The epilogue applies the slot's router weight.
+__launch_bounds__(256, 2) __global__ void FlintMoeGroupedDownWmmaKernel(
+    const void* __restrict__ down_stack, const void* __restrict__ act_q8,
+    float* __restrict__ down_out, const int* __restrict__ offsets,
+    const float* __restrict__ slot_weights,
+    const int* __restrict__ tile_expert, const int* __restrict__ tile_slot0,
+    const int* __restrict__ tile_count, int expert_ff, int hidden,
+    std::size_t slab_bytes) {
+  constexpr int BM = 128;
+  constexpr int BK = 2;
+  constexpr int kRowTiles = BM / 16;
+
+  const int t = static_cast<int>(blockIdx.x);
+  if (t >= tile_count[0]) {
+    return;
+  }
+  const int e = tile_expert[t];
+  const std::size_t slot0 = static_cast<std::size_t>(tile_slot0[t]);
+  const std::size_t r_block = static_cast<std::size_t>(blockIdx.y) * BM;
+
+  const int tid = static_cast<int>(threadIdx.x);
+  const int wave_id = tid >> 5;
+  const int lane_id = tid & 31;
+  const int sub_lane = lane_id & 15;
+  const int half_id = lane_id >> 4;
+
+  const std::size_t num_blocks = static_cast<std::size_t>(expert_ff) / 32;
+  const auto* w_blocks = reinterpret_cast<const Q8_0Block*>(
+      static_cast<const std::uint8_t*>(down_stack) +
+      static_cast<std::size_t>(e) * slab_bytes);
+
+  __shared__ int32x4_t s_a[BK][kRowTiles][32];
+  __shared__ float s_dw[BK][kRowTiles][16];
+  __shared__ int32x4_t s_b[BK][1][32];
+  __shared__ float s_dx[BK][1][16];
+
+  const int rr = tid / BK;
+  const int kk = tid % BK;
+  const int rl = rr % 16;
+  const int scale_slot = (rl % 2 == 0) ? (rl / 2) : (8 + (rl / 2));
+  const Q8_0Block* wrow =
+      w_blocks + (r_block + static_cast<std::size_t>(rr)) * num_blocks;
+
+  const std::int8_t* b_base =
+      static_cast<const std::int8_t*>(act_q8) +
+      ((slot0 >> 4) * num_blocks * kQ8ActTileBytes);
+
+  float acc[8];
+#pragma unroll
+  for (int l = 0; l < 8; ++l) {
+    acc[l] = 0.0F;
+  }
+
+  int32x4_t r_q0, r_q1;
+  float r_dw;
+  int32x4_t r_b[BK];
+  float r_dx[BK];
+
+  const auto fetch_stage = [&](int kb0) {
+    const Q8_0Block& blk = wrow[kb0 + kk];
+    __builtin_memcpy(&r_q0, blk.qs + 0, 16);
+    __builtin_memcpy(&r_q1, blk.qs + 16, 16);
+    r_dw = __half2float(blk.d);
+    if (wave_id == 0) {
+#pragma unroll
+      for (int i = 0; i < BK; ++i) {
+        const std::int8_t* tile =
+            b_base + static_cast<std::size_t>(kb0 + i) * kQ8ActTileBytes;
+        r_b[i] = reinterpret_cast<const int32x4_t*>(tile)[lane_id];
+        r_dx[i] =
+            reinterpret_cast<const float*>(tile + kQ8ActScaleOffset)[lane_id & 15];
+      }
+    }
+  };
+
+  const auto commit_stage = [&]() {
+    s_a[kk][rr / 16][rl] = r_q0;
+    s_a[kk][rr / 16][16 + rl] = r_q1;
+    s_dw[kk][rr / 16][scale_slot] = r_dw;
+    if (wave_id == 0) {
+#pragma unroll
+      for (int i = 0; i < BK; ++i) {
+        s_b[i][0][lane_id] = r_b[i];
+        if (lane_id < 16) {
+          s_dx[i][0][lane_id] = r_dx[i];
+        }
+      }
+    }
+  };
+
+  const int num_kb = static_cast<int>(num_blocks);
+  fetch_stage(0);
+  for (int kb0 = 0; kb0 < num_kb; kb0 += BK) {
+    commit_stage();
+    __syncthreads();
+    if (kb0 + BK < num_kb) {
+      fetch_stage(kb0 + BK);
+    }
+#pragma unroll
+    for (int kb = 0; kb < BK; ++kb) {
+      const int rs = wave_id;
+      const int32x4_t a0 = s_a[kb][rs][sub_lane];
+      const int32x4_t a1 = s_a[kb][rs][16 + sub_lane];
+      float dw[8];
+      const float4 lo =
+          *reinterpret_cast<const float4*>(&s_dw[kb][rs][half_id * 8]);
+      const float4 up =
+          *reinterpret_cast<const float4*>(&s_dw[kb][rs][(half_id * 8) + 4]);
+      dw[0] = lo.x; dw[1] = lo.y; dw[2] = lo.z; dw[3] = lo.w;
+      dw[4] = up.x; dw[5] = up.y; dw[6] = up.z; dw[7] = up.w;
+      const int32x4_t b0 = s_b[kb][0][sub_lane];
+      const int32x4_t b1 = s_b[kb][0][16 + sub_lane];
+      const float dx = s_dx[kb][0][sub_lane];
+      int32x8_t c = {0, 0, 0, 0, 0, 0, 0, 0};
+      c = WmmaQuant<32>(a0, b0, c);
+      c = WmmaQuant<32>(a1, b1, c);
+#pragma unroll
+      for (int l = 0; l < 8; ++l) {
+        acc[l] += (dw[l] * dx) * static_cast<float>(c[l]);
+      }
+      __builtin_amdgcn_sched_barrier(0);
+    }
+    __syncthreads();
+  }
+
+  __syncthreads();
+  float* scratch = reinterpret_cast<float*>(&s_a[0][0][0]) + (wave_id * 256);
+#pragma unroll
+  for (int l = 0; l < 8; ++l) {
+    scratch[(sub_lane * 16) + (2 * l) + half_id] = acc[l];
+  }
+  __builtin_amdgcn_wave_barrier();
+  const std::size_t r0 = r_block + static_cast<std::size_t>(wave_id * 16);
+#pragma unroll
+  for (int s = 0; s < 8; ++s) {
+    const int flat = (s * 32) + lane_id;
+    const std::size_t slot = slot0 + static_cast<std::size_t>(flat >> 4);
+    down_out[slot * static_cast<std::size_t>(hidden) + r0 +
+             static_cast<std::size_t>(flat & 15)] =
+        slot_weights[slot] * scratch[flat];
+  }
+  __builtin_amdgcn_wave_barrier();
+}
+
 }  // namespace
 
 void LaunchFlintRouterBatch(const float* x, std::size_t n_tokens,
@@ -580,13 +1036,17 @@ void LaunchFlintMoeSlots(const std::uint32_t* selected,
                          std::size_t used, std::size_t expert_count,
                          int* counts, int* offsets, int* cursors,
                          int* slot_tokens, float* slot_weights,
-                         int* token_slots, hipStream_t stream) {
+                         int* token_slots, int* tile_expert, int* tile_slot0,
+                         int* tile_count, hipStream_t stream) {
   const int total = static_cast<int>(n_tokens * used);
   const unsigned int blocks =
       static_cast<unsigned int>((total + 255) / 256);
   HIP_CHECK(hipMemsetAsync(counts, 0, expert_count * sizeof(int), stream));
   FlintMoeCountKernel<<<blocks, 256, 0, stream>>>(selected, total, counts);
   FlintMoeOffsetsKernel<<<1, 32, 0, stream>>>(counts, offsets, cursors,
+                                              slot_tokens, slot_weights,
+                                              tile_expert, tile_slot0,
+                                              tile_count,
                                               static_cast<int>(expert_count));
   FlintMoeScatterKernel<<<blocks, 256, 0, stream>>>(
       selected, sel_weights, cursors, slot_tokens, slot_weights, token_slots,
@@ -642,6 +1102,109 @@ void LaunchFlintMoeCombine(const float* shared_out, const float* down_out,
                           stream>>>(shared_out, down_out, token_slots, mlp_out,
                                     static_cast<int>(used),
                                     static_cast<int>(hidden));
+}
+
+// ---------------------------------------------------------------------------
+// Grouped WMMA route (F-L4 tuning). `tile_bound` is the host-side upper bound
+// on the device-built tile count: ceil(slots / 16) + expert_count (each expert
+// wastes at most one tile to padding).
+// ---------------------------------------------------------------------------
+
+void LaunchFlintGatherQ8Act(const void* x_q8, void* slot_q8,
+                            const int* slot_tokens, const int* offsets,
+                            std::size_t expert_count, std::size_t slot_bound,
+                            std::size_t hidden, hipStream_t stream) {
+  if (slot_bound == 0 || hidden == 0) {
+    return;
+  }
+  FlintGatherQ8ActKernel<<<static_cast<unsigned int>(slot_bound),
+                           static_cast<unsigned int>(hidden / 32), 0, stream>>>(
+      slot_tokens, offsets, static_cast<int>(expert_count),
+      static_cast<const std::int8_t*>(x_q8),
+      static_cast<std::int8_t*>(slot_q8), static_cast<int>(hidden / 32));
+}
+
+bool FlintGroupedWmmaSupported(core::GgmlType gate_up_type,
+                               core::GgmlType down_type, std::size_t expert_ff,
+                               std::size_t hidden) noexcept {
+  // The grouped gate/up kernel mirrors WKQuantA8's no-offset formats; the
+  // down kernel reads block_q8_0 rows directly. Shapes must tile BM=128 and
+  // the 32-element K blocks exactly.
+  const bool gate_up_ok = gate_up_type == core::GgmlType::kQ6_K ||
+                          gate_up_type == core::GgmlType::kQ3_K ||
+                          gate_up_type == core::GgmlType::kIQ4_NL ||
+                          gate_up_type == core::GgmlType::kIQ3_S;
+  return gate_up_ok && down_type == core::GgmlType::kQ8_0 &&
+         expert_ff % 128 == 0 && hidden % 128 == 0 && hidden % 64 == 0 &&
+         expert_ff % 64 == 0;
+}
+
+void LaunchFlintMoeGroupedGateUpWmma(const void* gate_stack,
+                                     const void* up_stack,
+                                     core::GgmlType type, const void* slot_q8,
+                                     float* gate_out, float* up_out,
+                                     const int* offsets,
+                                     const int* tile_expert,
+                                     const int* tile_slot0,
+                                     const int* tile_count,
+                                     std::size_t tile_bound,
+                                     std::size_t expert_count,
+                                     std::size_t expert_ff, std::size_t hidden,
+                                     std::size_t slab_bytes,
+                                     hipStream_t stream) {
+  if (tile_bound == 0 || expert_ff == 0) {
+    return;
+  }
+  const dim3 grid(static_cast<unsigned int>(tile_bound),
+                  static_cast<unsigned int>(expert_ff / 128));
+  const auto launch = [&](auto type_tag) {
+    constexpr core::GgmlType kType = decltype(type_tag)::value;
+    FlintMoeGroupedGateUpWmmaKernel<kType><<<grid, 256, 0, stream>>>(
+        gate_stack, up_stack, slot_q8, gate_out, up_out, offsets, tile_expert,
+        tile_slot0, tile_count, static_cast<int>(expert_ff),
+        static_cast<int>(hidden), slab_bytes);
+  };
+  switch (type) {
+    case core::GgmlType::kQ6_K:
+      launch(std::integral_constant<core::GgmlType, core::GgmlType::kQ6_K>{});
+      break;
+    case core::GgmlType::kQ3_K:
+      launch(std::integral_constant<core::GgmlType, core::GgmlType::kQ3_K>{});
+      break;
+    case core::GgmlType::kIQ4_NL:
+      launch(
+          std::integral_constant<core::GgmlType, core::GgmlType::kIQ4_NL>{});
+      break;
+    case core::GgmlType::kIQ3_S:
+      launch(std::integral_constant<core::GgmlType, core::GgmlType::kIQ3_S>{});
+      break;
+    default:
+      throw std::invalid_argument(
+          "flint grouped WMMA gate/up does not support the routed type");
+  }
+}
+
+void LaunchFlintMoeGroupedDownWmma(const void* down_stack,
+                                   const void* act_q8, float* down_out,
+                                   const int* offsets,
+                                   const float* slot_weights,
+                                   const int* tile_expert,
+                                   const int* tile_slot0,
+                                   const int* tile_count,
+                                   std::size_t tile_bound,
+                                   std::size_t expert_count,
+                                   std::size_t expert_ff, std::size_t hidden,
+                                   std::size_t slab_bytes,
+                                   hipStream_t stream) {
+  if (tile_bound == 0 || hidden == 0) {
+    return;
+  }
+  const dim3 grid(static_cast<unsigned int>(tile_bound),
+                  static_cast<unsigned int>(hidden / 128));
+  FlintMoeGroupedDownWmmaKernel<<<grid, 256, 0, stream>>>(
+      down_stack, act_q8, down_out, offsets, slot_weights, tile_expert,
+      tile_slot0, tile_count, static_cast<int>(expert_ff),
+      static_cast<int>(hidden), slab_bytes);
 }
 
 }  // namespace gufo::hip

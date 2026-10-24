@@ -116,12 +116,19 @@ void LaunchFlintRouterTopKBatch(const float* logits, std::size_t n_tokens,
 /// slot_weights[slots] (router weight per slot) and token_slots[T*used]
 /// (slot index per selection, selection order preserved). `cursors` is
 /// scratch; counts/offsets/cursors are E, E+1 and E ints.
+///
+/// Bucket starts are padded to the 16-row WMMA token tile: offsets[E+1] is
+/// the PADDED total, and the tile table (tile_expert/tile_slot0, count in
+/// tile_count) maps each 16-row tile to its expert and first slot for the
+/// grouped WMMA kernels. The slot tables must hold slots + 15 * expert_count
+/// rows (see kFlintPrefillSlotCapacity).
 void LaunchFlintMoeSlots(const std::uint32_t* selected,
                          const float* sel_weights, std::size_t n_tokens,
                          std::size_t used, std::size_t expert_count,
                          int* counts, int* offsets, int* cursors,
                          int* slot_tokens, float* slot_weights,
-                         int* token_slots, hipStream_t stream = nullptr);
+                         int* token_slots, int* tile_expert, int* tile_slot0,
+                         int* tile_count, hipStream_t stream = nullptr);
 
 /// Expert-grouped SwiGLU over the slot buckets:
 /// act[slot, r] = silu(gate_e[r] . x[token(slot)]) * (up_e[r] . x[token(slot)]).
@@ -150,6 +157,58 @@ void LaunchFlintMoeCombine(const float* shared_out, const float* down_out,
                            const int* token_slots, float* mlp_out,
                            std::size_t n_tokens, std::size_t used,
                            std::size_t hidden, hipStream_t stream = nullptr);
+
+// ---------------------------------------------------------------------------
+// Grouped WMMA route (F-L4 tuning). The expert buckets run on the same int8
+// tensor-core arithmetic as the projections: activations arrive gathered into
+// the tiled Q8_1 layout in slot order, and the two grouped kernels launch a
+// grid over (tile, weight rows) with one expert resolved per block.
+// ---------------------------------------------------------------------------
+
+/// Copies the tiled Q8_1 rows of `x_q8` (token-major, [n_tokens, hidden])
+/// into slot order in `slot_q8` ([slot_bound, hidden]). `slot_bound` is the
+/// host-side padded-slot upper bound.
+void LaunchFlintGatherQ8Act(const void* x_q8, void* slot_q8,
+                            const int* slot_tokens, const int* offsets,
+                            std::size_t expert_count, std::size_t slot_bound,
+                            std::size_t hidden, hipStream_t stream = nullptr);
+
+/// True when the grouped WMMA kernels cover this layer's routed types and
+/// shapes (gate/up in a no-offset WK format, down Q8_0, 128-divisible m).
+[[nodiscard]] bool FlintGroupedWmmaSupported(core::GgmlType gate_up_type,
+                                             core::GgmlType down_type,
+                                             std::size_t expert_ff,
+                                             std::size_t hidden) noexcept;
+
+/// gate_out[slot, r] = gate_e[r] . x[slot] and up likewise for every tile,
+/// with x read from the slot-major tiled Q8_1 buffer and the expert resolved
+/// per block through the tile table. Outputs are f32 rows in slot order.
+void LaunchFlintMoeGroupedGateUpWmma(const void* gate_stack,
+                                     const void* up_stack, core::GgmlType type,
+                                     const void* slot_q8, float* gate_out,
+                                     float* up_out, const int* offsets,
+                                     const int* tile_expert,
+                                     const int* tile_slot0,
+                                     const int* tile_count,
+                                     std::size_t tile_bound,
+                                     std::size_t expert_count,
+                                     std::size_t expert_ff, std::size_t hidden,
+                                     std::size_t slab_bytes,
+                                     hipStream_t stream = nullptr);
+
+/// down_out[slot, r] = slot_weights[slot] * (down_e[r] . act[slot]) reading
+/// act from its slot-major tiled Q8_1 buffer (down stacks are Q8_0).
+void LaunchFlintMoeGroupedDownWmma(const void* down_stack, const void* act_q8,
+                                   float* down_out, const int* offsets,
+                                   const float* slot_weights,
+                                   const int* tile_expert,
+                                   const int* tile_slot0,
+                                   const int* tile_count,
+                                   std::size_t tile_bound,
+                                   std::size_t expert_count,
+                                   std::size_t expert_ff, std::size_t hidden,
+                                   std::size_t slab_bytes,
+                                   hipStream_t stream = nullptr);
 
 }  // namespace gufo::hip
 

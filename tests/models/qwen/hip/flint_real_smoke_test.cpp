@@ -690,9 +690,10 @@ void RunChunkParity(const gufo::hip::FlintGpuModel& model,
                       hipMemcpyDeviceToHost));
 
   const auto t0 = std::chrono::steady_clock::now();
+  gufo::hip::FlintPrefillTimings timings;
   gufo::hip::ExecuteFlintPrefillChunk(model.GetWeights(), tokens, 0,
                                       /*compute_logits=*/true, buffers,
-                                      prefill);
+                                      prefill, &timings);
   HIP_CHECK(hipStreamSynchronize(buffers.stream));
   const auto t1 = std::chrono::steady_clock::now();
   const double chunk_ms =
@@ -762,6 +763,14 @@ void RunChunkParity(const gufo::hip::FlintGpuModel& model,
             << "\n"
             << "  rate: " << chunk_ms << " ms/chunk = "
             << (n * 1000.0 / chunk_ms) << " t/s\n";
+  // Per-stage breakdown (tuning item 0.3): where the chunk's GPU time goes.
+  std::cout << "  stages: norm=" << timings.norm_ms << " qkv=" << timings.qkv_ms
+            << " attn=" << timings.attention_ms << " oproj=" << timings.oproj_ms
+            << " router=" << timings.router_ms
+            << " shared=" << timings.shared_ms
+            << " routed=" << timings.routed_ms
+            << " dense=" << timings.dense_ms << " tail=" << timings.tail_ms
+            << " ms (sum=" << timings.total_ms() << ")\n";
   Expect(vs_token.cosine >= 0.999, "chunk vs token cosine");
   Expect(vs_token.argmax_cpu == vs_token.argmax_gpu,
          "chunk vs token argmax identity");

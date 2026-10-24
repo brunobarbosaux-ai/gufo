@@ -98,6 +98,9 @@ if (ENGINE_ENABLE_HIP)
   add_qwen_hip_test(qwen_flint_decode_step_test
     tests/models/qwen/hip/flint_decode_step_test.cpp
     "hip;gpu;kernels;qwen;flint;decode;step;slow")
+  add_qwen_hip_test(qwen_flint_moe_wmma_ops_test
+    tests/models/qwen/hip/flint_moe_wmma_ops_test.cpp
+    "hip;gpu;kernels;qwen;flint;moe;wmma;slow")
   add_qwen_hip_test(qwen_flint_real_smoke_test
     tests/models/qwen/hip/flint_real_smoke_test.cpp
     "hip;gpu;kernels;qwen;flint;decode;real;slow")

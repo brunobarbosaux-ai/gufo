@@ -40,6 +40,11 @@ constexpr float kFlintRmsEps = 1e-6F;
 
 const bool debug_slots = std::getenv("GUFO_FLINT_PREFILL_DEBUG") != nullptr;
 
+// A/B override: force the scalar grouped kernels even when the WMMA route is
+// available (W1 measurements compare the two on the same binary).
+const bool debug_force_scalar =
+    std::getenv("GUFO_FLINT_MOE_SCALAR") != nullptr;
+
 /// Types the batched expert kernels decode (Q8_0 plus the sub-16 formats).
 [[nodiscard]] bool BatchExpertSupported(core::GgmlType t) noexcept {
   return t == core::GgmlType::kQ8_0 || t == core::GgmlType::kQ4_K ||
@@ -65,6 +70,17 @@ void Project(const models::QwenTensorRef& w, const float* x, std::size_t batch,
   LaunchQuantizeActivationQ8_1FromFp32(x, q8_scratch, batch, k, stream);
   LaunchBatchedQuantGEMMPreQuantized(w.type, w.data, q8_scratch, out, batch, m,
                                      k, stream);
+}
+
+/// Projection from an activation that is already in the tiled Q8_1 layout.
+/// Five of the layer's projections read `normed` (q, k, v and the shared
+/// expert's gate/up, all k = hidden); quantizing it once per layer into a
+/// dedicated buffer instead of once per Project call is F-L4 tuning item 2.4.
+void ProjectFromQ8(const models::QwenTensorRef& w, const void* q8_x,
+                   std::size_t batch, std::size_t m, std::size_t k, float* out,
+                   hipStream_t stream) {
+  LaunchBatchedQuantGEMMPreQuantized(w.type, w.data, q8_x, out, batch, m, k,
+                                     stream);
 }
 
 }  // namespace
@@ -117,7 +133,8 @@ void ExecuteFlintPrefillChunk(const models::FlintModelWeights& weights,
                               std::span<const std::uint32_t> tokens,
                               std::uint32_t start_pos, bool compute_logits,
                               const FlintGpuStepBuffers& buffers,
-                              const FlintPrefillBuffers& prefill) {
+                              const FlintPrefillBuffers& prefill,
+                              FlintPrefillTimings* timings) {
   const auto& config = weights.config;
   const std::size_t n = tokens.size();
   if (n == 0) {
@@ -143,6 +160,59 @@ void ExecuteFlintPrefillChunk(const models::FlintModelWeights& weights,
 
   void* q8 = prefill.q8_act;
 
+  // Stage-grouped event marks (tuning item 0.3). Each interval between two
+  // marks is attributed to the bucket recorded at its closing mark, so the
+  // per-layer residual add folds into the next layer's norm interval.
+  enum Bucket : int {
+    kNone = -1,
+    kTail = 0,  // embedding, final norm, unembed
+    kNorm,      // RMSNorm + the shared Q8_1 quantize
+    kQkv,
+    kAttention,
+    kOproj,
+    kRouter,  // FFN norm + router + top-k + compaction
+    kShared,
+    kRouted,
+    kDense,
+    kBucketCount
+  };
+  std::vector<hipEvent_t> marks;
+  std::vector<int> mark_buckets;
+  const auto mark = [&](int bucket) {
+    if (timings == nullptr) {
+      return;
+    }
+    hipEvent_t e = nullptr;
+    HIP_CHECK(hipEventCreate(&e));
+    HIP_CHECK(hipEventRecord(e, stream));
+    marks.push_back(e);
+    mark_buckets.push_back(bucket);
+  };
+  const auto collect = [&]() {
+    if (timings == nullptr || marks.size() < 2) {
+      return;
+    }
+    HIP_CHECK(hipStreamSynchronize(stream));
+    double* fields[kBucketCount] = {
+        &timings->tail_ms,  &timings->norm_ms, &timings->qkv_ms,
+        &timings->attention_ms, &timings->oproj_ms, &timings->router_ms,
+        &timings->shared_ms,    &timings->routed_ms, &timings->dense_ms};
+    for (std::size_t i = 1; i < marks.size(); ++i) {
+      if (mark_buckets[i] < 0) {
+        continue;
+      }
+      float ms = 0.0F;
+      HIP_CHECK(hipEventElapsedTime(&ms, marks[i - 1], marks[i]));
+      *fields[static_cast<std::size_t>(mark_buckets[i])] += ms;
+    }
+    for (auto& e : marks) {
+      (void)hipEventDestroy(e);
+    }
+    marks.clear();
+    mark_buckets.clear();
+  };
+  mark(kNone);
+
   // Token ids reach the embedding kernel through device staging: the caller's
   // span is host memory, and a kernel dereferencing it faults the context.
   HIP_CHECK(hipMemcpyAsync(prefill.d_tokens, tokens.data(),
@@ -166,6 +236,7 @@ void ExecuteFlintPrefillChunk(const models::FlintModelWeights& weights,
   LaunchBatchedEmbeddingLookup(weights.token_embd.data, weights.token_embd.type,
                                prefill.d_tokens, prefill.hidden, n, hidden,
                                stream);
+  mark(kTail);
 
   for (std::uint32_t layer_idx = 0; layer_idx < config.num_layers;
        ++layer_idx) {
@@ -176,12 +247,18 @@ void ExecuteFlintPrefillChunk(const models::FlintModelWeights& weights,
                          static_cast<const float*>(layer.attn_norm.data),
                          prefill.normed, nullptr, n, hidden, kFlintRmsEps,
                          stream);
-    Project(layer.attn_q, prefill.normed, n, attention_size, hidden, q8,
-            prefill.q, stream);
-    Project(layer.attn_k, prefill.normed, n, kv_size, hidden, q8, prefill.k,
-            stream);
-    Project(layer.attn_v, prefill.normed, n, kv_size, hidden, q8, prefill.v,
-            stream);
+    // normed is read by five projections this layer (q/k/v, shared gate/up,
+    // and the MoE gather) — quantize it once (2.4).
+    LaunchQuantizeActivationQ8_1FromFp32(prefill.normed, prefill.q8_normed, n,
+                                         hidden, stream);
+    mark(kNorm);
+    ProjectFromQ8(layer.attn_q, prefill.q8_normed, n, attention_size, hidden,
+                  prefill.q, stream);
+    ProjectFromQ8(layer.attn_k, prefill.q8_normed, n, kv_size, hidden,
+                  prefill.k, stream);
+    ProjectFromQ8(layer.attn_v, prefill.q8_normed, n, kv_size, hidden,
+                  prefill.v, stream);
+    mark(kQkv);
 
     LaunchBatchedPerHeadRMSNorm(
         prefill.q, static_cast<const float*>(layer.attn_q_norm.data),
@@ -209,11 +286,13 @@ void ExecuteFlintPrefillChunk(const models::FlintModelWeights& weights,
         config.num_attention_heads, config.num_key_value_heads,
         config.head_dim, stream, /*skip_kv_write=*/false,
         /*out_context_bf16=*/nullptr, &policy);
+    mark(kAttention);
 
     Project(layer.attn_output, prefill.attn_out, n, hidden, attention_size, q8,
             prefill.attn_proj, stream);
     LaunchBatchedResidualAdd(prefill.hidden, prefill.attn_proj, prefill.hidden,
                              n, hidden, stream);
+    mark(kOproj);
 
     // --- feed forward ------------------------------------------------------
     LaunchBatchedRMSNorm(prefill.hidden,
@@ -232,6 +311,7 @@ void ExecuteFlintPrefillChunk(const models::FlintModelWeights& weights,
                                     stream);
       Project(layer.ffn_down, prefill.ffn_gate, n, hidden, intermediate, q8,
               prefill.mlp_out, stream);
+      mark(kDense);
     } else {
       const std::size_t expert_ff = config.expert_feed_forward_length;
       const std::size_t shared_ff = config.expert_shared_feed_forward_length;
@@ -240,7 +320,8 @@ void ExecuteFlintPrefillChunk(const models::FlintModelWeights& weights,
       // Router and device-side slot compaction.
       LaunchFlintRouterBatch(prefill.normed, n, layer.ffn_gate_inp.data,
                              layer.ffn_gate_inp.type, config.expert_count,
-                             hidden, prefill.router_logits, stream);      LaunchFlintRouterTopKBatch(
+                             hidden, prefill.router_logits, stream);
+      LaunchFlintRouterTopKBatch(
           prefill.router_logits, n, config.expert_count, used,
           config.expert_weights_norm, config.expert_weights_scale,
           prefill.selected, prefill.sel_weights, stream);
@@ -248,7 +329,9 @@ void ExecuteFlintPrefillChunk(const models::FlintModelWeights& weights,
                           config.expert_count, prefill.expert_counts,
                           prefill.expert_offsets, prefill.expert_cursors,
                           prefill.slot_tokens, prefill.slot_weights,
-                          prefill.token_slots, stream);
+                          prefill.token_slots, prefill.tile_expert,
+                          prefill.tile_slot0, prefill.tile_count, stream);
+      mark(kRouter);
 
       // GUFO_FLINT_PREFILL_DEBUG=1 dumps the first MoE layer's routing state
       // (first chunk only) to isolate slot-table corruption.
@@ -334,51 +417,89 @@ void ExecuteFlintPrefillChunk(const models::FlintModelWeights& weights,
       }
 
       // Shared expert: three full-chunk GEMMs.
-      Project(layer.ffn_gate_shexp, prefill.normed, n, shared_ff, hidden, q8,
-              prefill.ffn_gate, stream);
-      Project(layer.ffn_up_shexp, prefill.normed, n, shared_ff, hidden, q8,
-              prefill.ffn_up, stream);
+      ProjectFromQ8(layer.ffn_gate_shexp, prefill.q8_normed, n, shared_ff,
+                    hidden, prefill.ffn_gate, stream);
+      ProjectFromQ8(layer.ffn_up_shexp, prefill.q8_normed, n, shared_ff, hidden,
+                    prefill.ffn_up, stream);
       LaunchBatchedSwiGLUActivation(prefill.ffn_gate, prefill.ffn_up,
                                     prefill.ffn_gate, nullptr, n * shared_ff,
                                     stream);
       Project(layer.ffn_down_shexp, prefill.ffn_gate, n, hidden, shared_ff, q8,
               prefill.shared_out, stream);
+      mark(kShared);
 
-      // Routed experts: two grouped kernels over the expert buckets.
-      LaunchFlintMoeBatchSwiGLU(
-          layer.ffn_gate_exps.data, layer.ffn_up_exps.data,
-          layer.ffn_gate_exps.type, prefill.normed, prefill.act_slots,
-          prefill.expert_offsets, prefill.slot_tokens, config.expert_count,
-          expert_ff, hidden,
-          quant::EncodedSizeBytes(layer.ffn_gate_exps.type, expert_slab),
-          stream);
-      LaunchFlintMoeBatchDown(
-          layer.ffn_down_exps.data, layer.ffn_down_exps.type,
-          prefill.act_slots, prefill.down_slots, prefill.expert_offsets,
-          prefill.slot_weights, config.expert_count, expert_ff, hidden,
-          quant::EncodedSizeBytes(layer.ffn_down_exps.type, expert_slab),
-          stream);
+      // Routed experts. The grouped WMMA route runs the buckets on the same
+      // int8 tensor cores as the projections; the scalar grouped pair stays
+      // for formats the WMMA kernels do not cover.
+      const std::size_t slab_gate =
+          quant::EncodedSizeBytes(layer.ffn_gate_exps.type, expert_slab);
+      const std::size_t slab_down =
+          quant::EncodedSizeBytes(layer.ffn_down_exps.type, expert_slab);
+      const bool wmma_route =
+          FlintGroupedWmmaSupported(layer.ffn_gate_exps.type,
+                                    layer.ffn_down_exps.type, expert_ff,
+                                    hidden) &&
+          !debug_force_scalar;
+      if (wmma_route) {
+        const std::size_t tile_bound = prefill.slot_capacity / 16;
+        LaunchFlintGatherQ8Act(prefill.q8_normed, prefill.slot_q8,
+                               prefill.slot_tokens, prefill.expert_offsets,
+                               config.expert_count, prefill.slot_capacity,
+                               hidden, stream);
+        LaunchFlintMoeGroupedGateUpWmma(
+            layer.ffn_gate_exps.data, layer.ffn_up_exps.data,
+            layer.ffn_gate_exps.type, prefill.slot_q8, prefill.act_slots,
+            prefill.up_slots, prefill.expert_offsets, prefill.tile_expert,
+            prefill.tile_slot0, prefill.tile_count, tile_bound,
+            config.expert_count, expert_ff, hidden, slab_gate, stream);
+        LaunchBatchedSwiGLUActivation(prefill.act_slots, prefill.up_slots,
+                                      prefill.act_slots, nullptr,
+                                      prefill.slot_capacity * expert_ff,
+                                      stream);
+        LaunchQuantizeActivationQ8_1FromFp32(prefill.act_slots,
+                                             prefill.act_q8,
+                                             prefill.slot_capacity, expert_ff,
+                                             stream);
+        LaunchFlintMoeGroupedDownWmma(
+            layer.ffn_down_exps.data, prefill.act_q8, prefill.down_slots,
+            prefill.expert_offsets, prefill.slot_weights, prefill.tile_expert,
+            prefill.tile_slot0, prefill.tile_count, tile_bound,
+            config.expert_count, expert_ff, hidden, slab_down, stream);
+      } else {
+        LaunchFlintMoeBatchSwiGLU(
+            layer.ffn_gate_exps.data, layer.ffn_up_exps.data,
+            layer.ffn_gate_exps.type, prefill.normed, prefill.act_slots,
+            prefill.expert_offsets, prefill.slot_tokens, config.expert_count,
+            expert_ff, hidden, slab_gate, stream);
+        LaunchFlintMoeBatchDown(
+            layer.ffn_down_exps.data, layer.ffn_down_exps.type,
+            prefill.act_slots, prefill.down_slots, prefill.expert_offsets,
+            prefill.slot_weights, config.expert_count, expert_ff, hidden,
+            slab_down, stream);
+      }
 
       LaunchFlintMoeCombine(prefill.shared_out, prefill.down_slots,
                             prefill.token_slots, prefill.mlp_out, n, used,
                             hidden, stream);
+      mark(kRouted);
     }
 
     LaunchBatchedResidualAdd(prefill.hidden, prefill.mlp_out, prefill.hidden, n,
                              hidden, stream);
   }
 
-  if (!compute_logits) {
-    return;
+  if (compute_logits) {
+    LaunchBatchedRMSNorm(prefill.hidden + (n - 1) * hidden,
+                         static_cast<const float*>(weights.output_norm.data),
+                         buffers.normed, nullptr, 1, hidden, kFlintRmsEps,
+                         stream);
+    LaunchGEMV(weights.output.data, weights.output.type, buffers.normed,
+               buffers.logits, config.vocab_size, hidden, stream);
+    LaunchGPUArgmax(buffers.logits, buffers.d_out_token, config.vocab_size,
+                    stream);
   }
-  LaunchBatchedRMSNorm(prefill.hidden + (n - 1) * hidden,
-                       static_cast<const float*>(weights.output_norm.data),
-                       buffers.normed, nullptr, 1, hidden, kFlintRmsEps,
-                       stream);
-  LaunchGEMV(weights.output.data, weights.output.type, buffers.normed,
-             buffers.logits, config.vocab_size, hidden, stream);
-  LaunchGPUArgmax(buffers.logits, buffers.d_out_token, config.vocab_size,
-                  stream);
+  mark(kTail);
+  collect();
 }
 
 }  // namespace gufo::hip
