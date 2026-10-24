@@ -9,7 +9,8 @@ in `libllama.so`, against the pinned artifact
 
 | Tool | Purpose |
 | --- | --- |
-| `oracle_server.sh [cpu\|gpu]` | Pinned oracle server, port 8098. `cpu` uses `--device none` (no GPU) and is enough for tokenize/template goldens; `gpu` full-offloads for logit dumps and G4 identity |
+| `serve_gates.py` | F-L7 serve-path gates (G4, G5, G8) against running endpoints. `g4` captures arms (oracle with top-20 logprobs, one generation per prompt — **restart the oracle first**: repeats hit its cached-decode path and flip near-ties); `g4-compare` verifies every greedy fork against the oracle's own top-k (rank ≤ 3, logprob delta ≤ 0.5); `g5` captures T1.0/p0.95/k20 distribution arms (first word of the full stream — the answer is empty at small max_tokens for a reasoning model); `g5-verdict` applies the re-scoped criterion (support + ordering + TV ≤ 0.25); `g8` concurrency identity. See the requirements doc §G4/§G5 for the calibration |
+| `oracle_server.sh [cpu\|gpu]` | Pinned oracle server, port 8098. `cpu` uses `--device none` (no GPU) and is enough for tokenize/template goldens; `gpu` full-offloads for logit dumps and G4/G5 arms. Note: this llama.cpp build wants `--load-mode mmap` (not `--mmap`) |
 | `corpus.py OUTDIR [--probe]` | Deterministic F-H2 corpus: 2 700 cases in nine classes, plus the G3 depth probes (64 / 600 / 4096 / 16384 nominal tokens; 600 sits just past the 513 window) |
 | `golden.py tokenize OUTDIR` | M0.6: `/tokenize` goldens for the whole corpus, `add_special` true and false |
 | `golden.py template OUTDIR` | M0.7: `/apply-template` goldens for the G2 fixtures (roles, reasoning, tools, malformed calls, escaping) |

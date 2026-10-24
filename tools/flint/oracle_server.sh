@@ -27,7 +27,7 @@ case "$MODE" in
     FLAGS=(--device none -ngl 0 -c "$CTX_CPU" -t "$THREADS" -tb "$THREADS")
     ;;
   gpu)
-    FLAGS=(--mmap mmap -ngl 99 -fa off -c "$CTX_GPU")
+    FLAGS=(--load-mode mmap -ngl 99 -fa off -c "$CTX_GPU")
     ;;
   *)
     echo "usage: $0 [cpu|gpu]" >&2; exit 2 ;;
