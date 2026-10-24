@@ -72,6 +72,45 @@ __device__ __forceinline__ float4 LoadBatchedHalf4(const __half* source) {
   return make_float4(lower.x, lower.y, upper.x, upper.y);
 }
 
+// W3 sub-stage profile (2.6 audit): per-stage cycle accumulators for
+// BatchedAttentionKernel, read with AttnProfileRead. Costs one uniform
+// global load per block when disabled; enable only for profiling runs.
+// Index 0..2 accumulate thread-0 clock deltas across all blocks: QK
+// (score fill), softmax (max/sum/normalize), PV (weighted V sum + gate +
+// output write). Index 3 counts blocks.
+__device__ unsigned long long g_attn_cycles[4];
+__device__ unsigned int g_attn_prof_on;
+// A/B phase isolation: bit0 = skip QK (scores become position-scaled
+// constants, no K loads/dot), bit1 = skip PV (no V loads/FMA, outputs
+// zero), bit2 = skip the whole attention body (isolates the fused
+// norm/RoPE + KV-write kernels around it). Set with AttnProfileSetSkip.
+__device__ unsigned int g_attn_skip;
+
+void AttnProfileSet(bool on, hipStream_t stream) {
+  const unsigned int flag = on ? 1u : 0u;
+  HIP_CHECK(hipMemcpyToSymbolAsync(HIP_SYMBOL(g_attn_prof_on), &flag,
+                                   sizeof(flag), 0, hipMemcpyHostToDevice,
+                                   stream));
+  const unsigned long long zeros[4] = {0, 0, 0, 0};
+  HIP_CHECK(hipMemcpyToSymbolAsync(HIP_SYMBOL(g_attn_cycles), zeros,
+                                   sizeof(zeros), 0, hipMemcpyHostToDevice,
+                                   stream));
+}
+
+void AttnProfileRead(unsigned long long out[4], hipStream_t stream) {
+  HIP_CHECK(hipMemcpyFromSymbolAsync(out, HIP_SYMBOL(g_attn_cycles),
+                                     sizeof(unsigned long long) * 4, 0,
+                                     hipMemcpyDeviceToHost, stream));
+  HIP_CHECK(hipStreamSynchronize(stream));
+}
+
+void AttnProfileSetSkip(unsigned skip, hipStream_t stream) {
+  HIP_CHECK(hipMemcpyToSymbolAsync(HIP_SYMBOL(g_attn_skip), &skip,
+                                   sizeof(skip), 0, hipMemcpyHostToDevice,
+                                   stream));
+  HIP_CHECK(hipStreamSynchronize(stream));
+}
+
 __global__ void BatchedAttentionKernel(
     const float* __restrict__ q, const float* __restrict__ gate,
     const float* __restrict__ k_cache, const float* __restrict__ v_cache,
@@ -113,11 +152,25 @@ __global__ void BatchedAttentionKernel(
   const auto* q_h_vec = reinterpret_cast<const float4*>(q_h);
   const std::size_t num_vec = head_dim / 4;
   constexpr std::size_t wave_dot_min_sequence = 64;
+  const bool prof = g_attn_prof_on != 0u;
+  const unsigned int skip = g_attn_skip;
+  if ((skip & 4u) != 0u) {
+    // Phase isolation: attention body skipped entirely.
+    return;
+  }
+  const unsigned long long prof_t0 = prof ? clock64() : 0ull;
   if (span >= wave_dot_min_sequence) {
     const std::size_t lane_id = tid & 31U;
     const std::size_t wave_id = tid >> 5U;
     const std::size_t waves_per_block = blockDim.x >> 5U;
     for (std::size_t rel = wave_id; rel < span; rel += waves_per_block) {
+      if ((skip & 1u) != 0u) {
+        // Phase isolation: synthetic scores, no K traffic.
+        if (tid == 0) {
+          s_scores[rel] = scale * static_cast<float>(rel % 7) * 0.01f;
+        }
+        continue;
+      }
       const std::size_t p = p_begin + rel;
       const std::size_t p_offset =
           (((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) *
@@ -149,6 +202,10 @@ __global__ void BatchedAttentionKernel(
     }
   } else {
     for (std::size_t rel = tid; rel < span; rel += blockDim.x) {
+      if ((skip & 1u) != 0u) {
+        s_scores[rel] = scale * static_cast<float>(rel % 7) * 0.01f;
+        continue;
+      }
       const std::size_t p = p_begin + rel;
       const std::size_t p_offset =
           (((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) *
@@ -175,6 +232,7 @@ __global__ void BatchedAttentionKernel(
     }
   }
   __syncthreads();
+  const unsigned long long prof_t1 = prof ? clock64() : 0ull;
 
   // Step 2: Softmax
   float local_max = -1e30F;
@@ -219,11 +277,25 @@ __global__ void BatchedAttentionKernel(
     s_scores[p] *= inv_sum_exp;
   }
   __syncthreads();
+  const unsigned long long prof_t2 = prof ? clock64() : 0ull;
 
   // Step 3: Weighted sum of V. The p-loop is a serial accumulation chain per
   // thread, so it runs four positions per iteration with independent
   // accumulators; the fixed 4-way grouping keeps each output's summation
   // order independent of the chunk size (G6 split-exactness).
+  if ((skip & 2u) != 0u) {
+    // Phase isolation: no V traffic, no gate, zero output.
+    if (tid < head_dim) {
+      const std::size_t out_index = (t * num_heads * head_dim) +
+                                    (static_cast<std::size_t>(h) * head_dim) +
+                                    tid;
+      out_context[out_index] = 0.0f;
+      if (out_context_bf16 != nullptr) {
+        out_context_bf16[out_index] = hip_bfloat16(0.0f);
+      }
+    }
+    return;
+  }
   if (tid < head_dim) {
     float c0 = 0.0F, c1 = 0.0F, c2 = 0.0F, c3 = 0.0F;
     std::size_t p = p_begin;
@@ -287,6 +359,13 @@ __global__ void BatchedAttentionKernel(
     out_context[out_index] = ctx;
     if (out_context_bf16 != nullptr) {
       out_context_bf16[out_index] = hip_bfloat16(ctx);
+    }
+    if (prof && tid == 0) {
+      const unsigned long long prof_t3 = clock64();
+      atomicAdd(&g_attn_cycles[0], prof_t1 - prof_t0);
+      atomicAdd(&g_attn_cycles[1], prof_t2 - prof_t1);
+      atomicAdd(&g_attn_cycles[2], prof_t3 - prof_t2);
+      atomicAdd(&g_attn_cycles[3], 1ull);
     }
   }
 }

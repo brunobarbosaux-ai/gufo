@@ -103,6 +103,18 @@ void LaunchBatchedAttention(const float* q, const float* k, const float* v,
                             void* out_context_bf16 = nullptr,
                             const detail::FlintKernelPolicy* policy = nullptr);
 
+/// W3 sub-stage profile: reset (and arm/disable) the per-stage cycle
+/// accumulators inside BatchedAttentionKernel, or read them back. The
+/// accumulators count shader-clock cycles summed over thread 0 of every
+/// block: [0] QK score fill, [1] softmax, [2] PV + gate + write, [3] block
+/// count. Report stage shares as cycle fractions (clock-independent).
+void AttnProfileSet(bool on, hipStream_t stream);
+void AttnProfileRead(unsigned long long out[4], hipStream_t stream);
+/// Phase isolation for the W3 profile: bit0 skips the QK stage (synthetic
+/// scores), bit1 skips PV (zero output). Cost of a phase = full time minus
+/// skip time (hipEvent A/B — clock64 proved unreliable across barriers).
+void AttnProfileSetSkip(unsigned skip, hipStream_t stream);
+
 /// Batched fuse of per-head Q/K RMSNorm, RoPE, and the KV-cache write across B
 /// tokens into one launch (opt-c010-qk-rope-kv). Writes the normed+roped Q into
 /// q_out and the normed+roped K into k_out, and K/V into every non-null cache

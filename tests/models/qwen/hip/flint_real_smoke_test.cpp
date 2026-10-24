@@ -27,6 +27,7 @@
 #include "src/models/qwen/flint_forward.hpp"
 #include "src/models/qwen/hip/detail/flint_decode_step.hpp"
 #include "src/models/qwen/hip/flint_gpu_model.hpp"
+#include "src/models/qwen/hip/ops/attention.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/hip/ops/moe.hpp"
 #include "src/models/qwen/hip/ops/norm_residual.hpp"
@@ -700,6 +701,37 @@ void RunChunkParity(const gufo::hip::FlintGpuModel& model,
   const auto t1 = std::chrono::steady_clock::now();
   const double chunk_ms =
       std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+  // W3 sub-stage profile (2.6 audit): phase isolation by A/B. One warm +
+  // one timed chunk per phase; the attention stage is already event-timed
+  // in `timings`. QK cost = full - skipPV; PV cost = full - skipQK.
+  if (std::getenv("GUFO_FLINT_ATTN_PROFILE") != nullptr) {
+    const auto timed_chunk = [&](unsigned skip) {
+      gufo::hip::AttnProfileSetSkip(skip, buffers.stream);
+      const auto a0 = std::chrono::steady_clock::now();
+      gufo::hip::FlintPrefillTimings t;
+      gufo::hip::ExecuteFlintPrefillChunk(model.GetWeights(), tokens, 0,
+                                          /*compute_logits=*/false, buffers,
+                                          prefill, &t);
+      HIP_CHECK(hipStreamSynchronize(buffers.stream));
+      const auto a1 = std::chrono::steady_clock::now();
+      gufo::hip::AttnProfileSetSkip(0u, buffers.stream);
+      return std::make_pair(t.attention_ms,
+                            std::chrono::duration<double, std::milli>(a1 - a0)
+                                .count());
+    };
+    const auto [full_attn, full_ms] = timed_chunk(0u);
+    const auto [nopv_attn, nopv_ms] = timed_chunk(2u);
+    const auto [noqk_attn, noqk_ms] = timed_chunk(1u);
+    const auto [noattn_attn, noattn_ms] = timed_chunk(6u);
+    std::cout << "  attn A/B: full=" << full_attn << " ms (chunk "
+              << full_ms << "), -PV=" << nopv_attn << " (chunk " << nopv_ms
+              << "), -QK=" << noqk_attn << " (chunk " << noqk_ms << ")"
+              << ", -body=" << noattn_attn << " (chunk " << noattn_ms << ")\n"
+              << "  => QK ~" << (full_attn - noqk_attn)
+              << " ms, PV ~" << (full_attn - nopv_attn)
+              << " ms, norm/rope/kvwrite+launch ~" << noattn_attn << " ms\n";
+  }
 
   // Token-by-token reference over the same positions.
   for (std::size_t i = 0; i < n; ++i) {
