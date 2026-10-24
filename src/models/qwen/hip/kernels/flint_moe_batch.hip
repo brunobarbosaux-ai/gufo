@@ -24,6 +24,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <type_traits>
 
@@ -50,6 +51,122 @@ constexpr int kFlintSlotTile = 16;
 // Router: logits[N, E] = x[N, H] * W[E, H]^T for the whole chunk.
 // ---------------------------------------------------------------------------
 
+/// Tiled router GEMM (Phase 2 item: router on the fast path). The warp-per-
+/// expert scalar kernel below runs ~1.7 ms per layer at 512 tokens (~13% of
+/// the chunk) because each warp issues nine global loads per eight FMAs with
+/// no reuse. This kernel stages 32-token x and 32-expert w tiles in LDS with
+/// a 2x2 register tile per thread, turning the nine global loads into four
+/// broadcast LDS reads and reusing every staged value 32 times.
+///
+/// Numerics match the decode GEMV's operand semantics exactly (fp32 products
+/// of the stored weight and activation, fp32 accumulation) and each output
+/// accumulates over k in one fixed sequential order that does not depend on
+/// the chunk size, so split and single-chunk runs stay bit-identical (G6).
+///
+/// Out-of-range rows load as zero and masked stores keep partial tiles safe;
+/// the launcher only takes hidden % 64 == 0 (the staged float4 loads) and
+/// falls back to the scalar kernel otherwise. The LDS tiles are k-major
+/// [k][row] with pitch 34: every thread's pair of values is one aligned
+/// float2 read (conflict-free; the staged stores pay at most a 4-way).
+template <typename T>
+__global__ void __launch_bounds__(256, 3)
+    FlintRouterTiledKernel(const float* __restrict__ x, int n_tokens,
+                           const T* __restrict__ w, int expert_count,
+                           int hidden, float* __restrict__ logits) {
+  constexpr int kTile = 32;          // experts and tokens per block tile
+  constexpr int kBK = 64;            // k elements per LDS stage
+  constexpr int kPitch = kTile + 2;  // float2-aligned, bank-spreading pitch
+  __shared__ float s_x[kBK][kPitch];  // [k][token]
+  __shared__ float s_w[kBK][kPitch];  // [k][expert]
+
+  const int tid = static_cast<int>(threadIdx.x);
+  const int tx = tid & 15;  // thread tile column: expert pair of 2
+  const int ty = tid >> 4;  // thread tile row: token pair of 2
+  const int e0 = static_cast<int>(blockIdx.x) * kTile;
+  const int t0 = static_cast<int>(blockIdx.y) * kTile;
+
+  float acc[2][2];
+#pragma unroll
+  for (int i = 0; i < 2; ++i) {
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+      acc[i][j] = 0.0F;
+    }
+  }
+
+  for (int k0 = 0; k0 < hidden; k0 += kBK) {
+    __syncthreads();
+    // Stage x: 32 tokens x 64 fp32 as float4. Threads walk rows of 16
+    // float4 (coalesced); the stores transpose into the k-major tile.
+    // (The launcher only takes hidden % 64 == 0, so tiles are never
+    // partial in k.)
+#pragma unroll
+    for (int p = 0; p < 2; ++p) {
+      const int idx = tid + p * 256;  // float4 index in the tile
+      const int t = idx >> 4;
+      const int c4 = (idx & 15) << 2;
+      float4 v = make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+      if (t0 + t < n_tokens) {
+        v = *reinterpret_cast<const float4*>(&
+            x[static_cast<std::size_t>(t0 + t) * hidden + k0 + c4]);
+      }
+      s_x[c4 + 0][t] = v.x;
+      s_x[c4 + 1][t] = v.y;
+      s_x[c4 + 2][t] = v.z;
+      s_x[c4 + 3][t] = v.w;
+    }
+    // Stage w: 32 experts x 64 weight row elements, converted to fp32 once
+    // here so the compute loop has no conversions.
+#pragma unroll
+    for (int p = 0; p < 2; ++p) {
+      const int idx = tid + p * 256;  // weight-x4 index in the tile
+      const int e = idx >> 4;
+      const int c4 = (idx & 15) << 2;
+      float v[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+      if (e0 + e < expert_count) {
+        const T* row = w + static_cast<std::size_t>(e0 + e) * hidden + k0 + c4;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          v[j] = static_cast<float>(row[j]);
+        }
+      }
+      s_w[c4 + 0][e] = v[0];
+      s_w[c4 + 1][e] = v[1];
+      s_w[c4 + 2][e] = v[2];
+      s_w[c4 + 3][e] = v[3];
+    }
+    __syncthreads();
+
+    for (int k = 0; k < kBK; ++k) {
+      // One aligned float2 per operand per k: the w pair broadcasts across
+      // the lanes that share tx, the x pair across the lanes that share ty.
+      const float2 wv = *reinterpret_cast<const float2*>(&s_w[k][2 * tx]);
+      const float2 xv = *reinterpret_cast<const float2*>(&s_x[k][2 * ty]);
+      acc[0][0] += wv.x * xv.x;
+      acc[1][0] += wv.y * xv.x;
+      acc[0][1] += wv.x * xv.y;
+      acc[1][1] += wv.y * xv.y;
+    }
+  }
+
+#pragma unroll
+  for (int i = 0; i < 2; ++i) {
+    const int e = e0 + 2 * tx + i;
+    if (e >= expert_count) {
+      continue;
+    }
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+      const int t = t0 + 2 * ty + j;
+      if (t < n_tokens) {
+        logits[static_cast<std::size_t>(t) * expert_count + e] = acc[i][j];
+      }
+    }
+  }
+}
+
+/// Scalar fallback for shapes the tiled kernel cannot take (a hidden size
+/// that is not a multiple of 64). Warp per expert x 8 tokens.
 template <typename T>
 __global__ void FlintRouterBatchKernel(const float* __restrict__ x,
                                        int n_tokens,
@@ -988,6 +1105,33 @@ void LaunchFlintRouterBatch(const float* x, std::size_t n_tokens,
                             float* logits, hipStream_t stream) {
   if (n_tokens == 0 || expert_count == 0 || hidden == 0) {
     return;
+  }
+  // A/B override: the W1 measurements compare tiled vs scalar on one binary.
+  static const bool force_scalar =
+      std::getenv("GUFO_FLINT_ROUTER_SCALAR") != nullptr;
+  if (!force_scalar && hidden % 64 == 0) {
+    const dim3 grid(static_cast<unsigned int>((expert_count + 31) / 32),
+                    static_cast<unsigned int>((n_tokens + 31) / 32));
+    if (type == core::GgmlType::kBF16) {
+      FlintRouterTiledKernel<hip_bfloat16><<<grid, 256, 0, stream>>>(
+          x, static_cast<int>(n_tokens), static_cast<const hip_bfloat16*>(w),
+          static_cast<int>(expert_count), static_cast<int>(hidden), logits);
+      return;
+    }
+    if (type == core::GgmlType::kF16) {
+      FlintRouterTiledKernel<__half><<<grid, 256, 0, stream>>>(
+          x, static_cast<int>(n_tokens), static_cast<const __half*>(w),
+          static_cast<int>(expert_count), static_cast<int>(hidden), logits);
+      return;
+    }
+    if (type == core::GgmlType::kF32) {
+      FlintRouterTiledKernel<float><<<grid, 256, 0, stream>>>(
+          x, static_cast<int>(n_tokens), static_cast<const float*>(w),
+          static_cast<int>(expert_count), static_cast<int>(hidden), logits);
+      return;
+    }
+    throw std::invalid_argument(
+        "flint batched router requires an f32, f16 or bf16 router tensor");
   }
   const dim3 grid(
       static_cast<unsigned int>((expert_count + kFlintRouterWarps - 1) /

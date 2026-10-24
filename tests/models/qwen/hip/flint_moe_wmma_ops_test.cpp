@@ -603,6 +603,99 @@ int RunCase(std::size_t n, std::size_t used, std::size_t experts,
 
 }  // namespace
 
+/// Router GEMM gate: tiled logits vs an fp32 CPU reference, and the G6
+/// property that a row's logits are bit-identical regardless of how many
+/// tokens share the launch (the k-order is fixed per output).
+void RunRouterCase(std::size_t n_tokens, std::size_t experts,
+                   std::size_t hidden, bool use_f16, std::uint32_t seed) {
+  std::uint32_t rng = seed;
+  std::vector<float> h_x(n_tokens * hidden);
+  for (auto& v : h_x) {
+    v = Uniform(&rng, 1.0F);
+  }
+  std::vector<std::uint16_t> h_w16;
+  std::vector<float> h_w32;
+  const std::size_t w_elems = experts * hidden;
+  if (use_f16) {
+    h_w16.resize(w_elems);
+    for (auto& v : h_w16) {
+      const __half h = __float2half(Uniform(&rng, 0.05F));
+      std::memcpy(&v, &h, sizeof(v));
+    }
+  } else {
+    h_w32.resize(w_elems);
+    for (auto& v : h_w32) {
+      v = Uniform(&rng, 0.05F);
+    }
+  }
+
+  const std::size_t logits_bytes = n_tokens * experts * sizeof(float);
+  float* d_x = nullptr;
+  void* d_w = nullptr;
+  float* d_logits = nullptr;
+  float* d_split = nullptr;
+  HIP_CHECK(hipMalloc(&d_x, h_x.size() * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_w, w_elems * (use_f16 ? 2 : 4)));
+  HIP_CHECK(hipMalloc(&d_logits, logits_bytes));
+  HIP_CHECK(hipMalloc(&d_split, logits_bytes));
+  HIP_CHECK(hipMemcpy(d_x, h_x.data(), h_x.size() * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_w, use_f16 ? (const void*)h_w16.data()
+                                   : (const void*)h_w32.data(),
+                      w_elems * (use_f16 ? 2 : 4), hipMemcpyHostToDevice));
+
+  const GgmlType wtype = use_f16 ? GgmlType::kF16 : GgmlType::kF32;
+  gufo::hip::LaunchFlintRouterBatch(d_x, n_tokens, d_w, wtype, experts, hidden,
+                                    d_logits);
+
+  // Split launch: the first half of the tokens alone must give bit-identical
+  // logits (fixed per-output k-order).
+  const std::size_t n_split = n_tokens / 2;
+  gufo::hip::LaunchFlintRouterBatch(d_x, n_split, d_w, wtype, experts, hidden,
+                                    d_split);
+  std::vector<float> h_logits(n_tokens * experts);
+  std::vector<float> h_split(n_split * experts);
+  HIP_CHECK(
+      hipMemcpy(h_logits.data(), d_logits, logits_bytes, hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(h_split.data(), d_split, n_split * experts * sizeof(float),
+                      hipMemcpyDeviceToHost));
+  for (std::size_t i = 0; i < n_split * experts; ++i) {
+    Expect(std::memcmp(&h_logits[i], &h_split[i], sizeof(float)) == 0,
+           "router logits must be bit-identical across chunk splits");
+  }
+
+  double worst = 0.0;
+  for (std::size_t t = 0; t < n_tokens; ++t) {
+    for (std::size_t e = 0; e < experts; ++e) {
+      double ref = 0.0;
+      for (std::size_t k = 0; k < hidden; ++k) {
+        double wv;
+        if (use_f16) {
+          __half h;
+          std::memcpy(&h, &h_w16[e * hidden + k], sizeof(h));
+          wv = __half2float(h);
+        } else {
+          wv = h_w32[e * hidden + k];
+        }
+        ref += h_x[t * hidden + k] * wv;
+      }
+      const double got = h_logits[t * experts + e];
+      const double rel = std::fabs(got - ref) / (1.0 + std::fabs(ref));
+      worst = std::fmax(worst, rel);
+      Expect(std::isfinite(got), "router logit must be finite");
+    }
+  }
+  std::cout << "  router n=" << n_tokens << " E=" << experts
+            << " H=" << hidden << (use_f16 ? " f16" : " f32")
+            << ": max_rel=" << worst << "\n";
+  Expect(worst < 1e-4, "router logits must match the fp32 reference");
+
+  hipFree(d_x);
+  hipFree(d_w);
+  hipFree(d_logits);
+  hipFree(d_split);
+}
+
 int main() {
   int device_count = 0;
   if (hipGetDeviceCount(&device_count) != hipSuccess || device_count == 0) {
@@ -614,6 +707,11 @@ int main() {
   RunCase(40, 3, 8, 256, 128, 0xC0FFEEU);
   // Larger case: multi-tile buckets and more experts.
   RunCase(100, 6, 16, 512, 256, 0xBADC0DEU);
+  // Router: partial expert tile + partial token tile (37 tokens, 8 experts
+  // against 32x32 block tiles), both weight storages; and the flint shape.
+  RunRouterCase(37, 8, 256, true, 0xA11CEU);
+  RunRouterCase(37, 8, 256, false, 0xBEEFU);
+  RunRouterCase(512, 256, 2048, true, 0xF1167U);
   std::cout << "flint grouped wmma ops: PASS\n";
   return 0;
 }
