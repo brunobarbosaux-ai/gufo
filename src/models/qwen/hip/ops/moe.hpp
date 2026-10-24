@@ -133,14 +133,17 @@ void LaunchFlintMoeSlots(const std::uint32_t* selected,
                          int* tile_count, hipStream_t stream = nullptr);
 
 /// Expert-grouped SwiGLU over the slot buckets:
-/// act[slot, r] = silu(gate_e[r] . x[token(slot)]) * (up_e[r] . x[token(slot)]).
-/// `offsets`/`slot_tokens` come from LaunchFlintMoeSlots; `slab_bytes` is the
-/// encoded per-expert slab of the routed stacks.
+/// act[slot, r] = silu(gate_e[r] . x(token(slot)]) * (up_e[r] . x[token(slot)]).
+/// `offsets`/`slot_tokens` come from LaunchFlintMoeSlots; `slab_bytes`/
+/// `slab_up` are the encoded per-expert slabs of the two stacks (types may
+/// differ per tensor — bartowski IQ4_XS blk.2 has gate IQ4_XS, up Q5_K).
 void LaunchFlintMoeBatchSwiGLU(const void* gate_stack, const void* up_stack,
-                               core::GgmlType type, const float* x, float* act,
+                               core::GgmlType type, core::GgmlType up_type,
+                               const float* x, float* act,
                                const int* offsets, const int* slot_tokens,
                                std::size_t expert_count, std::size_t expert_ff,
                                std::size_t hidden, std::size_t slab_bytes,
+                               std::size_t slab_up,
                                hipStream_t stream = nullptr);
 
 /// Expert-grouped down projection over the slot buckets, writing compact
@@ -176,8 +179,11 @@ void LaunchFlintGatherQ8Act(const void* x_q8, void* slot_q8,
                             std::size_t hidden, hipStream_t stream = nullptr);
 
 /// True when the grouped WMMA kernels cover this layer's routed types and
-/// shapes (gate/up in a no-offset WK format, down Q8_0, 128-divisible m).
+/// shapes (gate/up in a no-offset WK format with gate == up, down in
+/// Q8_0/Q6_K/IQ4_XS, 128-divisible m). Layers failing this — e.g. a Q5_K
+/// (offset-format) gate/up stack — take the scalar grouped pair.
 [[nodiscard]] bool FlintGroupedWmmaSupported(core::GgmlType gate_up_type,
+                                             core::GgmlType up_type,
                                              core::GgmlType down_type,
                                              std::size_t expert_ff,
                                              std::size_t hidden) noexcept;
@@ -199,8 +205,10 @@ void LaunchFlintMoeGroupedGateUpWmma(const void* gate_stack,
                                      hipStream_t stream = nullptr);
 
 /// down_out[slot, r] = slot_weights[slot] * (down_e[r] . act[slot]) reading
-/// act from its slot-major tiled Q8_1 buffer (down stacks are Q8_0).
-void LaunchFlintMoeGroupedDownWmma(const void* down_stack, const void* act_q8,
+/// act from its slot-major tiled Q8_1 buffer. `type` is the down stack's
+/// weight format (Q8_0, Q6_K or IQ4_XS — see FlintGroupedWmmaSupported).
+void LaunchFlintMoeGroupedDownWmma(const void* down_stack,
+                                   core::GgmlType type, const void* act_q8,
                                    float* down_out, const int* offsets,
                                    const float* slot_weights,
                                    const int* tile_expert,

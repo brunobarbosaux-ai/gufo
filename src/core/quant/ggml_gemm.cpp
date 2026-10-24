@@ -120,6 +120,12 @@ float Dot(core::GgmlType type, const void* row, std::span<const float> x,
       return DotProductQ8_K(row, x, k);
     case core::GgmlType::kQ8_0:
       return DotProductQ8_0(row, x, k);
+    case core::GgmlType::kIQ4_NL:
+      return DotProductIQ4_NL(row, x, k);
+    case core::GgmlType::kIQ4_XS:
+      return DotProductIQ4_XS(row, x, k);
+    case core::GgmlType::kIQ3_S:
+      return DotProductIQ3_S(row, x, k);
     default:
       assert(false && "quant::Dot: unsupported GgmlType");
       std::abort();

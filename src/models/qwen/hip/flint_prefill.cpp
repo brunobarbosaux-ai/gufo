@@ -112,11 +112,13 @@ bool FlintPrefillSupported(const models::FlintModelWeights& weights) noexcept {
     if (!BatchRouterSupported(layer.ffn_gate_inp.type)) {
       return false;
     }
-    if (layer.ffn_gate_exps.type != layer.ffn_up_exps.type) {
-      // The grouped SwiGLU decodes both routed stacks with one type.
-      return false;
-    }
+    // gate/up/down may each carry their own type (bartowski IQ4_XS: blk.2 has
+    // gate IQ4_XS + up Q5_K, blk.48 is Q5_K/Q5_K/Q6_K). Layers where
+    // gate == up in a no-offset WMMA format take the grouped WMMA route; the
+    // rest take the scalar grouped pair, which decodes each stack with its
+    // own type.
     if (!BatchExpertSupported(layer.ffn_gate_exps.type) ||
+        !BatchExpertSupported(layer.ffn_up_exps.type) ||
         !BatchExpertSupported(layer.ffn_down_exps.type)) {
       return false;
     }
@@ -439,10 +441,13 @@ void ExecuteFlintPrefillChunk(const models::FlintModelWeights& weights,
       // for formats the WMMA kernels do not cover.
       const std::size_t slab_gate =
           quant::EncodedSizeBytes(layer.ffn_gate_exps.type, expert_slab);
+      const std::size_t slab_up =
+          quant::EncodedSizeBytes(layer.ffn_up_exps.type, expert_slab);
       const std::size_t slab_down =
           quant::EncodedSizeBytes(layer.ffn_down_exps.type, expert_slab);
       const bool wmma_route =
           FlintGroupedWmmaSupported(layer.ffn_gate_exps.type,
+                                    layer.ffn_up_exps.type,
                                     layer.ffn_down_exps.type, expert_ff,
                                     hidden) &&
           !debug_force_scalar;
@@ -467,16 +472,18 @@ void ExecuteFlintPrefillChunk(const models::FlintModelWeights& weights,
                                              prefill.slot_capacity, expert_ff,
                                              stream);
         LaunchFlintMoeGroupedDownWmma(
-            layer.ffn_down_exps.data, prefill.act_q8, prefill.down_slots,
+            layer.ffn_down_exps.data, layer.ffn_down_exps.type,
+            prefill.act_q8, prefill.down_slots,
             prefill.expert_offsets, prefill.slot_weights, prefill.tile_expert,
             prefill.tile_slot0, prefill.tile_count, tile_bound,
             config.expert_count, expert_ff, hidden, slab_down, stream);
       } else {
         LaunchFlintMoeBatchSwiGLU(
             layer.ffn_gate_exps.data, layer.ffn_up_exps.data,
-            layer.ffn_gate_exps.type, prefill.normed, prefill.act_slots,
+            layer.ffn_gate_exps.type, layer.ffn_up_exps.type, prefill.normed,
+            prefill.act_slots,
             prefill.expert_offsets, prefill.slot_tokens, config.expert_count,
-            expert_ff, hidden, slab_gate, stream);
+            expert_ff, hidden, slab_gate, slab_up, stream);
         LaunchFlintMoeBatchDown(
             layer.ffn_down_exps.data, layer.ffn_down_exps.type,
             prefill.act_slots, prefill.down_slots, prefill.expert_offsets,

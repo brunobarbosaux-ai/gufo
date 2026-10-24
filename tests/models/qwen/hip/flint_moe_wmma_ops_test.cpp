@@ -113,6 +113,61 @@ void FillQ8_0(std::vector<std::uint8_t>& bytes, std::size_t rows,
   }
 }
 
+void FillIQ4_XS(std::vector<std::uint8_t>& bytes, std::size_t rows,
+                std::size_t row_bytes, std::uint32_t* rng) {
+  for (std::size_t row = 0; row < rows; ++row) {
+    auto* blocks = reinterpret_cast<gufo::quant::block_iq4_xs*>(
+        bytes.data() + row * row_bytes);
+    const std::size_t count = row_bytes / sizeof(gufo::quant::block_iq4_xs);
+    for (std::size_t b = 0; b < count; ++b) {
+      blocks[b].d = TestScaleHalf(b);
+      blocks[b].scales_h =
+          static_cast<std::uint16_t>(NextRandom(rng) & 0xFFFFU);
+      for (auto& value : blocks[b].scales_l) {
+        value = static_cast<std::uint8_t>(NextRandom(rng) & 0xFFU);
+      }
+      for (auto& value : blocks[b].qs) {
+        value = static_cast<std::uint8_t>(NextRandom(rng) & 0xFFU);
+      }
+    }
+  }
+}
+
+void FillStack(std::vector<std::uint8_t>& bytes, std::size_t rows,
+               std::size_t row_bytes, GgmlType type, std::uint32_t* rng) {
+  switch (type) {
+    case GgmlType::kQ6_K:
+      FillQ6_K(bytes, rows, row_bytes, rng);
+      return;
+    case GgmlType::kQ8_0:
+      FillQ8_0(bytes, rows, row_bytes, rng);
+      return;
+    case GgmlType::kIQ4_XS:
+      FillIQ4_XS(bytes, rows, row_bytes, rng);
+      return;
+    default:
+      std::cerr << "FillStack: unsupported type\n";
+      std::exit(1);
+  }
+}
+
+void DequantRow(const void* src, float* dst, GgmlType type, std::size_t k) {
+  switch (type) {
+    case GgmlType::kQ6_K:
+      gufo::quant::DequantizeQ6_K(src, dst, k);
+      return;
+    case GgmlType::kQ8_0:
+      gufo::quant::DequantizeQ8_0(src, dst, k);
+      return;
+    case GgmlType::kIQ4_XS:
+      gufo::quant::DequantizeIQ4_XS(src, dst, k);
+      return;
+    default:
+      std::cerr << "DequantRow: unsupported type\n";
+      std::exit(1);
+  }
+}
+
 /// Decodes the tiled Q8_1 buffer (16-token tiles of 576-byte K blocks with
 /// inline fp32 scales) into row-major f32.
 std::vector<float> DecodeTiledQ8(const std::vector<std::uint8_t>& bytes,
@@ -172,22 +227,32 @@ double DotF64(const float* a, const float* b, std::size_t n) {
 }
 
 int RunCase(std::size_t n, std::size_t used, std::size_t experts,
-            std::size_t hidden, std::size_t expert_ff, std::uint32_t seed) {
+            std::size_t hidden, std::size_t expert_ff, GgmlType gate_up_type,
+            GgmlType down_type, std::uint32_t seed) {
   std::cout << "grouped wmma: n=" << n << " used=" << used
             << " E=" << experts << " H=" << hidden << " ff=" << expert_ff
-            << "\n";
-  Expect(gufo::hip::FlintGroupedWmmaSupported(GgmlType::kQ6_K, GgmlType::kQ8_0,
-                                              expert_ff, hidden),
+            << " gate/up=" << gufo::core::ToString(gate_up_type)
+            << " down=" << gufo::core::ToString(down_type) << "\n";
+  Expect(gufo::hip::FlintGroupedWmmaSupported(gate_up_type, gate_up_type,
+                                              down_type, expert_ff, hidden),
          "case shapes must take the grouped WMMA route");
+  // IQ4_XS decodes 136-byte super-blocks of 256 elements; a shorter row makes
+  // DecodeQuantSub16 read past the slab (and the CPU reference loops over
+  // k/256 super-blocks, producing zeros).
+  const auto superblock_ok = [](GgmlType t, std::size_t k) {
+    return t != GgmlType::kIQ4_XS || k % 256 == 0;
+  };
+  Expect(superblock_ok(gate_up_type, hidden) && superblock_ok(down_type, expert_ff),
+         "IQ4_XS dims must be multiples of 256");
 
   const std::size_t slots = n * used;
   const std::size_t cap =
       (slots + 15 * experts + 15) & ~static_cast<std::size_t>(15);
   const std::size_t tiles_bound = cap / 16;
   const std::size_t gate_row =
-      gufo::quant::QuantizedRowBytes(GgmlType::kQ6_K, hidden);
+      gufo::quant::QuantizedRowBytes(gate_up_type, hidden);
   const std::size_t down_row =
-      gufo::quant::QuantizedRowBytes(GgmlType::kQ8_0, expert_ff);
+      gufo::quant::QuantizedRowBytes(down_type, expert_ff);
   const std::size_t slab_gate = expert_ff * gate_row;
   const std::size_t slab_down = hidden * down_row;
 
@@ -223,14 +288,14 @@ int RunCase(std::size_t n, std::size_t used, std::size_t experts,
     v = Uniform(&rng, 0.3F);
   }
 
-  // Expert stacks: gate/up Q6_K [expert_ff, hidden], down Q8_0
-  // [hidden, expert_ff].
+  // Expert stacks: gate/up [expert_ff, hidden] and down [hidden, expert_ff]
+  // in the case's quant types.
   std::vector<std::uint8_t> h_gate(experts * slab_gate, 0);
   std::vector<std::uint8_t> h_up(experts * slab_gate, 0);
   std::vector<std::uint8_t> h_down(experts * slab_down, 0);
-  FillQ6_K(h_gate, experts * expert_ff, gate_row, &rng);
-  FillQ6_K(h_up, experts * expert_ff, gate_row, &rng);
-  FillQ8_0(h_down, experts * hidden, down_row, &rng);
+  FillStack(h_gate, experts * expert_ff, gate_row, gate_up_type, &rng);
+  FillStack(h_up, experts * expert_ff, gate_row, gate_up_type, &rng);
+  FillStack(h_down, experts * hidden, down_row, down_type, &rng);
 
   // Dequantized weight images for the reference.
   std::vector<float> w_gate(experts * expert_ff * hidden);
@@ -238,17 +303,17 @@ int RunCase(std::size_t n, std::size_t used, std::size_t experts,
   std::vector<float> w_down(experts * hidden * expert_ff);
   for (std::size_t e = 0; e < experts; ++e) {
     for (std::size_t r = 0; r < expert_ff; ++r) {
-      gufo::quant::DequantizeQ6_K(
-          h_gate.data() + (e * expert_ff + r) * gate_row,
-          w_gate.data() + (e * expert_ff + r) * hidden, hidden);
-      gufo::quant::DequantizeQ6_K(
-          h_up.data() + (e * expert_ff + r) * gate_row,
-          w_up.data() + (e * expert_ff + r) * hidden, hidden);
+      DequantRow(h_gate.data() + (e * expert_ff + r) * gate_row,
+                 w_gate.data() + (e * expert_ff + r) * hidden, gate_up_type,
+                 hidden);
+      DequantRow(h_up.data() + (e * expert_ff + r) * gate_row,
+                 w_up.data() + (e * expert_ff + r) * hidden, gate_up_type,
+                 hidden);
     }
     for (std::size_t r = 0; r < hidden; ++r) {
-      gufo::quant::DequantizeQ8_0(
-          h_down.data() + (e * hidden + r) * down_row,
-          w_down.data() + (e * hidden + r) * expert_ff, expert_ff);
+      DequantRow(h_down.data() + (e * hidden + r) * down_row,
+                 w_down.data() + (e * hidden + r) * expert_ff, down_type,
+                 expert_ff);
     }
   }
 
@@ -320,7 +385,7 @@ int RunCase(std::size_t n, std::size_t used, std::size_t experts,
   gufo::hip::LaunchFlintGatherQ8Act(d_xq, d_slotq, d_slot_tokens, d_offsets,
                                     experts, cap, hidden);
   gufo::hip::LaunchFlintMoeGroupedGateUpWmma(
-      d_gate, d_up, GgmlType::kQ6_K, d_slotq, d_gate_out, d_up_out, d_offsets,
+      d_gate, d_up, gate_up_type, d_slotq, d_gate_out, d_up_out, d_offsets,
       d_tile_expert, d_tile_slot0, d_tile_count, tiles_bound, experts,
       expert_ff, hidden, slab_gate);
   // Snapshot gate/up before the in-place SwiGLU rewrites d_gate_out.
@@ -334,7 +399,7 @@ int RunCase(std::size_t n, std::size_t used, std::size_t experts,
   gufo::hip::LaunchQuantizeActivationQ8_1FromFp32(d_gate_out, d_actq, cap,
                                                   expert_ff);
   gufo::hip::LaunchFlintMoeGroupedDownWmma(
-      d_down, d_actq, d_down_out, d_offsets, d_slot_w, d_tile_expert,
+      d_down, down_type, d_actq, d_down_out, d_offsets, d_slot_w, d_tile_expert,
       d_tile_slot0, d_tile_count, tiles_bound, experts, expert_ff, hidden,
       slab_down);
   gufo::hip::LaunchFlintMoeCombine(d_shared, d_down_out, d_token_slots, d_mlp,
@@ -719,10 +784,20 @@ int main() {
     return 77;
   }
   // Small case: tiny buckets (empty, partial, and multi-row) at 16-tile
-  // granularity.
-  RunCase(40, 3, 8, 256, 128, 0xC0FFEEU);
+  // granularity. Q6_K gate/up + Q8_0 down is the UD-Q6_K_XL production route.
+  RunCase(40, 3, 8, 256, 128, GgmlType::kQ6_K, GgmlType::kQ8_0, 0xC0FFEEU);
   // Larger case: multi-tile buckets and more experts.
-  RunCase(100, 6, 16, 512, 256, 0xBADC0DEU);
+  RunCase(100, 6, 16, 512, 256, GgmlType::kQ6_K, GgmlType::kQ8_0, 0xBADC0DEU);
+  // IQ4_XS artifact route: uniform IQ4_XS gate/up/down (bartowski layers 3-47).
+  // IQ4_XS rows are 136-byte super-blocks of 256, so both k dims must be
+  // multiples of 256 — smaller rows decode past the slab (the production
+  // shapes are hidden=4096, ff=6144).
+  RunCase(40, 3, 8, 256, 256, GgmlType::kIQ4_XS, GgmlType::kIQ4_XS, 0x10415U);
+  RunCase(100, 6, 16, 512, 256, GgmlType::kIQ4_XS, GgmlType::kIQ4_XS,
+          0x4C5BADU);
+  // Mixed: IQ4_XS gate/up with Q6_K down (the fused blk.48 shape minus its
+  // Q5_K gate) at a flint-adjacent shape.
+  RunCase(64, 4, 8, 512, 256, GgmlType::kIQ4_XS, GgmlType::kQ6_K, 0x06C45U);
   // Router: partial expert tile + partial token tile (37 tokens, 8 experts
   // against 32x32 block tiles), all three weight storages — bf16 is the
   // artifact's actual router format (F-C2); and the flint shape.

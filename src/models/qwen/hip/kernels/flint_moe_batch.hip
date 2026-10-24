@@ -445,12 +445,13 @@ __device__ __forceinline__ void FlintDotRow(
 __global__ void __launch_bounds__(kFlintBatchWarps * 32, 4)
     FlintMoeBatchSwiGLUKernel(const void* __restrict__ gate_stack,
                               const void* __restrict__ up_stack,
-                              core::GgmlType type, const float* __restrict__ x,
+                              core::GgmlType type, core::GgmlType up_type,
+                              const float* __restrict__ x,
                               float* __restrict__ act,
                               const int* __restrict__ offsets,
                               const int* __restrict__ slot_tokens,
                               int expert_ff, int hidden,
-                              std::size_t slab_bytes) {
+                              std::size_t slab_bytes, std::size_t slab_up) {
   const int e = static_cast<int>(blockIdx.y);
   const int begin = offsets[e];
   const int end = offsets[e + 1];
@@ -470,15 +471,17 @@ __global__ void __launch_bounds__(kFlintBatchWarps * 32, 4)
   const char* gbase = static_cast<const char*>(gate_stack) +
                       static_cast<std::size_t>(e) * slab_bytes;
   const char* ubase = static_cast<const char*>(up_stack) +
-                      static_cast<std::size_t>(e) * slab_bytes;
+                      static_cast<std::size_t>(e) * slab_up;
   const std::size_t row_bytes = QuantRowBytes(type, static_cast<std::size_t>(hidden));
+  const std::size_t row_bytes_u =
+      QuantRowBytes(up_type, static_cast<std::size_t>(hidden));
   const char* grow0 = gbase + static_cast<std::size_t>(r0) * row_bytes;
-  const char* urow0 = ubase + static_cast<std::size_t>(r0) * row_bytes;
+  const char* urow0 = ubase + static_cast<std::size_t>(r0) * row_bytes_u;
   const char* grow1 = has_r1
                           ? gbase + static_cast<std::size_t>(r0 + 1) * row_bytes
                           : nullptr;
   const char* urow1 = has_r1
-                          ? ubase + static_cast<std::size_t>(r0 + 1) * row_bytes
+                          ? ubase + static_cast<std::size_t>(r0 + 1) * row_bytes_u
                           : nullptr;
 
   for (int tb = begin; tb < end; tb += kFlintBatchTokens) {
@@ -496,10 +499,10 @@ __global__ void __launch_bounds__(kFlintBatchWarps * 32, 4)
       au1[t] = 0.0F;
     }
     FlintDotRow(type, grow0, lane, x, hidden, toks, tn, hidden, ag0);
-    FlintDotRow(type, urow0, lane, x, hidden, toks, tn, hidden, au0);
+    FlintDotRow(up_type, urow0, lane, x, hidden, toks, tn, hidden, au0);
     if (grow1 != nullptr) {
       FlintDotRow(type, grow1, lane, x, hidden, toks, tn, hidden, ag1);
-      FlintDotRow(type, urow1, lane, x, hidden, toks, tn, hidden, au1);
+      FlintDotRow(up_type, urow1, lane, x, hidden, toks, tn, hidden, au1);
     }
     FlintReduceTokens(ag0, tn);
     FlintReduceTokens(au0, tn);
@@ -951,9 +954,14 @@ __launch_bounds__(256, 2) __global__ void FlintMoeGroupedGateUpWmmaKernel(
   __builtin_amdgcn_wave_barrier();
 }
 
-/// Grouped down projection over Q8_0 expert stacks (flint's routed down
-/// tensors are Q8_0): weight rows are already int8, so the stage reads
-/// block_q8_0 directly. The epilogue applies the slot's router weight.
+/// Grouped down projection over the expert stacks on WMMA int8 tensor cores:
+/// down_out[slot, r] = slot_weight * (down_e[r] . act[slot]). Templated on the
+/// down weight format: Q8_0 (the UD-Q6_K_XL stacks), Q6_K (per-16 scales) and
+/// IQ4_XS (per-32 scales, the bartowski int4 artifact) all decode through
+/// DecodeQuantSub16; Q8_0's decode is the same 32-byte block read the original
+/// kernel performed, so its outputs stay bit-identical. The epilogue applies
+/// the slot's router weight.
+template <core::GgmlType WType>
 __launch_bounds__(256, 2) __global__ void FlintMoeGroupedDownWmmaKernel(
     const void* __restrict__ down_stack, const void* __restrict__ act_q8,
     float* __restrict__ down_out, const int* __restrict__ offsets,
@@ -964,6 +972,9 @@ __launch_bounds__(256, 2) __global__ void FlintMoeGroupedDownWmmaKernel(
   constexpr int BM = 128;
   constexpr int BK = 2;
   constexpr int kRowTiles = BM / 16;
+  constexpr bool PerHalfScale =
+      WType == core::GgmlType::kQ6_K || WType == core::GgmlType::kQ3_K;
+  constexpr int kScaleHalves = PerHalfScale ? 2 : 1;
 
   const int t = static_cast<int>(blockIdx.x);
   if (t >= tile_count[0]) {
@@ -980,12 +991,12 @@ __launch_bounds__(256, 2) __global__ void FlintMoeGroupedDownWmmaKernel(
   const int half_id = lane_id >> 4;
 
   const std::size_t num_blocks = static_cast<std::size_t>(expert_ff) / 32;
-  const auto* w_blocks = reinterpret_cast<const Q8_0Block*>(
-      static_cast<const std::uint8_t*>(down_stack) +
-      static_cast<std::size_t>(e) * slab_bytes);
+  const std::size_t row_bytes = QuantRowBytes(WType, expert_ff);
+  const std::uint8_t* wbase = static_cast<const std::uint8_t*>(down_stack) +
+                              static_cast<std::size_t>(e) * slab_bytes;
 
   __shared__ int32x4_t s_a[BK][kRowTiles][32];
-  __shared__ float s_dw[BK][kRowTiles][16];
+  __shared__ float s_dw[BK][kScaleHalves][kRowTiles][16];
   __shared__ int32x4_t s_b[BK][1][32];
   __shared__ float s_dx[BK][1][16];
 
@@ -993,8 +1004,8 @@ __launch_bounds__(256, 2) __global__ void FlintMoeGroupedDownWmmaKernel(
   const int kk = tid % BK;
   const int rl = rr % 16;
   const int scale_slot = (rl % 2 == 0) ? (rl / 2) : (8 + (rl / 2));
-  const Q8_0Block* wrow =
-      w_blocks + (r_block + static_cast<std::size_t>(rr)) * num_blocks;
+  const std::uint8_t* wline =
+      wbase + (r_block + static_cast<std::size_t>(rr)) * row_bytes;
 
   const std::int8_t* b_base =
       static_cast<const std::int8_t*>(act_q8) +
@@ -1007,15 +1018,19 @@ __launch_bounds__(256, 2) __global__ void FlintMoeGroupedDownWmmaKernel(
   }
 
   int32x4_t r_q0, r_q1;
-  float r_dw;
+  float r_dw0, r_dw1;
   int32x4_t r_b[BK];
   float r_dx[BK];
 
   const auto fetch_stage = [&](int kb0) {
-    const Q8_0Block& blk = wrow[kb0 + kk];
-    __builtin_memcpy(&r_q0, blk.qs + 0, 16);
-    __builtin_memcpy(&r_q1, blk.qs + 16, 16);
-    r_dw = __half2float(blk.d);
+    const int kb = kb0 + kk;
+    QuantSub16 lo, hi;
+    DecodeQuantSub16(WType, wline, static_cast<std::size_t>(kb) * 2, lo);
+    DecodeQuantSub16(WType, wline, static_cast<std::size_t>(kb) * 2 + 1, hi);
+    __builtin_memcpy(&r_q0, lo.q, 16);
+    __builtin_memcpy(&r_q1, hi.q, 16);
+    r_dw0 = lo.scale;
+    r_dw1 = hi.scale;
     if (wave_id == 0) {
 #pragma unroll
       for (int i = 0; i < BK; ++i) {
@@ -1031,7 +1046,10 @@ __launch_bounds__(256, 2) __global__ void FlintMoeGroupedDownWmmaKernel(
   const auto commit_stage = [&]() {
     s_a[kk][rr / 16][rl] = r_q0;
     s_a[kk][rr / 16][16 + rl] = r_q1;
-    s_dw[kk][rr / 16][scale_slot] = r_dw;
+    s_dw[kk][0][rr / 16][scale_slot] = r_dw0;
+    if constexpr (PerHalfScale) {
+      s_dw[kk][1][rr / 16][scale_slot] = r_dw1;
+    }
     if (wave_id == 0) {
 #pragma unroll
       for (int i = 0; i < BK; ++i) {
@@ -1056,22 +1074,42 @@ __launch_bounds__(256, 2) __global__ void FlintMoeGroupedDownWmmaKernel(
       const int rs = wave_id;
       const int32x4_t a0 = s_a[kb][rs][sub_lane];
       const int32x4_t a1 = s_a[kb][rs][16 + sub_lane];
-      float dw[8];
+      float dw0[8], dw1[PerHalfScale ? 8 : 1];
       const float4 lo =
-          *reinterpret_cast<const float4*>(&s_dw[kb][rs][half_id * 8]);
+          *reinterpret_cast<const float4*>(&s_dw[kb][0][rs][half_id * 8]);
       const float4 up =
-          *reinterpret_cast<const float4*>(&s_dw[kb][rs][(half_id * 8) + 4]);
-      dw[0] = lo.x; dw[1] = lo.y; dw[2] = lo.z; dw[3] = lo.w;
-      dw[4] = up.x; dw[5] = up.y; dw[6] = up.z; dw[7] = up.w;
+          *reinterpret_cast<const float4*>(&s_dw[kb][0][rs][(half_id * 8) + 4]);
+      dw0[0] = lo.x; dw0[1] = lo.y; dw0[2] = lo.z; dw0[3] = lo.w;
+      dw0[4] = up.x; dw0[5] = up.y; dw0[6] = up.z; dw0[7] = up.w;
+      if constexpr (PerHalfScale) {
+        const float4 h_lo =
+            *reinterpret_cast<const float4*>(&s_dw[kb][1][rs][half_id * 8]);
+        const float4 h_up =
+            *reinterpret_cast<const float4*>(&s_dw[kb][1][rs][(half_id * 8) + 4]);
+        dw1[0] = h_lo.x; dw1[1] = h_lo.y; dw1[2] = h_lo.z; dw1[3] = h_lo.w;
+        dw1[4] = h_up.x; dw1[5] = h_up.y; dw1[6] = h_up.z; dw1[7] = h_up.w;
+      }
       const int32x4_t b0 = s_b[kb][0][sub_lane];
       const int32x4_t b1 = s_b[kb][0][16 + sub_lane];
       const float dx = s_dx[kb][0][sub_lane];
-      int32x8_t c = {0, 0, 0, 0, 0, 0, 0, 0};
-      c = WmmaQuant<32>(a0, b0, c);
-      c = WmmaQuant<32>(a1, b1, c);
+      if constexpr (PerHalfScale) {
+        int32x8_t c0 = {0, 0, 0, 0, 0, 0, 0, 0};
+        int32x8_t c1 = {0, 0, 0, 0, 0, 0, 0, 0};
+        c0 = WmmaQuant<32>(a0, b0, c0);
+        c1 = WmmaQuant<32>(a1, b1, c1);
 #pragma unroll
-      for (int l = 0; l < 8; ++l) {
-        acc[l] += (dw[l] * dx) * static_cast<float>(c[l]);
+        for (int l = 0; l < 8; ++l) {
+          acc[l] += (dw0[l] * dx) * static_cast<float>(c0[l]) +
+                    (dw1[l] * dx) * static_cast<float>(c1[l]);
+        }
+      } else {
+        int32x8_t c = {0, 0, 0, 0, 0, 0, 0, 0};
+        c = WmmaQuant<32>(a0, b0, c);
+        c = WmmaQuant<32>(a1, b1, c);
+#pragma unroll
+        for (int l = 0; l < 8; ++l) {
+          acc[l] += (dw0[l] * dx) * static_cast<float>(c[l]);
+        }
       }
       __builtin_amdgcn_sched_barrier(0);
     }
@@ -1198,10 +1236,12 @@ void LaunchFlintMoeSlots(const std::uint32_t* selected,
 }
 
 void LaunchFlintMoeBatchSwiGLU(const void* gate_stack, const void* up_stack,
-                               core::GgmlType type, const float* x, float* act,
+                               core::GgmlType type, core::GgmlType up_type,
+                               const float* x, float* act,
                                const int* offsets, const int* slot_tokens,
                                std::size_t expert_count, std::size_t expert_ff,
                                std::size_t hidden, std::size_t slab_bytes,
+                               std::size_t slab_up,
                                hipStream_t stream) {
   if (expert_count == 0 || expert_ff == 0) {
     return;
@@ -1212,8 +1252,9 @@ void LaunchFlintMoeBatchSwiGLU(const void* gate_stack, const void* up_stack,
                                 (kFlintBatchRowsPerWarp * kFlintBatchWarps)),
       static_cast<unsigned int>(expert_count));
   FlintMoeBatchSwiGLUKernel<<<grid, kFlintBatchWarps * 32, 0, stream>>>(
-      gate_stack, up_stack, type, x, act, offsets, slot_tokens,
-      static_cast<int>(expert_ff), static_cast<int>(hidden), slab_bytes);
+      gate_stack, up_stack, type, up_type, x, act, offsets, slot_tokens,
+      static_cast<int>(expert_ff), static_cast<int>(hidden), slab_bytes,
+      slab_up);
 }
 
 void LaunchFlintMoeBatchDown(const void* down_stack, core::GgmlType type,
@@ -1269,18 +1310,25 @@ void LaunchFlintGatherQ8Act(const void* x_q8, void* slot_q8,
 }
 
 bool FlintGroupedWmmaSupported(core::GgmlType gate_up_type,
+                               core::GgmlType up_type,
                                core::GgmlType down_type, std::size_t expert_ff,
                                std::size_t hidden) noexcept {
   // The grouped gate/up kernel mirrors WKQuantA8's no-offset formats; the
-  // down kernel reads block_q8_0 rows directly. Shapes must tile BM=128 and
-  // the 32-element K blocks exactly.
-  const bool gate_up_ok = gate_up_type == core::GgmlType::kQ6_K ||
-                          gate_up_type == core::GgmlType::kQ3_K ||
-                          gate_up_type == core::GgmlType::kIQ4_NL ||
-                          gate_up_type == core::GgmlType::kIQ3_S;
-  return gate_up_ok && down_type == core::GgmlType::kQ8_0 &&
-         expert_ff % 128 == 0 && hidden % 128 == 0 && hidden % 64 == 0 &&
-         expert_ff % 64 == 0;
+  // fused kernel decodes gate and up rows with the SAME type, so a layer with
+  // gate != up (bartowski IQ4_XS blk.2) must fall back to the scalar pair.
+  // The down kernel covers Q8_0 / Q6_K / IQ4_XS stacks.
+  const bool gate_up_ok =
+      gate_up_type == up_type &&
+      (gate_up_type == core::GgmlType::kQ6_K ||
+       gate_up_type == core::GgmlType::kQ3_K ||
+       gate_up_type == core::GgmlType::kIQ4_NL ||
+       gate_up_type == core::GgmlType::kIQ4_XS ||
+       gate_up_type == core::GgmlType::kIQ3_S);
+  const bool down_ok = down_type == core::GgmlType::kQ8_0 ||
+                       down_type == core::GgmlType::kQ6_K ||
+                       down_type == core::GgmlType::kIQ4_XS;
+  return gate_up_ok && down_ok && expert_ff % 128 == 0 && hidden % 128 == 0 &&
+         hidden % 64 == 0 && expert_ff % 64 == 0;
 }
 
 void LaunchFlintMoeGroupedGateUpWmma(const void* gate_stack,
@@ -1319,6 +1367,10 @@ void LaunchFlintMoeGroupedGateUpWmma(const void* gate_stack,
       launch(
           std::integral_constant<core::GgmlType, core::GgmlType::kIQ4_NL>{});
       break;
+    case core::GgmlType::kIQ4_XS:
+      launch(
+          std::integral_constant<core::GgmlType, core::GgmlType::kIQ4_XS>{});
+      break;
     case core::GgmlType::kIQ3_S:
       launch(std::integral_constant<core::GgmlType, core::GgmlType::kIQ3_S>{});
       break;
@@ -1329,7 +1381,8 @@ void LaunchFlintMoeGroupedGateUpWmma(const void* gate_stack,
 }
 
 void LaunchFlintMoeGroupedDownWmma(const void* down_stack,
-                                   const void* act_q8, float* down_out,
+                                   core::GgmlType type, const void* act_q8,
+                                   float* down_out,
                                    const int* offsets,
                                    const float* slot_weights,
                                    const int* tile_expert,
@@ -1345,10 +1398,27 @@ void LaunchFlintMoeGroupedDownWmma(const void* down_stack,
   }
   const dim3 grid(static_cast<unsigned int>(tile_bound),
                   static_cast<unsigned int>(hidden / 128));
-  FlintMoeGroupedDownWmmaKernel<<<grid, 256, 0, stream>>>(
-      down_stack, act_q8, down_out, offsets, slot_weights, tile_expert,
-      tile_slot0, tile_count, static_cast<int>(expert_ff),
-      static_cast<int>(hidden), slab_bytes);
+  const auto launch = [&](auto type_tag) {
+    constexpr core::GgmlType kType = decltype(type_tag)::value;
+    FlintMoeGroupedDownWmmaKernel<kType><<<grid, 256, 0, stream>>>(
+        down_stack, act_q8, down_out, offsets, slot_weights, tile_expert,
+        tile_slot0, tile_count, static_cast<int>(expert_ff),
+        static_cast<int>(hidden), slab_bytes);
+  };
+  switch (type) {
+    case core::GgmlType::kQ8_0:
+      launch(std::integral_constant<core::GgmlType, core::GgmlType::kQ8_0>{});
+      break;
+    case core::GgmlType::kQ6_K:
+      launch(std::integral_constant<core::GgmlType, core::GgmlType::kQ6_K>{});
+      break;
+    case core::GgmlType::kIQ4_XS:
+      launch(std::integral_constant<core::GgmlType, core::GgmlType::kIQ4_XS>{});
+      break;
+    default:
+      throw std::invalid_argument(
+          "flint grouped WMMA down does not support the routed type");
+  }
 }
 
 }  // namespace gufo::hip
