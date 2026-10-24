@@ -8,6 +8,7 @@
 // Small shapes by design: this is the fast gate that runs in seconds before
 // the 36 GB real-artifact smoke. The flint shapes (E=256, ff=512, H=2048) are
 // covered by the chunk mode of flint_real_smoke_test.
+#include <hip/hip_bfloat16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
@@ -24,6 +25,7 @@
 #include "src/core/quant/ggml_dequant.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/hip/ops/moe.hpp"
+#include "tests/models/qwen/hip/support/bfloat16.hpp"
 #include "src/models/qwen/hip/ops/swiglu.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -607,7 +609,9 @@ int RunCase(std::size_t n, std::size_t used, std::size_t experts,
 /// property that a row's logits are bit-identical regardless of how many
 /// tokens share the launch (the k-order is fixed per output).
 void RunRouterCase(std::size_t n_tokens, std::size_t experts,
-                   std::size_t hidden, bool use_f16, std::uint32_t seed) {
+                   std::size_t hidden, int w_storage,
+                   std::uint32_t seed) {
+  // w_storage: 0 = f32, 1 = f16, 2 = bf16 (the artifact's router format).
   std::uint32_t rng = seed;
   std::vector<float> h_x(n_tokens * hidden);
   for (auto& v : h_x) {
@@ -616,11 +620,16 @@ void RunRouterCase(std::size_t n_tokens, std::size_t experts,
   std::vector<std::uint16_t> h_w16;
   std::vector<float> h_w32;
   const std::size_t w_elems = experts * hidden;
-  if (use_f16) {
+  if (w_storage == 1) {
     h_w16.resize(w_elems);
     for (auto& v : h_w16) {
       const __half h = __float2half(Uniform(&rng, 0.05F));
       std::memcpy(&v, &h, sizeof(v));
+    }
+  } else if (w_storage == 2) {
+    h_w16.resize(w_elems);
+    for (auto& v : h_w16) {
+      v = gufo::test::FloatToBf16Bits(Uniform(&rng, 0.05F));
     }
   } else {
     h_w32.resize(w_elems);
@@ -629,22 +638,26 @@ void RunRouterCase(std::size_t n_tokens, std::size_t experts,
     }
   }
 
+  const std::size_t w_elem_bytes = w_storage == 0 ? 4 : 2;
   const std::size_t logits_bytes = n_tokens * experts * sizeof(float);
   float* d_x = nullptr;
   void* d_w = nullptr;
   float* d_logits = nullptr;
   float* d_split = nullptr;
   HIP_CHECK(hipMalloc(&d_x, h_x.size() * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_w, w_elems * (use_f16 ? 2 : 4)));
+  HIP_CHECK(hipMalloc(&d_w, w_elems * w_elem_bytes));
   HIP_CHECK(hipMalloc(&d_logits, logits_bytes));
   HIP_CHECK(hipMalloc(&d_split, logits_bytes));
   HIP_CHECK(hipMemcpy(d_x, h_x.data(), h_x.size() * sizeof(float),
                       hipMemcpyHostToDevice));
-  HIP_CHECK(hipMemcpy(d_w, use_f16 ? (const void*)h_w16.data()
-                                   : (const void*)h_w32.data(),
-                      w_elems * (use_f16 ? 2 : 4), hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_w,
+                      w_storage == 0 ? (const void*)h_w32.data()
+                                     : (const void*)h_w16.data(),
+                      w_elems * w_elem_bytes, hipMemcpyHostToDevice));
 
-  const GgmlType wtype = use_f16 ? GgmlType::kF16 : GgmlType::kF32;
+  const GgmlType wtype = w_storage == 0    ? GgmlType::kF32
+                         : w_storage == 1  ? GgmlType::kF16
+                                           : GgmlType::kBF16;
   gufo::hip::LaunchFlintRouterBatch(d_x, n_tokens, d_w, wtype, experts, hidden,
                                     d_logits);
 
@@ -670,10 +683,12 @@ void RunRouterCase(std::size_t n_tokens, std::size_t experts,
       double ref = 0.0;
       for (std::size_t k = 0; k < hidden; ++k) {
         double wv;
-        if (use_f16) {
+        if (w_storage == 1) {
           __half h;
           std::memcpy(&h, &h_w16[e * hidden + k], sizeof(h));
           wv = __half2float(h);
+        } else if (w_storage == 2) {
+          wv = gufo::test::Bf16BitsToFloat(h_w16[e * hidden + k]);
         } else {
           wv = h_w32[e * hidden + k];
         }
@@ -686,7 +701,8 @@ void RunRouterCase(std::size_t n_tokens, std::size_t experts,
     }
   }
   std::cout << "  router n=" << n_tokens << " E=" << experts
-            << " H=" << hidden << (use_f16 ? " f16" : " f32")
+            << " H=" << hidden
+            << (w_storage == 1 ? " f16" : (w_storage == 2 ? " bf16" : " f32"))
             << ": max_rel=" << worst << "\n";
   Expect(worst < 1e-4, "router logits must match the fp32 reference");
 
@@ -708,10 +724,12 @@ int main() {
   // Larger case: multi-tile buckets and more experts.
   RunCase(100, 6, 16, 512, 256, 0xBADC0DEU);
   // Router: partial expert tile + partial token tile (37 tokens, 8 experts
-  // against 32x32 block tiles), both weight storages; and the flint shape.
-  RunRouterCase(37, 8, 256, true, 0xA11CEU);
-  RunRouterCase(37, 8, 256, false, 0xBEEFU);
-  RunRouterCase(512, 256, 2048, true, 0xF1167U);
+  // against 32x32 block tiles), all three weight storages — bf16 is the
+  // artifact's actual router format (F-C2); and the flint shape.
+  RunRouterCase(37, 8, 256, 1, 0xA11CEU);
+  RunRouterCase(37, 8, 256, 2, 0xA11CEU);
+  RunRouterCase(37, 8, 256, 0, 0xBEEFU);
+  RunRouterCase(512, 256, 2048, 2, 0xF1167U);
   std::cout << "flint grouped wmma ops: PASS\n";
   return 0;
 }

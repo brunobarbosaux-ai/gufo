@@ -24,7 +24,9 @@ OUT="${OUT:-/tmp/flint-prefill-sweep-$(date +%Y%m%d-%H%M%S).log}"
 run() {  # run <label> <n_tokens> [env assignments...]
   local label="$1" n="$2"; shift 2
   echo "===== $label  n=$n  ctx=$CTX  env: $* =====" | tee -a "$OUT"
-  env "$@" "$BIN" chunk "$CTX" "$n" 2>&1 | tee -a "$OUT"
+  # Continue past gate failures: a failed parity gate must not kill the
+  # remaining A/B runs — the isolation data is the point of the sweep.
+  env "$@" "$BIN" chunk "$CTX" "$n" 2>&1 | tee -a "$OUT" || true
   echo | tee -a "$OUT"
 }
 
@@ -35,13 +37,15 @@ echo "===== synthetic gate =====" | tee -a "$OUT"
 build/gpu-test/tests/models/qwen/qwen_flint_moe_wmma_ops_test 2>&1 | tee -a "$OUT"
 echo | tee -a "$OUT"
 
-# Chunk-size sweep (2.5): the 181-token floor gate, 256, and 512 capacity.
-# WMMA route (default), tiled router (default).
-for n in 181 256 512; do run "wmma+tiled-router" "$n"; done
-
-# Router A/B (2.7): scalar router vs the new tiled router, same MoE route.
-for n in 181 512; do run "wmma+SCALAR-router" "$n" GUFO_FLINT_ROUTER_SCALAR=1; done
-
+# Diagnostic first: scalar router at 181 isolates the tiled-router kernel
+# (the W2 sweep run that failed the head gate); 512 with the tiled router
+# isolates the chunk size. Then the remaining sweep cells.
+run "wmma+SCALAR-router" 181 GUFO_FLINT_ROUTER_SCALAR=1
+run "wmma+tiled-router" 512
+run "wmma+tiled-router" 256
+run "wmma+SCALAR-router" 512 GUFO_FLINT_ROUTER_SCALAR=1
+# Isolation: both routes scalar (W1-era kernels + the PV unroll only).
+run "SCALAR-moe+SCALAR-router" 181 GUFO_FLINT_MOE_SCALAR=1 GUFO_FLINT_ROUTER_SCALAR=1
 # MoE route A/B (2.2 re-check at the small end): scalar grouped MoE.
 run "SCALAR-moe+tiled-router" 181 GUFO_FLINT_MOE_SCALAR=1
 
