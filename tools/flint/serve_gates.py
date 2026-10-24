@@ -231,6 +231,8 @@ def cmd_g4(args):
 
 
 def cmd_g4_compare(args):
+    max_delta = G4_NEAR_TIE_DELTA if args.max_delta is None else args.max_delta
+    max_rank = G4_MAX_RANK if args.max_rank is None else args.max_rank
     left = json.load(open(args.left))
     right = json.load(open(args.right))
     failures = 0
@@ -253,7 +255,7 @@ def cmd_g4_compare(args):
                   f"    serve : {b[common:common + 60]!r}")
         else:
             rank, delta = verdict
-            ok = rank <= G4_MAX_RANK and delta <= G4_NEAR_TIE_DELTA
+            ok = rank <= max_rank and delta <= max_delta
             if not ok:
                 failures += 1
             print(f"  {row_l['class']}: fork at char {common} — serve pick "
@@ -263,7 +265,7 @@ def cmd_g4_compare(args):
                   f"    serve : {b[max(0, common - 30):common + 30]!r}")
     print("G4 VERDICT:",
           "PASS (all forks near-tie: rank <="
-          f" {G4_MAX_RANK}, delta <= {G4_NEAR_TIE_DELTA})"
+          f" {max_rank}, delta <= {max_delta})"
           if failures == 0 else f"FAIL ({failures} rows failed)")
     return 0 if failures == 0 else 1
 
@@ -481,6 +483,13 @@ def main():
     p = sub.add_parser("g4-compare")
     p.add_argument("left")
     p.add_argument("right")
+    p.add_argument("--max-delta", type=float, default=None,
+                   help="near-tie delta bound override (default: "
+                        "G4_NEAR_TIE_DELTA, calibrated on the UD-Q6_K_XL "
+                        "stack; coarser artifacts need their own envelope — "
+                        "IQ4_XS measured 2.0x, see requirements finding 19)")
+    p.add_argument("--max-rank", type=int, default=None,
+                   help="fork rank bound override (default: G4_MAX_RANK)")
 
     p = sub.add_parser("g8")
     p.add_argument("--engine", choices=("oracle", "serve"), default="serve")
