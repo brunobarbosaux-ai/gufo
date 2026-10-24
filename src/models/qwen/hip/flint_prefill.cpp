@@ -148,6 +148,21 @@ void ExecuteFlintPrefillChunk(const models::FlintModelWeights& weights,
   HIP_CHECK(hipMemcpyAsync(prefill.d_tokens, tokens.data(),
                            n * sizeof(std::uint32_t), hipMemcpyHostToDevice,
                            stream));
+  if (debug_slots) {
+    // Verify the staging copy landed before the kernel consumes it.
+    HIP_CHECK(hipStreamSynchronize(stream));
+    std::vector<std::uint32_t> back(n);
+    HIP_CHECK(hipMemcpy(back.data(), prefill.d_tokens, n * sizeof(int),
+                        hipMemcpyDeviceToHost));
+    std::cout << "[prefill-dbg] chunk n=" << n << " start_pos=" << start_pos
+              << " d_tokens=" << static_cast<const void*>(prefill.d_tokens)
+              << " hidden=" << static_cast<const void*>(prefill.hidden)
+              << " table=" << weights.token_embd.data << " tokens:";
+    for (auto v : back) {
+      std::cout << " " << v;
+    }
+    std::cout << std::endl;
+  }
   LaunchBatchedEmbeddingLookup(weights.token_embd.data, weights.token_embd.type,
                                prefill.d_tokens, prefill.hidden, n, hidden,
                                stream);

@@ -838,8 +838,14 @@ int main(int argc, char** argv) {
       tokens.insert(tokens.end(), prompt_tokens.begin(), prompt_tokens.end());
     }
     tokens.resize(gufo::hip::kFlintPrefillBatchCapacity);
-    RunChunkParity(*gpu_model, tokens,
-                   std::max<std::uint32_t>(max_context, 1024));
+    // Optional second arg: arena max_context (default 4096). The serve path
+    // runs 32768 — the 6.6 GB KV plane changes the allocation landscape, so
+    // the chunk must be checked there too.
+    const std::uint32_t chunk_ctx =
+        argc > 2
+            ? static_cast<std::uint32_t>(std::atoi(argv[2]))
+            : std::max<std::uint32_t>(max_context, 1024);
+    RunChunkParity(*gpu_model, tokens, chunk_ctx);
     return 0;
   }
 
