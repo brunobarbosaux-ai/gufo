@@ -89,6 +89,17 @@ namespace {
          config.num_key_value_heads * max_context * config.head_dim;
 }
 
+/// Tiled Q8_1 activation bytes (prefill_quant_gemm's layout: 16-token tiles of
+/// 576-byte K blocks with the fp32 scales inline). Mirrored here because that
+/// header carries device code and cannot be included from a host unit.
+[[nodiscard]] std::size_t FlintQ8ActBytes(std::size_t batch,
+                                          std::size_t k) noexcept {
+  constexpr std::size_t kTileTokens = 16;
+  constexpr std::size_t kTileBytes = 576;
+  const std::size_t tiles = (batch + kTileTokens - 1) / kTileTokens;
+  return tiles * (k / 32) * kTileBytes;
+}
+
 }  // namespace
 
 FlintGpuArena::FlintGpuArena(const core::ModelConfig& config,
@@ -162,6 +173,81 @@ FlintGpuArena::FlintGpuArena(const core::ModelConfig& config,
                       gufo::hip::kFlintMoeMaxJobs * sizeof(int)));
   buffers_.max_context = max_context;
   HIP_CHECK(hipStreamCreate(&buffers_.stream));
+
+  // --- chunked-prefill scratch (F-L4) -------------------------------------
+  // One block for every f32 row buffer, one block for the integer slot
+  // tables, and a tiled Q8_1 staging buffer sized for the widest projection
+  // input (the 6144-wide dense FFN rows). The chunk path owns these; the
+  // batch-1 decode buffers above stay untouched so a decode step can follow a
+  // chunk immediately.
+  const std::size_t cap = kFlintPrefillBatchCapacity;
+  const std::size_t used = config.expert_used_count;
+  const std::size_t slots = cap * used;
+  const std::size_t ffn_act = std::max<std::size_t>(
+      config.intermediate_size, config.expert_shared_feed_forward_length);
+  const std::size_t prefill_floats =
+      cap * (hidden_size * 5 + attention_size * 2 + kv_size * 2 +
+             ffn_act * 2 + config.expert_count + used) +
+      slots * (1 + config.expert_feed_forward_length + hidden_size);
+  const std::size_t prefill_ints =
+      cap +  // d_tokens staging
+      cap * used +  // selected
+      config.expert_count * 3 + 1 +  // counts, cursors, offsets
+      slots * 2;  // slot_tokens, token_slots
+
+  float* prefill_block = nullptr;
+  HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&prefill_block),
+                      prefill_floats * sizeof(float)));
+  std::size_t prefill_offset = 0;
+  auto prefill_alloc = [&](std::size_t floats) -> float* {
+    float* out = prefill_block + prefill_offset;
+    prefill_offset += floats;
+    return out;
+  };
+  prefill_.batch_capacity = cap;
+  prefill_.slot_capacity = slots;
+  prefill_.hidden = prefill_alloc(cap * hidden_size);
+  prefill_.normed = prefill_alloc(cap * hidden_size);
+  prefill_.attn_proj = prefill_alloc(cap * hidden_size);
+  prefill_.mlp_out = prefill_alloc(cap * hidden_size);
+  prefill_.shared_out = prefill_alloc(cap * hidden_size);
+  prefill_.q = prefill_alloc(cap * attention_size);
+  prefill_.attn_out = prefill_alloc(cap * attention_size);
+  prefill_.k = prefill_alloc(cap * kv_size);
+  prefill_.v = prefill_alloc(cap * kv_size);
+  prefill_.ffn_gate = prefill_alloc(cap * ffn_act);
+  prefill_.ffn_up = prefill_alloc(cap * ffn_act);
+  prefill_.router_logits = prefill_alloc(cap * config.expert_count);
+  prefill_.sel_weights = prefill_alloc(cap * used);
+  prefill_.slot_weights = prefill_alloc(slots);
+  prefill_.act_slots = prefill_alloc(slots * config.expert_feed_forward_length);
+  prefill_.down_slots = prefill_alloc(slots * hidden_size);
+
+  int* prefill_int_block = nullptr;
+  HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&prefill_int_block),
+                      prefill_ints * sizeof(int)));
+  int* int_cursor = prefill_int_block;
+  prefill_.d_tokens = reinterpret_cast<std::uint32_t*>(int_cursor);
+  int_cursor += cap;
+  prefill_.selected = reinterpret_cast<std::uint32_t*>(int_cursor);
+  int_cursor += cap * used;
+  prefill_.expert_counts = int_cursor;
+  int_cursor += config.expert_count;
+  prefill_.expert_cursors = int_cursor;
+  int_cursor += config.expert_count;
+  prefill_.expert_offsets = int_cursor;
+  int_cursor += config.expert_count + 1;
+  prefill_.slot_tokens = int_cursor;
+  int_cursor += slots;
+  prefill_.token_slots = int_cursor;
+
+  const std::size_t q8_k = std::max<std::size_t>(
+      std::max<std::size_t>(hidden_size, attention_size), ffn_act);
+  HIP_CHECK(hipMalloc(&prefill_.q8_act, FlintQ8ActBytes(cap, q8_k)));
+
+  scratch_bytes_ += prefill_floats * sizeof(float) +
+                    prefill_ints * sizeof(int) +
+                    FlintQ8ActBytes(cap, q8_k);
 }
 
 FlintGpuArena::~FlintGpuArena() { FreeAll(); }
@@ -170,9 +256,11 @@ FlintGpuArena::FlintGpuArena(FlintGpuArena&& other) noexcept
     : config_(other.config_),
       max_context_(other.max_context_),
       scratch_bytes_(other.scratch_bytes_),
-      buffers_(other.buffers_) {
+      buffers_(other.buffers_),
+      prefill_(other.prefill_) {
   other.scratch_bytes_ = 0;
   other.buffers_ = {};
+  other.prefill_ = {};
 }
 
 FlintGpuArena& FlintGpuArena::operator=(FlintGpuArena&& other) noexcept {
@@ -182,8 +270,10 @@ FlintGpuArena& FlintGpuArena::operator=(FlintGpuArena&& other) noexcept {
     max_context_ = other.max_context_;
     scratch_bytes_ = other.scratch_bytes_;
     buffers_ = other.buffers_;
+    prefill_ = other.prefill_;
     other.scratch_bytes_ = 0;
     other.buffers_ = {};
+    other.prefill_ = {};
   }
   return *this;
 }
@@ -201,10 +291,20 @@ void FlintGpuArena::FreeAll() noexcept {
   if (buffers_.expert_job_list != nullptr) {
     (void)hipFree(buffers_.expert_job_list);
   }
+  if (prefill_.hidden != nullptr) {
+    (void)hipFree(prefill_.hidden);
+  }
+  if (prefill_.expert_counts != nullptr) {
+    (void)hipFree(prefill_.expert_counts);
+  }
+  if (prefill_.q8_act != nullptr) {
+    (void)hipFree(prefill_.q8_act);
+  }
   if (buffers_.stream != nullptr) {
     (void)hipStreamDestroy(buffers_.stream);
   }
   buffers_ = {};
+  prefill_ = {};
   scratch_bytes_ = 0;
 }
 

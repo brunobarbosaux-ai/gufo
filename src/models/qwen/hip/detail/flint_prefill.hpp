@@ -1,0 +1,88 @@
+#ifndef GUFO_MODELS_QWEN_HIP_DETAIL_FLINT_PREFILL_HPP_
+#define GUFO_MODELS_QWEN_HIP_DETAIL_FLINT_PREFILL_HPP_
+
+#include <cstddef>
+#include <cstdint>
+#include <span>
+
+#include "src/models/qwen/hip/detail/flint_decode_step.hpp"
+#include "src/models/qwen/state.hpp"
+
+#if defined(ENGINE_ENABLE_HIP)
+#include <hip/hip_runtime.h>
+
+namespace gufo::hip {
+
+/// Maximum tokens one chunked-prefill call consumes. The expert buckets grow
+/// with the chunk (roughly chunk * used / expert_count rows each), which is
+/// what makes the grouped expert kernels worth their launch: at 512 tokens a
+/// bucket holds about twelve rows, so a decoded weight block feeds twelve
+/// tokens instead of one.
+inline constexpr std::size_t kFlintPrefillBatchCapacity = 512;
+
+/// Highest absolute position a batched chunk may cover. The batched attention
+/// score row has to fit the gfx1151 LDS budget (64 KiB minus 256 floats), and
+/// the global layers cover the full causal prefix; chunks that would cross
+/// this position are handed to the token-by-token path instead.
+inline constexpr std::size_t kFlintPrefillMaxPosition = 16000;
+
+/// Chunk-prefill scratch. Sized once per session from the config; the decode
+/// buffers (FlintGpuStepBuffers) are reused only for the KV cache, the logits
+/// row and the argmax slot.
+struct FlintPrefillBuffers {
+  std::size_t batch_capacity = 0;  ///< rows this scratch holds
+  std::size_t slot_capacity = 0;   ///< batch_capacity * expert_used_count
+
+  float* hidden = nullptr;      ///< [cap, H] residual stream
+  float* normed = nullptr;      ///< [cap, H] post-norm rows
+  float* q = nullptr;           ///< [cap, A]
+  float* k = nullptr;           ///< [cap, S]
+  float* v = nullptr;           ///< [cap, S]
+  float* attn_out = nullptr;    ///< [cap, A]
+  float* attn_proj = nullptr;   ///< [cap, H]
+  float* mlp_out = nullptr;     ///< [cap, H] FFN/MoE output before residual
+  float* shared_out = nullptr;  ///< [cap, H] shared-expert output
+  float* ffn_gate = nullptr;    ///< [cap, max(dense ff, shared ff)]
+  float* ffn_up = nullptr;      ///< [cap, max(dense ff, shared ff)]
+  float* router_logits = nullptr;  ///< [cap, E]
+
+  std::uint32_t* selected = nullptr;  ///< [cap, used]
+  float* sel_weights = nullptr;       ///< [cap, used]
+  int* expert_counts = nullptr;       ///< [E]
+  int* expert_offsets = nullptr;      ///< [E + 1]
+  int* expert_cursors = nullptr;      ///< [E]
+  int* slot_tokens = nullptr;         ///< [slots]
+  float* slot_weights = nullptr;      ///< [slots]
+  int* token_slots = nullptr;         ///< [cap, used]
+  float* act_slots = nullptr;         ///< [slots, expert_ff]
+  float* down_slots = nullptr;        ///< [slots, H]
+
+  std::uint32_t* d_tokens = nullptr;  ///< [cap] device staging for token ids
+
+  void* q8_act = nullptr;  ///< tiled Q8_1 activation staging
+};
+
+/// True when every layer takes the batched routes (quantised projections,
+/// one router type both stacks decode, grouped SwiGLU with matching gate/up
+/// types). The runner falls back to the token-by-token path when false.
+[[nodiscard]] bool FlintPrefillSupported(
+    const models::FlintModelWeights& weights) noexcept;
+
+/// Runs one chunked-prefill pass: embedding -> every layer over all `tokens`
+/// -> final norm -> unembed (last row only). The KV cache is written position
+/// by position into the caller's step buffers, so a following decode step at
+/// `start_pos + tokens.size()` continues the same sequence.
+///
+/// `compute_logits` writes the last row's logits into `buffers.logits` and its
+/// argmax into `buffers.d_out_token`, exactly like ExecuteFlintDecodeStep.
+void ExecuteFlintPrefillChunk(const models::FlintModelWeights& weights,
+                              std::span<const std::uint32_t> tokens,
+                              std::uint32_t start_pos, bool compute_logits,
+                              const FlintGpuStepBuffers& buffers,
+                              const FlintPrefillBuffers& prefill);
+
+}  // namespace gufo::hip
+
+#endif  // defined(ENGINE_ENABLE_HIP)
+
+#endif  // GUFO_MODELS_QWEN_HIP_DETAIL_FLINT_PREFILL_HPP_

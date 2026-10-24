@@ -2328,6 +2328,7 @@ public:
                        std::uint32_t max_context)
       : arena_(model.GetConfig(), max_context),
         buffers_(arena_.GetBuffers()),
+        prefill_(arena_.GetPrefillBuffers()),
         logits_(model.GetConfig().vocab_size, 0.0F) {}
 
   void Invalidate() noexcept override {
@@ -2343,6 +2344,10 @@ public:
   [[nodiscard]] hip::FlintGpuStepBuffers buffers() const noexcept {
     return buffers_;
   }
+  [[nodiscard]] const hip::FlintPrefillBuffers& prefill_buffers() const
+      noexcept {
+    return prefill_;
+  }
   [[nodiscard]] std::size_t position() const noexcept { return position_; }
   void set_position(std::size_t position) noexcept { position_ = position; }
   [[nodiscard]] std::vector<float>& logits() noexcept { return logits_; }
@@ -2355,6 +2360,7 @@ public:
 private:
   hip::FlintGpuArena arena_;
   hip::FlintGpuStepBuffers buffers_{};
+  hip::FlintPrefillBuffers prefill_{};
   std::vector<float> logits_;
   std::size_t position_{0};
   bool has_frontier_logits_{false};
@@ -2496,7 +2502,38 @@ public:
       throw std::invalid_argument("flint prompt exceeds the served context");
     }
     const bool last_chunk = offset + consumed == prompt.size();
-    for (std::size_t i = 0; i < consumed; ++i) {
+    // Chunked prefill (F-L4): the whole chunk runs the batched layer stack,
+    // which amortises weight reads and kernel launches over its tokens. It is
+    // limited to positions where the batched attention score row still fits
+    // LDS (global layers at head_dim 128); beyond that the tail falls back to
+    // the token-by-token path.
+    std::size_t batched = 0;
+    if (hip::FlintPrefillSupported(model_->GetWeights()) &&
+        offset < hip::kFlintPrefillMaxPosition) {
+      batched = std::min(consumed,
+                         static_cast<std::size_t>(hip::kFlintPrefillMaxPosition -
+                                                  offset));
+    }
+    std::size_t done = 0;
+    while (done < batched) {
+      const std::size_t take = std::min(hip::kFlintPrefillBatchCapacity,
+                                        batched - done);
+      const bool final_take = last_chunk && done + take == consumed;
+      hip::ExecuteFlintPrefillChunk(
+          model_->GetWeights(),
+          std::span<const std::uint32_t>(prompt.data() + offset + done, take),
+          static_cast<std::uint32_t>(offset + done), final_take,
+          flint.buffers(), flint.prefill_buffers());
+      if (final_take) {
+        HIP_CHECK(hipStreamSynchronize(flint.buffers().stream));
+        HIP_CHECK(hipMemcpy(flint.logits().data(), flint.buffers().logits,
+                            flint.logits().size() * sizeof(float),
+                            hipMemcpyDeviceToHost));
+        flint.mark_frontier();
+      }
+      done += take;
+    }
+    for (std::size_t i = done; i < consumed; ++i) {
       // Steps queue on the arena stream: consecutive tokens need no host
       // round-trip, and only the final prompt token needs the logits.
       const bool compute_logits = last_chunk && i + 1 == consumed;

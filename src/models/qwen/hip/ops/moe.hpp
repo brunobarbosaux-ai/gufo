@@ -88,6 +88,69 @@ void LaunchFlintFusedMoEDown(const void* down_stack,
                              std::size_t slab_bytes,
                              hipStream_t stream = nullptr);
 
+// ---------------------------------------------------------------------------
+// Batched chunk-prefill MoE (F-L4). The chunk path replaces the per-token
+// decode dispatch: one batched router GEMM, one top-k block per row, one
+// device-side slot compaction, and two expert-grouped kernels whose blocks
+// reuse each decoded weight block across a whole expert bucket.
+// ---------------------------------------------------------------------------
+
+/// logits[t, e] = x[t] . W_router[e] for the whole chunk. `type` must be
+/// kF32, kF16 or kBF16 (the router tensor's storage type).
+void LaunchFlintRouterBatch(const float* x, std::size_t n_tokens,
+                            const void* w, core::GgmlType type,
+                            std::size_t expert_count, std::size_t hidden,
+                            float* logits, hipStream_t stream = nullptr);
+
+/// Sigmoid top-k for every chunk row: selected[t, k] + weights[t, k],
+/// same selection rule (ties to the lowest index), normalisation and scale
+/// as the decode router.
+void LaunchFlintRouterTopKBatch(const float* logits, std::size_t n_tokens,
+                                std::size_t expert_count, std::uint32_t used,
+                                bool norm, float scale,
+                                std::uint32_t* selected, float* weights,
+                                hipStream_t stream = nullptr);
+
+/// Compacts the chunk selection into expert-sorted slots. Writes
+/// counts[E], offsets[E+1], slot_tokens[slots] (token index per slot),
+/// slot_weights[slots] (router weight per slot) and token_slots[T*used]
+/// (slot index per selection, selection order preserved). `cursors` is
+/// scratch; counts/offsets/cursors are E, E+1 and E ints.
+void LaunchFlintMoeSlots(const std::uint32_t* selected,
+                         const float* sel_weights, std::size_t n_tokens,
+                         std::size_t used, std::size_t expert_count,
+                         int* counts, int* offsets, int* cursors,
+                         int* slot_tokens, float* slot_weights,
+                         int* token_slots, hipStream_t stream = nullptr);
+
+/// Expert-grouped SwiGLU over the slot buckets:
+/// act[slot, r] = silu(gate_e[r] . x[token(slot)]) * (up_e[r] . x[token(slot)]).
+/// `offsets`/`slot_tokens` come from LaunchFlintMoeSlots; `slab_bytes` is the
+/// encoded per-expert slab of the routed stacks.
+void LaunchFlintMoeBatchSwiGLU(const void* gate_stack, const void* up_stack,
+                               core::GgmlType type, const float* x, float* act,
+                               const int* offsets, const int* slot_tokens,
+                               std::size_t expert_count, std::size_t expert_ff,
+                               std::size_t hidden, std::size_t slab_bytes,
+                               hipStream_t stream = nullptr);
+
+/// Expert-grouped down projection over the slot buckets, writing compact
+/// slot rows already scaled by the slot's router weight:
+/// down_out[slot, r] = slot_weights[slot] * (down_e[r] . act[slot]).
+void LaunchFlintMoeBatchDown(const void* down_stack, core::GgmlType type,
+                             const float* act, float* down_out,
+                             const int* offsets, const float* slot_weights,
+                             std::size_t expert_count, std::size_t expert_ff,
+                             std::size_t hidden, std::size_t slab_bytes,
+                             hipStream_t stream = nullptr);
+
+/// Deterministic combine: mlp[t] = shared[t] + sum_j down_out[slot(t, j)]
+/// in selection order.
+void LaunchFlintMoeCombine(const float* shared_out, const float* down_out,
+                           const int* token_slots, float* mlp_out,
+                           std::size_t n_tokens, std::size_t used,
+                           std::size_t hidden, hipStream_t stream = nullptr);
+
 }  // namespace gufo::hip
 
 #endif  // defined(ENGINE_ENABLE_HIP)

@@ -9,6 +9,7 @@
 
 #include "src/core/gguf_reader.hpp"
 #include "src/models/qwen/hip/detail/flint_decode_step.hpp"
+#include "src/models/qwen/hip/detail/flint_prefill.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/state.hpp"
 
@@ -76,6 +77,9 @@ class FlintGpuArena {
   [[nodiscard]] FlintGpuStepBuffers GetBuffers() const noexcept {
     return buffers_;
   }
+  [[nodiscard]] FlintPrefillBuffers GetPrefillBuffers() const noexcept {
+    return prefill_;
+  }
   [[nodiscard]] std::uint32_t GetMaxContext() const noexcept {
     return max_context_;
   }
@@ -92,6 +96,7 @@ class FlintGpuArena {
   std::uint32_t max_context_;
   std::size_t scratch_bytes_{0};
   FlintGpuStepBuffers buffers_{};
+  FlintPrefillBuffers prefill_{};
 };
 
 }  // namespace gufo::hip

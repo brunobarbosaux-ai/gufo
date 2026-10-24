@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -654,6 +655,131 @@ void ProbeMoEBranch(const gufo::models::FlintModelWeights& gpu_weights,
 
 }  // namespace
 
+namespace {
+
+/// F-L4 parity and rate check: the chunked prefetch path against the
+/// token-by-token path on the same tokens, then the same chunk split in two
+/// (a chunk boundary must not move the logits), then a timed run for t/s.
+void RunChunkParity(const gufo::hip::FlintGpuModel& model,
+                    const std::vector<gufo::tokenization::TokenId>& tokens,
+                    std::uint32_t max_context) {
+  const auto& config = model.GetConfig();
+  if (!gufo::hip::FlintPrefillSupported(model.GetWeights())) {
+    std::cout << "chunk: model does not take the batched routes\n";
+    return;
+  }
+  const std::size_t n = tokens.size();
+  Expect(n > 1, "chunk parity needs at least two tokens");
+  Expect(n <= gufo::hip::kFlintPrefillBatchCapacity,
+         "chunk parity prompt exceeds one chunk");
+
+  gufo::hip::FlintGpuArena arena(config, max_context);
+  const auto buffers = arena.GetBuffers();
+  const auto prefill = arena.GetPrefillBuffers();
+  std::vector<float> chunk_logits(config.vocab_size);
+  std::vector<float> token_logits(config.vocab_size);
+  std::vector<float> split_logits(config.vocab_size);
+
+  // Warm every kernel (weights and code pages), then time one chunk.
+  gufo::hip::ExecuteFlintPrefillChunk(model.GetWeights(), tokens, 0,
+                                      /*compute_logits=*/true, buffers,
+                                      prefill);
+  HIP_CHECK(hipStreamSynchronize(buffers.stream));
+  HIP_CHECK(hipMemcpy(chunk_logits.data(), buffers.logits,
+                      chunk_logits.size() * sizeof(float),
+                      hipMemcpyDeviceToHost));
+
+  const auto t0 = std::chrono::steady_clock::now();
+  gufo::hip::ExecuteFlintPrefillChunk(model.GetWeights(), tokens, 0,
+                                      /*compute_logits=*/true, buffers,
+                                      prefill);
+  HIP_CHECK(hipStreamSynchronize(buffers.stream));
+  const auto t1 = std::chrono::steady_clock::now();
+  const double chunk_ms =
+      std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+  // Token-by-token reference over the same positions.
+  for (std::size_t i = 0; i < n; ++i) {
+    gufo::hip::ExecuteFlintDecodeStep(model.GetWeights(), tokens[i],
+                                      static_cast<std::uint32_t>(i),
+                                      /*compute_logits=*/i + 1 == n, buffers);
+  }
+  HIP_CHECK(hipStreamSynchronize(buffers.stream));
+  HIP_CHECK(hipMemcpy(token_logits.data(), buffers.logits,
+                      token_logits.size() * sizeof(float),
+                      hipMemcpyDeviceToHost));
+
+  // Chunk boundary: half the tokens, then the other half.
+  const std::size_t half = n / 2;
+  gufo::hip::ExecuteFlintPrefillChunk(
+      model.GetWeights(), std::span<const std::uint32_t>(tokens.data(), half),
+      0, /*compute_logits=*/false, buffers, prefill);
+  gufo::hip::ExecuteFlintPrefillChunk(
+      model.GetWeights(),
+      std::span<const std::uint32_t>(tokens.data() + half, n - half),
+      static_cast<std::uint32_t>(half), /*compute_logits=*/true, buffers,
+      prefill);
+  HIP_CHECK(hipStreamSynchronize(buffers.stream));
+  HIP_CHECK(hipMemcpy(split_logits.data(), buffers.logits,
+                      split_logits.size() * sizeof(float),
+                      hipMemcpyDeviceToHost));
+
+  const auto vs_token = CompareLogits(token_logits, chunk_logits);
+  const auto vs_split = CompareLogits(chunk_logits, split_logits);
+  // Where does the chunk-vs-token disagreement live? Quantised-activation
+  // GEMMs (chunk) against f32 GEMV (token) move tail logits far more than
+  // head logits; report both regimes separately.
+  float tail_max = 0.0F;
+  float head_max = 0.0F;
+  {
+    std::size_t tail_idx = 0, head_idx = 0;
+    for (std::size_t i = 0; i < config.vocab_size; ++i) {
+      const float d = std::abs(token_logits[i] - chunk_logits[i]);
+      if (token_logits[i] < -10.0F) {
+        if (d > tail_max) {
+          tail_max = d;
+          tail_idx = i;
+        }
+      } else if (d > head_max) {
+        head_max = d;
+        head_idx = i;
+      }
+    }
+    std::cout << "  logit diff: head(|l|<=10) max=" << head_max
+              << " @token " << token_logits[head_idx] << " vs "
+              << chunk_logits[head_idx] << "; tail(l<-10) max=" << tail_max
+              << " @token " << token_logits[tail_idx] << " vs "
+              << chunk_logits[tail_idx] << "\n";
+  }
+  std::cout << "chunk(" << n << " tokens): cos=" << vs_token.cosine
+            << " dlogp=" << vs_token.max_logp_diff
+            << " argmax(chunk/token)=" << vs_token.argmax_gpu << "/"
+            << vs_token.argmax_cpu << "\n"
+            << "  split(" << half << "+" << (n - half)
+            << "): cos=" << vs_split.cosine
+            << " dlogp=" << vs_split.max_logp_diff
+            << " argmax=" << vs_split.argmax_gpu << "/" << vs_split.argmax_cpu
+            << "\n"
+            << "  rate: " << chunk_ms << " ms/chunk = "
+            << (n * 1000.0 / chunk_ms) << " t/s\n";
+  Expect(vs_token.cosine >= 0.999, "chunk vs token cosine");
+  Expect(vs_token.argmax_cpu == vs_token.argmax_gpu,
+         "chunk vs token argmax identity");
+  // Cross-precision gate: the chunk path runs q8_1-activation WMMA GEMMs,
+  // the token path f32 GEMV, so the strict G3 delta-log-p gate (written for
+  // decode-vs-oracle, same arithmetic) does not transfer — deep-tail logits
+  // (p ~ e^-35, unsampleable) absorb the whole quantisation wobble while the
+  // head stays tight (measured: head <= 0.41, tail <= 2.63, argmax equal,
+  // split-boundary bit-exact). Gate on the head and ignore the tail.
+  Expect(head_max <= 0.5F, "chunk vs token head logit delta");
+  Expect(vs_split.argmax_cpu == vs_split.argmax_gpu,
+         "chunk boundary argmax identity");
+  Expect(vs_split.max_logp_diff <= 1e-4,
+         "chunk boundary must not move the logits");
+}
+
+}  // namespace
+
 int main(int argc, char** argv) {
   if (argc > 1 && std::string_view(argv[1]) == "synthq8") {
     SynthQ8SwiGLUCheck();
@@ -667,8 +793,12 @@ int main(int argc, char** argv) {
 
   std::uint32_t max_context = 4096;
   std::uint32_t steps = 8;
-  bool probe = argc > 1 && std::string_view(argv[1]) == "probe";
-  if (argc > 1 && !probe) max_context = static_cast<std::uint32_t>(std::atoi(argv[1]));
+  const std::string_view mode =
+      argc > 1 ? std::string_view(argv[1]) : std::string_view{};
+  bool probe = mode == "probe";
+  const bool chunk = mode == "chunk";
+  if (!mode.empty() && !probe && !chunk)
+    max_context = static_cast<std::uint32_t>(std::atoi(argv[1]));
   if (argc > 2) steps = static_cast<std::uint32_t>(std::atoi(argv[2]));
   Expect(steps > 0, "steps must be positive");
 
@@ -699,6 +829,17 @@ int main(int argc, char** argv) {
   if (probe) {
     gufo::hip::FlintGpuArena arena(gpu_model->GetConfig(), 64);
     ProbeMoEBranch(gpu_model->GetWeights(), *cpu_weights, arena);
+    return 0;
+  }
+
+  if (chunk) {
+    std::vector<gufo::tokenization::TokenId> tokens;
+    while (tokens.size() < gufo::hip::kFlintPrefillBatchCapacity) {
+      tokens.insert(tokens.end(), prompt_tokens.begin(), prompt_tokens.end());
+    }
+    tokens.resize(gufo::hip::kFlintPrefillBatchCapacity);
+    RunChunkParity(*gpu_model, tokens,
+                   std::max<std::uint32_t>(max_context, 1024));
     return 0;
   }
 

@@ -72,12 +72,14 @@ if (ENGINE_ENABLE_HIP)
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/hipblaslt_gemm.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/dflash_kernels.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/flint_moe.hip
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/flint_moe_batch.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/arena.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/batched_decode.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/decode.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/decode_step.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/detail/weight_regions.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/flint_decode_step.cpp
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/flint_prefill.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/flint_gpu_model.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/executor.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/model_loader.cpp
