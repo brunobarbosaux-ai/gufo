@@ -64,6 +64,15 @@ __device__ __forceinline__ float4 LoadHalf4(const __half* source) {
   return make_float4(lower.x, lower.y, upper.x, upper.y);
 }
 
+// Long-position decode attention (defined below LaunchAttention): online
+// tiled kernel for positions past the LDS score-row budget.
+__global__ void FlintDecodeOnlineAttentionKernel(
+    const float* __restrict__ q, const float* __restrict__ k_cache,
+    const float* __restrict__ v_cache, float* __restrict__ out_context,
+    std::uint32_t layer_idx, std::uint32_t pos, std::uint32_t max_context,
+    std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t head_dim,
+    detail::FlintKernelPolicy policy);
+
 __global__ void AttentionKernel(
     const float* __restrict__ q, const float* __restrict__ gate,
     const float* __restrict__ k_cache, const float* __restrict__ v_cache,
@@ -924,6 +933,22 @@ void LaunchAttention(const float* q, const float* k, const float* v,
         (flint.window != 0 && seq_len < flint.window) ? seq_len : flint.window;
     const std::size_t shared_scores_bytes =
         (score_span != 0 ? score_span : seq_len) * sizeof(float);
+    if (!detail::BatchedAttentionScoresFitLds(score_span != 0 ? score_span
+                                                              : seq_len)) {
+      // Past the LDS budget the baseline cannot even launch (dynamic
+      // shared > 64 KiB — the device-lost at position 16129). The online
+      // tile kernel needs no score row and carries the same sink/window
+      // semantics; fp32 caches only (the decode step's plane).
+      if (k_cache != nullptr && v_cache != nullptr) {
+        detail::EmitAttentionDispatch("decode_online_flint", "");
+        FlintDecodeOnlineAttentionKernel<<<num_heads, 256, 0, stream>>>(
+            q, k_cache, v_cache, out_context, layer_idx, pos, max_context,
+            num_heads, num_kv_heads, head_dim, flint);
+        return;
+      }
+      throw std::invalid_argument(
+          "flint decode attention past the LDS budget requires fp32 caches");
+    }
     if (k_cache != nullptr && v_cache != nullptr) {
       detail::EmitAttentionDispatch(
           "decode_baseline_fp32",
@@ -942,6 +967,130 @@ void LaunchAttention(const float* q, const float* k, const float* v,
           static_cast<const __half*>(v_cache_f16), out_context, layer_idx, pos,
           max_context, num_heads, num_kv_heads, head_dim, flint);
     }
+  }
+}
+
+/// Online-tiled decode attention for the flint policy at positions past the
+/// LDS score-row budget (global layers, seq_len x 4 B would exceed 64 KiB):
+/// one block per head, keys walked in fixed-order 256-key tiles, per-tile
+/// block max/sum with the running (m, l) rescale. Same sink semantics as the
+/// baseline (F-D1): the sink seeds the max and the denominator, contributes
+/// no value. The per-thread O accumulator keeps one output dim, so the
+/// final normalization divides one register. Fixed tile order keeps the
+/// summation order independent of anything but position (deterministic).
+__global__ void FlintDecodeOnlineAttentionKernel(
+    const float* __restrict__ q, const float* __restrict__ k_cache,
+    const float* __restrict__ v_cache, float* __restrict__ out_context,
+    std::uint32_t layer_idx, std::uint32_t pos, std::uint32_t max_context,
+    std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t head_dim,
+    detail::FlintKernelPolicy policy) {
+  constexpr std::size_t kTile = 256;
+  const std::uint32_t h = blockIdx.x;
+  if (h >= num_heads) {
+    return;
+  }
+  const std::uint32_t group_size =
+      (num_kv_heads > 0) ? (num_heads / num_kv_heads) : 1;
+  const std::uint32_t kv_h = h / group_size;
+  const std::size_t tid = threadIdx.x;
+
+  const float* q_h = q + static_cast<std::size_t>(h) * head_dim;
+  const float scale = 1.0F / sqrtf(static_cast<float>(head_dim));
+  const std::size_t seq_len = static_cast<std::size_t>(pos) + 1;
+  const std::size_t p_begin =
+      (policy.window != 0 && seq_len > policy.window)
+          ? seq_len - policy.window
+          : 0;
+  const bool has_sink = policy.sinks != nullptr;
+  const float sink = has_sink ? policy.sinks[h] : 0.0F;
+
+  __shared__ float s_scores[kTile];
+  __shared__ float s_reduce[kTile];
+  __shared__ float s_m;     // running max
+  __shared__ float s_l;     // running denominator
+  __shared__ float s_alpha; // this tile's O rescale
+
+  float o = 0.0F; // thread-private output dim (tid < head_dim)
+
+  if (tid == 0) {
+    s_m = has_sink ? sink : -INFINITY;
+    s_l = has_sink ? 1.0F : 0.0F;
+  }
+  __syncthreads();
+
+  for (std::size_t tile = p_begin; tile < seq_len; tile += kTile) {
+    const std::size_t tile_end = std::min(tile + kTile, seq_len);
+    const std::size_t n = tile_end - tile;
+    // 1. Scores for this tile (thread-strided over keys, full dot per key).
+    for (std::size_t i = tid; i < n; i += kTile) {
+      const std::size_t p = tile + i;
+      const std::size_t p_offset =
+          (((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) *
+                max_context +
+            p) *
+           head_dim);
+      const float* k_p = k_cache + p_offset;
+      float dot = 0.0F;
+      for (std::size_t d = 0; d < head_dim; ++d) {
+        dot += q_h[d] * k_p[d];
+      }
+      s_scores[i] = dot * scale;
+    }
+    __syncthreads();
+    // 2. Tile max -> running max + rescale.
+    float local_max = -INFINITY;
+    for (std::size_t i = tid; i < n; i += kTile) {
+      local_max = fmaxf(local_max, s_scores[i]);
+    }
+    s_reduce[tid] = local_max;
+    __syncthreads();
+    for (std::size_t stride = kTile / 2; stride > 0; stride >>= 1) {
+      if (tid < stride) {
+        s_reduce[tid] = fmaxf(s_reduce[tid], s_reduce[tid + stride]);
+      }
+      __syncthreads();
+    }
+    if (tid == 0) {
+      const float m_new = fmaxf(s_m, s_reduce[0]);
+      s_alpha = expf(s_m - m_new);
+      s_m = m_new;
+    }
+    __syncthreads();
+    const float alpha = s_alpha;
+    // 3. Exponentiates + tile sum -> running denominator.
+    float local_sum = 0.0F;
+    for (std::size_t i = tid; i < n; i += kTile) {
+      const float e = expf(s_scores[i] - s_m);
+      s_scores[i] = e;
+      local_sum += e;
+    }
+    s_reduce[tid] = local_sum;
+    __syncthreads();
+    for (std::size_t stride = kTile / 2; stride > 0; stride >>= 1) {
+      if (tid < stride) {
+        s_reduce[tid] += s_reduce[tid + stride];
+      }
+      __syncthreads();
+    }
+    if (tid == 0) {
+      s_l = s_l * alpha + s_reduce[0];
+    }
+    // 4. O accumulation: rescale then add this tile's weighted V row.
+    if (tid < head_dim) {
+      o *= alpha;
+      const std::size_t v_base =
+          ((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) *
+               max_context +
+           tile) *
+          head_dim;
+      for (std::size_t i = 0; i < n; ++i) {
+        o += s_scores[i] * v_cache[v_base + i * head_dim + tid];
+      }
+    }
+    __syncthreads();
+  }
+  if (tid < head_dim) {
+    out_context[static_cast<std::size_t>(h) * head_dim + tid] = o / s_l;
   }
 }
 

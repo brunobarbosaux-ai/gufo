@@ -91,6 +91,163 @@ StepParity CompareLogits(const std::vector<float>& cpu,
 
 namespace {
 
+// Online-tile decode attention check (2.6 prerequisite): the kernel that
+// takes over past the LDS score-row budget (position 16129+ device-lost
+// before) vs a CPU double-precision reference, at the flint geometry
+// (32/4/128 + sinks, no window — the global-layer case). Also runs the
+// baseline kernel at a position where its LDS row still fits, validating
+// the reference itself. Needs no artifact.
+void RunOnlineDecodeCheck() {
+  using gufo::hip::detail::FlintKernelPolicy;
+  constexpr std::uint32_t kHeads = 32;
+  constexpr std::uint32_t kKvHeads = 4;
+  constexpr std::uint32_t kHeadDim = 128;
+  constexpr std::uint32_t kMaxContext = 32768;
+  constexpr std::uint32_t kLayer = 0;
+  constexpr std::size_t kKvWidth = kKvHeads * kHeadDim;
+  constexpr std::size_t kCacheElems =
+      static_cast<std::size_t>(kKvHeads) * kMaxContext * kHeadDim;
+  constexpr float kScale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
+
+  hipStream_t stream = nullptr;
+  HIP_CHECK(hipStreamCreate(&stream));
+
+  std::vector<float> h_q(kHeads * kHeadDim);
+  std::vector<float> h_sink(kHeads);
+  std::vector<float> h_k(kCacheElems);
+  std::vector<float> h_v(kCacheElems);
+  std::uint32_t lcg = 0x9e3779b9;
+  const auto next = [&lcg] {
+    lcg = lcg * 1664525u + 1013904223u;
+    return static_cast<float>(static_cast<double>(lcg >> 8) / 16777216.0 -
+                              0.5);
+  };
+  for (auto& v : h_q) {
+    v = next();
+  }
+  for (auto& s : h_sink) {
+    s = next() * 2.0F;
+  }
+  for (auto& v : h_k) {
+    v = next();
+  }
+  for (auto& v : h_v) {
+    v = next();
+  }
+
+  float *d_q = nullptr, *d_k = nullptr, *d_v = nullptr, *d_sink = nullptr,
+        *d_out = nullptr;
+  HIP_CHECK(hipMalloc(&d_q, h_q.size() * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_sink, h_sink.size() * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_k, h_k.size() * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_v, h_v.size() * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_out, kHeads * kHeadDim * sizeof(float)));
+  HIP_CHECK(hipMemcpy(d_q, h_q.data(), h_q.size() * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_sink, h_sink.data(), h_sink.size() * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_k, h_k.data(), h_k.size() * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_v, h_v.data(), h_v.size() * sizeof(float),
+                      hipMemcpyHostToDevice));
+
+  const FlintKernelPolicy policy{d_sink, 0U};
+
+  const auto cpu_reference = [&](std::uint32_t pos) {
+    std::vector<double> out(kHeads * kHeadDim);
+    const std::size_t seq_len = pos + 1;
+    for (std::uint32_t h = 0; h < kHeads; ++h) {
+      const std::uint32_t kv_h = h / (kHeads / kKvHeads);
+      const float* q_h = h_q.data() + h * kHeadDim;
+      double m = h_sink[h];
+      std::vector<double> scores(seq_len);
+      for (std::size_t p = 0; p < seq_len; ++p) {
+        const float* k_p = h_k.data() +
+                           ((kLayer * kKvHeads + kv_h) *
+                                static_cast<std::size_t>(kMaxContext) +
+                            p) *
+                               kHeadDim;
+        double dot = 0.0;
+        for (std::size_t d = 0; d < kHeadDim; ++d) {
+          dot += static_cast<double>(q_h[d]) * static_cast<double>(k_p[d]);
+        }
+        scores[p] = dot * kScale;
+        m = std::max(m, scores[p]);
+      }
+      double l = std::exp(static_cast<double>(h_sink[h]) - m);
+      for (std::size_t p = 0; p < seq_len; ++p) {
+        scores[p] = std::exp(scores[p] - m);
+        l += scores[p];
+      }
+      for (std::size_t d = 0; d < kHeadDim; ++d) {
+        double acc = 0.0;
+        for (std::size_t p = 0; p < seq_len; ++p) {
+          const float* v_p = h_v.data() +
+                             ((kLayer * kKvHeads + kv_h) *
+                                  static_cast<std::size_t>(kMaxContext) +
+                              p) *
+                                 kHeadDim;
+          acc += scores[p] * static_cast<double>(v_p[d]);
+        }
+        out[h * kHeadDim + d] = acc / l;
+      }
+    }
+    return out;
+  };
+
+  const auto run_kernel = [&](std::uint32_t pos) {
+    HIP_CHECK(hipMemsetAsync(d_out, 0, kHeads * kHeadDim * sizeof(float),
+                             stream));
+    gufo::hip::LaunchCausalDecodeAttention(
+        d_q, /*gate=*/nullptr, d_k, d_v, /*k_cache_f16=*/nullptr,
+        /*v_cache_f16=*/nullptr, d_out, kLayer, pos, 1, kMaxContext, kHeads,
+        kKvHeads, kHeadDim, stream, std::span<float>{}, &policy);
+    HIP_CHECK(hipStreamSynchronize(stream));
+    std::vector<float> out(kHeads * kHeadDim);
+    HIP_CHECK(hipMemcpy(out.data(), d_out, out.size() * sizeof(float),
+                        hipMemcpyDeviceToHost));
+    return out;
+  };
+
+  int failures = 0;
+  for (const std::uint32_t pos : {8000u, 20000u}) {
+    const std::string route = pos >= 16129 ? "online" : "baseline";
+    const auto ref = cpu_reference(pos);
+    const auto got = run_kernel(pos);
+    double max_abs = 0.0;
+    double dot_q = 0.0, nref = 0.0, ngot = 0.0;
+    for (std::size_t i = 0; i < ref.size(); ++i) {
+      max_abs = std::max(max_abs, std::abs(ref[i] - got[i]));
+      dot_q += ref[i] * got[i];
+      nref += ref[i] * ref[i];
+      ngot += got[i] * got[i];
+    }
+    const double cos =
+        dot_q / (std::sqrt(nref) * std::sqrt(ngot) + 1e-30);
+    std::cout << "  onlinedecode pos=" << pos << " (" << route
+              << "): cos=" << cos << " max_abs=" << max_abs << "\n";
+    if (!(cos > 0.9999) || max_abs > 5e-4) {
+      std::cerr << "FAIL: onlinedecode parity at pos " << pos << "\n";
+      ++failures;
+    }
+  }
+
+  HIP_CHECK(hipFree(d_q));
+  HIP_CHECK(hipFree(d_sink));
+  HIP_CHECK(hipFree(d_k));
+  HIP_CHECK(hipFree(d_v));
+  HIP_CHECK(hipFree(d_out));
+  HIP_CHECK(hipStreamDestroy(stream));
+  if (failures != 0) {
+    std::exit(1);
+  }
+  std::cout << "  onlinedecode: PASS\n";
+}
+
+}  // namespace
+
+namespace {
+
 // Synthetic Q8_0 SwiGLU repro at the exact production MoE shapes
 // (M=512 rows, K=2048): compares LaunchFusedSwiGLUGEMV (legacy) and the
 // F-J1 fused MoE SwiGLU against a CPU float reference. Needs no artifact.
@@ -882,6 +1039,10 @@ void RunChunkParity(const gufo::hip::FlintGpuModel& model,
 int main(int argc, char** argv) {
   if (argc > 1 && std::string_view(argv[1]) == "synthq8") {
     SynthQ8SwiGLUCheck();
+    return 0;
+  }
+  if (argc > 1 && std::string_view(argv[1]) == "onlinedecode") {
+    RunOnlineDecodeCheck();
     return 0;
   }
   const char* env = std::getenv("GUFO_FLINT_GGUF");
