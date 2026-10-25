@@ -1,5 +1,7 @@
 #include "src/cli/serve/inference_backend.hpp"
 
+#include "src/core/hip/detail/dispatch_telemetry.hpp"
+
 #include <unistd.h>
 
 #include <algorithm>
@@ -2515,23 +2517,46 @@ public:
                                                   offset));
     }
     std::size_t done = 0;
+    const auto prefill_t0 = std::chrono::steady_clock::now();
     while (done < batched) {
       const std::size_t take = std::min(hip::kFlintPrefillBatchCapacity,
                                         batched - done);
       const bool final_take = last_chunk && done + take == consumed;
+      const auto chunk_t0 = std::chrono::steady_clock::now();
       hip::ExecuteFlintPrefillChunk(
           model_->GetWeights(),
           std::span<const std::uint32_t>(prompt.data() + offset + done, take),
           static_cast<std::uint32_t>(offset + done), final_take,
           flint.buffers(), flint.prefill_buffers());
+      HIP_CHECK(hipStreamSynchronize(flint.buffers().stream));
+      const auto chunk_t1 = std::chrono::steady_clock::now();
+      if (hip::detail::DispatchTelemetryEnabled()) {
+        std::clog << "{\"component\":\"gufo.dispatch\",\"event\":"
+                     "\"flint_prefill_chunk\",\"offset\":"
+                  << offset + done << ",\"tokens\":" << take << ",\"ms\":"
+                  << std::chrono::duration<double, std::milli>(chunk_t1 -
+                                                               chunk_t0)
+                         .count()
+                  << "}\n";
+      }
       if (final_take) {
-        HIP_CHECK(hipStreamSynchronize(flint.buffers().stream));
         HIP_CHECK(hipMemcpy(flint.logits().data(), flint.buffers().logits,
                             flint.logits().size() * sizeof(float),
                             hipMemcpyDeviceToHost));
         flint.mark_frontier();
       }
       done += take;
+    }
+    if (hip::detail::DispatchTelemetryEnabled() && batched > 0) {
+      const auto prefill_t1 = std::chrono::steady_clock::now();
+      std::clog << "{\"component\":\"gufo.dispatch\",\"event\":"
+                   "\"flint_prefill\",\"offset\":"
+                << offset << ",\"batched\":" << batched << ",\"consumed\":"
+                << consumed << ",\"ms\":"
+                << std::chrono::duration<double, std::milli>(prefill_t1 -
+                                                             prefill_t0)
+                       .count()
+                << "}\n";
     }
     for (std::size_t i = done; i < consumed; ++i) {
       // Steps queue on the arena stream: consecutive tokens need no host
