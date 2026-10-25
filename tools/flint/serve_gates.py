@@ -149,8 +149,8 @@ def engine_generate(cfg, messages, *, max_tokens, temperature, top_p, top_k,
     return extract_text(data["choices"][0]["message"], full)
 
 
-def build_g4_prompts(count, cfg):
-    """Eight corpus-class prompts trimmed to exactly G4_TOKENS via the
+def build_g4_prompts(count, cfg, prompt_len=G4_TOKENS):
+    """Corpus-class prompts trimmed to exactly `prompt_len` via the
     oracle tokenizer (both engines share the G1-verified tokenizer)."""
     import pathlib
     import subprocess
@@ -177,7 +177,7 @@ def build_g4_prompts(count, cfg):
     for item in prompts:
         ids = post(f"{ORACLE}/tokenize",
                    {"content": item["text"], "add_special": True})["tokens"]
-        ids = ids[:G4_TOKENS]
+        ids = ids[:prompt_len]
         text = post(f"{ORACLE}/detokenize", {"tokens": ids})["content"]
         trimmed.append({"class": item["class"], "tokens": len(ids),
                         "text": text})
@@ -186,7 +186,8 @@ def build_g4_prompts(count, cfg):
 
 def cmd_g4(args):
     cfg = engine_config(args.engine)
-    prompts = build_g4_prompts(args.prompts, cfg)
+    gen_tokens = args.gen_tokens or args.prompt_len
+    prompts = build_g4_prompts(args.prompts, cfg, args.prompt_len)
     rows = []
     for index, item in enumerate(prompts):
         start = time.time()
@@ -195,7 +196,7 @@ def cmd_g4(args):
             # compare can verify every fork against the oracle's own
             # distribution (no fragile re-requests — see g4-compare).
             payload = {"messages": [{"role": "user", "content": item["text"]}],
-                       "max_tokens": G4_TOKENS, "temperature": 0.0,
+                       "max_tokens": gen_tokens, "temperature": 0.0,
                        "top_p": 1.0, "top_k": 0, "seed": 1234 + index,
                        "logprobs": True, "top_logprobs": 20}
             data = post(f"{cfg['base']}/v1/chat/completions", payload)
@@ -211,7 +212,7 @@ def cmd_g4(args):
         else:
             payload = {"model": cfg["model"],
                        "messages": [{"role": "user", "content": item["text"]}],
-                       "max_tokens": G4_TOKENS, "temperature": 0.0,
+                       "max_tokens": gen_tokens, "temperature": 0.0,
                        "top_p": 1.0, "top_k": 0, "seed": 1234 + index}
             message = post(f"{cfg['base']}/chat/completions",
                            payload)["choices"][0]["message"]
@@ -225,7 +226,8 @@ def cmd_g4(args):
               f"({len(full)} stream), {row['seconds']}s")
     with open(args.out, "w") as handle:
         json.dump({"gate": "G4", "engine": args.engine,
-                   "settings": {"temperature": 0.0, "max_tokens": G4_TOKENS},
+                   "settings": {"temperature": 0.0, "max_tokens": gen_tokens,
+                                "prompt_len": args.prompt_len},
                    "rows": rows}, handle, indent=1)
     print(f"G4 arm written: {args.out}")
 
@@ -479,6 +481,14 @@ def main():
         p.add_argument("--prompts", type=int, default=8)
         p.add_argument("--rows", type=int, default=200)
         p.add_argument("--max-tokens", type=int, default=16)
+        if name == "g4":
+            # 1.1 G3-delta: probe depths via --prompt-len (64/512/2048/6144);
+            # generation length defaults to the prompt depth.
+            p.add_argument("--prompt-len", type=int, default=G4_TOKENS,
+                           help="prompt depth in tokens (default 512, the "
+                                "gate spec)")
+            p.add_argument("--gen-tokens", type=int, default=None,
+                           help="generation length (default: --prompt-len)")
 
     p = sub.add_parser("g4-compare")
     p.add_argument("left")
