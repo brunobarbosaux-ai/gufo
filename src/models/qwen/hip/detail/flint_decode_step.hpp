@@ -72,12 +72,43 @@ struct FlintGpuStepBuffers {
 /// GEMV launches. That readback is the known optimization point (a fused
 /// device-side MoE dispatch removes it); correctness first.
 ///
+/// Runs one full flint decode step (embedding -> 49 attention layers ->
+/// final norm -> unembed -> argmax) on the GPU. Every layer is attention
+/// (no SSM); per-layer switches come from FlintLayerAttributes: RoPE is
+/// skipped on NoPE layers (F-D3), windowed layers pass the sliding window
+/// through FlintKernelPolicy (F-D2), and layers below
+/// leading_dense_block_count use a dense SwiGLU FFN while the rest run the
+/// sigmoid top-k MoE with one ungated shared expert (F-E1/F-E3).
+///
+/// The router runs on device; the selected expert ids and weights are read
+/// back once per MoE layer so the host can offset the expert slabs for the
+/// GEMV launches. That readback is the known optimization point (a fused
+/// device-side MoE dispatch removes it); correctness first.
+///
 /// `pos` is the position of the token being decoded. `compute_logits` skips
-/// the unembed + argmax when false.
+/// the unembed + argmax when false. When `timings` is non-null the step is
+/// instrumented with stream-ordered event marks (~500 event creates per
+/// call — profiling only; see FlintDecodeTimings below).
+struct FlintDecodeTimings {
+  double embed_ms = 0;
+  double attn_norm_qkv_ms = 0;   ///< RMSNorm + Q/K/V GEMVs
+  double head_rope_ms = 0;       ///< per-head norms + RoPE
+  double attention_ms = 0;       ///< decode attention incl. KV write
+  double oproj_ms = 0;           ///< O-projection + residual
+  double ffn_norm_router_ms = 0; ///< FFN norm + router GEMV
+  double moe_ms = 0;             ///< MoE branch (or dense FFN)
+  double residual_ms = 0;        ///< post-FFN residual add
+  double tail_ms = 0;            ///< final norm + unembed + argmax
+  double total_ms = 0;
+  std::size_t moe_layers = 0;
+  std::size_t dense_layers = 0;
+};
+
 void ExecuteFlintDecodeStep(const models::FlintModelWeights& weights,
                             std::uint32_t token_id, std::uint32_t pos,
                             bool compute_logits,
-                            const FlintGpuStepBuffers& buffers);
+                            const FlintGpuStepBuffers& buffers,
+                            FlintDecodeTimings* timings = nullptr);
 
 }  // namespace gufo::hip
 

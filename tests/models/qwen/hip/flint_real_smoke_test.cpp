@@ -992,6 +992,8 @@ int main(int argc, char** argv) {
   std::vector<float> gpu_logits(config.vocab_size);
   std::cout << "  arena scratch=" << gpu_arena.GetScratchBytes() / (1ULL << 20)
             << " MiB\n";
+  const bool profile_decode =
+      std::getenv("GUFO_FLINT_DECODE_PROFILE") != nullptr;
 
   for (int pass = 0; pass < 2; ++pass) {
     // The KV cache is only read at [0, pos] and every position is rewritten
@@ -1004,11 +1006,26 @@ int main(int argc, char** argv) {
                                       cpu_logits);
 
       const auto t0 = std::chrono::steady_clock::now();
+      gufo::hip::FlintDecodeTimings dt;
       gufo::hip::ExecuteFlintDecodeStep(gpu_model->GetWeights(), token, step,
-                                        /*compute_logits=*/true, buffers);
+                                        /*compute_logits=*/true, buffers,
+                                        profile_decode ? &dt : nullptr);
       HIP_CHECK(hipStreamSynchronize(buffers.stream));
       const auto t1 = std::chrono::steady_clock::now();
       total_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+      if (profile_decode && step + 1 == steps) {
+        std::cout << "\n  decode stages (final step, " << dt.total_ms
+                  << " ms): embed=" << dt.embed_ms
+                  << " norm+qkv=" << dt.attn_norm_qkv_ms
+                  << " head+rope=" << dt.head_rope_ms
+                  << " attn=" << dt.attention_ms
+                  << " oproj=" << dt.oproj_ms
+                  << " ffn-norm+router=" << dt.ffn_norm_router_ms
+                  << " ffn=" << dt.moe_ms << " (" << dt.moe_layers << " moe/"
+                  << dt.dense_layers << " dense)"
+                  << " residual=" << dt.residual_ms
+                  << " tail=" << dt.tail_ms;
+      }
 
       HIP_CHECK(hipMemcpy(gpu_logits.data(), buffers.logits,
                           gpu_logits.size() * sizeof(float),

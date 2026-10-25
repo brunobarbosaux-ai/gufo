@@ -79,7 +79,10 @@ void RunSwiGLU(const models::QwenTensorRef& gate,
 void RunFlintLayer(const models::FlintModelWeights& weights,
                    const models::FlintLayerWeights& layer,
                    std::uint32_t layer_idx, std::uint32_t pos,
-                   const FlintGpuStepBuffers& b) {
+                   const FlintGpuStepBuffers& b,
+                   FlintDecodeTimings* timings,
+                   std::vector<hipEvent_t>* marks,
+                   char* is_moe_layer) {
   const auto& config = weights.config;
   const std::size_t hidden_size = config.hidden_size;
   const std::size_t attention_size =
@@ -87,6 +90,16 @@ void RunFlintLayer(const models::FlintModelWeights& weights,
   const std::size_t kv_size =
       static_cast<std::size_t>(config.num_key_value_heads) * config.head_dim;
 
+  // Event marks are stream-ordered; the caller resolves stage sums after
+  // one final sync. Eight boundaries per layer: [0]=norm+qkv start,
+  // [1]=head-norm start, [2]=attention start, [3]=oproj start, [4]=ffn
+  // norm+router start, [5]=moe start, [6]=residual start, [7]=layer end.
+  auto mark = [&](std::size_t i) {
+    if (marks != nullptr) {
+      HIP_CHECK(hipEventRecord((*marks)[layer_idx * 8 + i], b.stream));
+    }
+  };
+  mark(0);
   // 1. Pre-attention RMSNorm.
   LaunchRMSNorm(b.hidden, static_cast<const float*>(layer.attn_norm.data),
                 b.normed, hidden_size, kFlintRmsEps, b.stream);
@@ -99,6 +112,7 @@ void RunFlintLayer(const models::FlintModelWeights& weights,
   LaunchGEMV(layer.attn_v.data, layer.attn_v.type, b.normed, b.v, kv_size,
              hidden_size, b.stream);
 
+  mark(1);
   // 3. Per-head Q/K RMSNorm.
   LaunchPerHeadRMSNorm(b.q, static_cast<const float*>(layer.attn_q_norm.data),
                        b.q, config.num_attention_heads, config.head_dim,
@@ -114,6 +128,7 @@ void RunFlintLayer(const models::FlintModelWeights& weights,
                b.stream);
   }
 
+  mark(2);
   // 5. Attention with sinks + optional sliding window (F-D1/F-D2). The
   // policy gates dispatch to the sink-capable baseline kernels.
   const detail::FlintKernelPolicy policy{
@@ -127,14 +142,20 @@ void RunFlintLayer(const models::FlintModelWeights& weights,
                   &policy);
 
   // 6. O-projection + residual.
+  mark(3);
   LaunchGEMV(layer.attn_output.data, layer.attn_output.type, b.attn_out,
              b.attn_proj, hidden_size, attention_size, b.stream);
   LaunchResidualAdd(b.hidden, b.attn_proj, b.hidden, hidden_size, b.stream);
 
   // 7. FFN: dense SwiGLU on the lead layers, MoE elsewhere.
+  mark(4);
   LaunchRMSNorm(b.hidden, static_cast<const float*>(layer.ffn_norm.data),
                 b.normed, hidden_size, kFlintRmsEps, b.stream);
   if (layer.attrs.dense_ffn) {
+    if (is_moe_layer != nullptr) {
+      *is_moe_layer = 0;
+    }
+    mark(5);
     RunSwiGLU(layer.ffn_gate, layer.ffn_up, b.normed, b.act, b.act_gate,
               config.intermediate_size, hidden_size, b.stream);
     LaunchGEMV(layer.ffn_down.data, layer.ffn_down.type, b.act, b.mlp_out,
@@ -147,6 +168,11 @@ void RunFlintLayer(const models::FlintModelWeights& weights,
 
     LaunchGEMV(layer.ffn_gate_inp.data, layer.ffn_gate_inp.type, b.normed,
                b.router_logits, config.expert_count, hidden_size, b.stream);
+
+    if (is_moe_layer != nullptr) {
+      *is_moe_layer = 1;
+    }
+    mark(5);
 
     // F-J1 fused dispatch: the router writes the full weight array on
     // device and compacts the selected ids into the job list; the two
@@ -216,8 +242,7 @@ void RunFlintLayer(const models::FlintModelWeights& weights,
       HIP_CHECK(hipStreamSynchronize(b.stream));
 
       LaunchFlintZero(b.mlp_out, hidden_size, b.stream);
-      for (std::uint32_t i = 0; i < used; ++i) {
-        const std::size_t expert = h_selected[i];
+      for (std::uint32_t i = 0; i < used; ++i) {        const std::size_t expert = h_selected[i];
         RunSwiGLU(SlabRef(layer.ffn_gate_exps, expert, expert_slab),
                   SlabRef(layer.ffn_up_exps, expert, expert_slab), b.normed,
                   b.act, b.act_gate, expert_ff, hidden_size, b.stream);
@@ -237,7 +262,47 @@ void RunFlintLayer(const models::FlintModelWeights& weights,
                                   b.stream);
     }
   }
+  mark(6);
   LaunchResidualAdd(b.hidden, b.mlp_out, b.hidden, hidden_size, b.stream);
+  mark(7);
+}
+
+/// Resolve the stream-ordered event marks into the stage sums. Boundaries
+/// per layer: 0 norm+qkv start, 1 head-norm start, 2 attention start,
+/// 3 oproj start, 4 ffn-norm start, 5 moe start, 6 residual start, 7 end.
+void ResolveDecodeTimings(FlintDecodeTimings& timings,
+                          const std::vector<hipEvent_t>& marks,
+                          const std::vector<char>& moe_flags,
+                          hipEvent_t embed_start, hipEvent_t embed_end,
+                          hipEvent_t tail_start, hipEvent_t step_end,
+                          hipStream_t stream) {
+  HIP_CHECK(hipEventSynchronize(step_end));
+  const auto elapsed = [&](hipEvent_t a, hipEvent_t b) {
+    float ms = 0.0F;
+    HIP_CHECK(hipEventElapsedTime(&ms, a, b));
+    return static_cast<double>(ms);
+  };
+  timings.embed_ms = elapsed(embed_start, embed_end);
+  const std::size_t layers = moe_flags.size();
+  for (std::size_t i = 0; i < layers; ++i) {
+    const hipEvent_t* e = marks.data() + i * 8;
+    timings.attn_norm_qkv_ms += elapsed(e[0], e[1]);
+    timings.head_rope_ms += elapsed(e[1], e[2]);
+    timings.attention_ms += elapsed(e[2], e[3]);
+    timings.oproj_ms += elapsed(e[3], e[4]);
+    timings.ffn_norm_router_ms += elapsed(e[4], e[5]);
+    timings.moe_ms += elapsed(e[5], e[6]);
+    timings.residual_ms += elapsed(e[6], e[7]);
+    if (moe_flags[i] != 0) {
+      ++timings.moe_layers;
+    } else {
+      ++timings.dense_layers;
+    }
+  }
+  if (tail_start != nullptr) {
+    timings.tail_ms = elapsed(tail_start, step_end);
+  }
+  timings.total_ms = elapsed(embed_start, step_end);
 }
 
 }  // namespace
@@ -245,26 +310,80 @@ void RunFlintLayer(const models::FlintModelWeights& weights,
 void ExecuteFlintDecodeStep(const models::FlintModelWeights& weights,
                             std::uint32_t token_id, std::uint32_t pos,
                             bool compute_logits,
-                            const FlintGpuStepBuffers& b) {
+                            const FlintGpuStepBuffers& b,
+                            FlintDecodeTimings* timings) {
   const auto& config = weights.config;
   const std::size_t hidden_size = config.hidden_size;
 
+  // Profiling scaffolding: 8 marks per layer + embed/tail boundaries.
+  // All events are stream-ordered; stage sums resolve after one final
+  // sync, so the step's enqueue shape is untouched.
+  std::vector<hipEvent_t> marks;
+  hipEvent_t embed_start = nullptr, embed_end = nullptr;
+  hipEvent_t tail_start = nullptr, step_end = nullptr;
+  if (timings != nullptr) {
+    marks.resize(config.num_layers * 8);
+    for (auto& e : marks) {
+      HIP_CHECK(hipEventCreate(&e));
+    }
+    HIP_CHECK(hipEventCreate(&embed_start));
+    HIP_CHECK(hipEventCreate(&embed_end));
+    HIP_CHECK(hipEventCreate(&tail_start));
+    HIP_CHECK(hipEventCreate(&step_end));
+    HIP_CHECK(hipEventRecord(embed_start, b.stream));
+  }
+
   LaunchEmbeddingLookup(weights.token_embd.data, weights.token_embd.type,
                         token_id, b.hidden, hidden_size, b.stream);
+  if (timings != nullptr) {
+    HIP_CHECK(hipEventRecord(embed_end, b.stream));
+  }
 
+  std::vector<char> moe_flags(config.num_layers, 0);
   for (std::uint32_t layer_idx = 0; layer_idx < config.num_layers;
        ++layer_idx) {
-    RunFlintLayer(weights, weights.layers[layer_idx], layer_idx, pos, b);
+    RunFlintLayer(weights, weights.layers[layer_idx], layer_idx, pos, b,
+                  timings, timings != nullptr ? &marks : nullptr,
+                  timings != nullptr ? moe_flags.data() + layer_idx : nullptr);
   }
 
   if (!compute_logits) {
+    if (timings != nullptr) {
+      HIP_CHECK(hipEventRecord(step_end, b.stream));
+      HIP_CHECK(hipEventSynchronize(step_end));
+      ResolveDecodeTimings(*timings, marks, moe_flags, embed_start, embed_end,
+                           nullptr, step_end, b.stream);
+      for (auto& e : marks) {
+        HIP_CHECK(hipEventDestroy(e));
+      }
+      HIP_CHECK(hipEventDestroy(embed_start));
+      HIP_CHECK(hipEventDestroy(embed_end));
+      HIP_CHECK(hipEventDestroy(tail_start));
+      HIP_CHECK(hipEventDestroy(step_end));
+    }
     return;
+  }
+  if (timings != nullptr) {
+    HIP_CHECK(hipEventRecord(tail_start, b.stream));
   }
   LaunchRMSNorm(b.hidden, static_cast<const float*>(weights.output_norm.data),
                 b.normed, hidden_size, kFlintRmsEps, b.stream);
   LaunchGEMV(weights.output.data, weights.output.type, b.normed, b.logits,
              config.vocab_size, hidden_size, b.stream);
   LaunchGPUArgmax(b.logits, b.d_out_token, config.vocab_size, b.stream);
+  if (timings != nullptr) {
+    HIP_CHECK(hipEventRecord(step_end, b.stream));
+    HIP_CHECK(hipEventSynchronize(step_end));
+    ResolveDecodeTimings(*timings, marks, moe_flags, embed_start, embed_end,
+                         tail_start, step_end, b.stream);
+    for (auto& e : marks) {
+      HIP_CHECK(hipEventDestroy(e));
+    }
+    HIP_CHECK(hipEventDestroy(embed_start));
+    HIP_CHECK(hipEventDestroy(embed_end));
+    HIP_CHECK(hipEventDestroy(tail_start));
+    HIP_CHECK(hipEventDestroy(step_end));
+  }
 }
 
 }  // namespace gufo::hip
