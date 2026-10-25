@@ -248,6 +248,116 @@ void RunOnlineDecodeCheck() {
 // Flash prefill attention check (2.6): FlintWmmaCausalAttention vs a CPU
 // double-precision reference at the flint geometry, batch 16 and 512,
 // with and without window, sinks always on. Needs no artifact.
+/// Times the decode-attention dispatch shapes at a long span (flashbench
+/// tuning probe): the graph ladder vs the legacy baseline vs the online
+/// tile kernel, 49 layers' worth of launches per sample, synthetic caches.
+/// CAVEAT learned the hard way: repeated relaunches of the same region are
+/// L2-resident, which flatters uncoalesced shapes (the online tile read
+/// 2x "faster" than coalesced rivals here while losing 25% in the serve's
+/// cold-KV F-J4). Rank kernels with this probe, but ship on serve A/Bs.
+void RunFlashBench() {
+  using gufo::hip::detail::FlintKernelPolicy;
+  constexpr std::uint32_t kHeads = 32;
+  constexpr std::uint32_t kKvHeads = 4;
+  constexpr std::uint32_t kHeadDim = 128;
+  constexpr std::uint32_t kMaxContext = 8192;
+  constexpr std::uint32_t kPos = 6600;
+  constexpr std::uint32_t kLayers = 49;
+
+  hipStream_t stream = nullptr;
+  HIP_CHECK(hipStreamCreate(&stream));
+
+  float* d_k = nullptr;
+  float* d_v = nullptr;
+  float* d_q = nullptr;
+  float* d_out = nullptr;
+  float* d_sink = nullptr;
+  std::uint32_t* d_control = nullptr;
+  // Sized for the online-tier probe's 24576 stride; the 8192-stride
+  // benches stay in the first planes.
+  constexpr std::uint32_t kCacheStride = 24576;
+  const std::size_t cache_elems =
+      static_cast<std::size_t>(kKvHeads) * kCacheStride * kHeadDim;
+  HIP_CHECK(hipMalloc(&d_k, cache_elems * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_v, cache_elems * sizeof(float)));
+  HIP_CHECK(hipMemset(d_k, 0x3C, cache_elems * sizeof(float)));
+  HIP_CHECK(hipMemset(d_v, 0x3C, cache_elems * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_q, kHeads * kHeadDim * sizeof(float)));
+  HIP_CHECK(hipMemset(d_q, 0x3C, kHeads * kHeadDim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_out, kHeads * kHeadDim * sizeof(float)));
+  std::vector<float> h_sink(kHeads, 0.5F);
+  HIP_CHECK(hipMalloc(&d_sink, kHeads * sizeof(float)));
+  HIP_CHECK(hipMemcpy(d_sink, h_sink.data(), kHeads * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMalloc(&d_control, 2 * sizeof(std::uint32_t)));
+  const std::uint32_t control[2] = {42U, kPos};
+  HIP_CHECK(hipMemcpy(d_control, control, sizeof(control),
+                      hipMemcpyHostToDevice));
+
+  const FlintKernelPolicy policy{d_sink, 0U};
+  const FlintKernelPolicy policy_w{d_sink, 513U};
+  const auto bench = [&](const char* name, auto&& launch) {
+    // warm
+    for (int i = 0; i < 3; ++i) {
+      launch();
+    }
+    HIP_CHECK(hipStreamSynchronize(stream));
+    const auto t0 = std::chrono::steady_clock::now();
+    constexpr int kReps = 20;
+    for (int i = 0; i < kReps; ++i) {
+      for (std::uint32_t l = 0; l < kLayers; ++l) {
+        launch();
+      }
+    }
+    HIP_CHECK(hipStreamSynchronize(stream));
+    const auto t1 = std::chrono::steady_clock::now();
+    const double ms =
+        std::chrono::duration<double, std::milli>(t1 - t0).count() /
+        (kReps * kLayers);
+    std::cout << "  " << name << ": " << ms << " ms/layer @ pos " << kPos
+              << "\n";
+  };
+
+  bench("graph ladder (d_pos, fixed-LDS clone @8192)",
+        [&] {
+          gufo::hip::LaunchAttention(
+              d_q, nullptr, nullptr, nullptr, d_k, d_v, nullptr, nullptr,
+              d_out, 0U, d_control + 1, kMaxContext, kHeads, kKvHeads,
+              kHeadDim, stream, /*skip_kv_write=*/true, &policy);
+        });
+  bench("baseline (host pos, dynamic LDS)",
+        [&] {
+          gufo::hip::LaunchAttention(
+              d_q, nullptr, nullptr, nullptr, d_k, d_v, nullptr, nullptr,
+              d_out, 0U, kPos, kMaxContext, kHeads, kKvHeads, kHeadDim,
+              stream, /*split_k_scratch=*/nullptr, /*skip_kv_write=*/true,
+              &policy);
+        });
+  bench("online Ptr (d_pos, >8192 tier)",
+        [&] {
+          gufo::hip::LaunchAttention(
+              d_q, nullptr, nullptr, nullptr, d_k, d_v, nullptr, nullptr,
+              d_out, 0U, d_control + 1, 24576U, kHeads, kKvHeads, kHeadDim,
+              stream, /*skip_kv_write=*/true, &policy);
+        });
+  bench("windowed baseline (host pos, span 513)",
+        [&] {
+          gufo::hip::LaunchAttention(
+              d_q, nullptr, nullptr, nullptr, d_k, d_v, nullptr, nullptr,
+              d_out, 0U, kPos, kMaxContext, kHeads, kKvHeads, kHeadDim,
+              stream, /*split_k_scratch=*/nullptr, /*skip_kv_write=*/true,
+              &policy_w);
+        });
+
+  HIP_CHECK(hipFree(d_k));
+  HIP_CHECK(hipFree(d_v));
+  HIP_CHECK(hipFree(d_q));
+  HIP_CHECK(hipFree(d_out));
+  HIP_CHECK(hipFree(d_sink));
+  HIP_CHECK(hipFree(d_control));
+  HIP_CHECK(hipStreamDestroy(stream));
+}
+
 void RunFlashCheck() {
   using gufo::hip::detail::FlintKernelPolicy;
   constexpr std::uint32_t kHeads = 32;
@@ -1289,6 +1399,10 @@ int main(int argc, char** argv) {
   }
   if (argc > 1 && std::string_view(argv[1]) == "flashcheck") {
     RunFlashCheck();
+    return 0;
+  }
+  if (argc > 1 && std::string_view(argv[1]) == "flashbench") {
+    RunFlashBench();
     return 0;
   }
   const char* env = std::getenv("GUFO_FLINT_GGUF");
