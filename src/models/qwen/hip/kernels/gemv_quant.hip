@@ -16,7 +16,8 @@ template<std::uint32_t WavesPerBlock>
 __launch_bounds__(WavesPerBlock * 32, 4) __global__
     void Q8KBlockGEMVKernel(const void* __restrict__ A, core::GgmlType type,
                             const float* __restrict__ x, float* __restrict__ y,
-                            std::size_t M, std::size_t K) {
+                            std::size_t M, std::size_t K,
+                            const float* __restrict__ residual) {
   const std::size_t tid = threadIdx.x;
   const std::size_t lane_id = tid & 31u;
   const std::size_t warp_id = tid >> 5u;
@@ -27,7 +28,7 @@ __launch_bounds__(WavesPerBlock * 32, 4) __global__
 
   const float sumf = QuantWarpBlockDot(type, A, m, x, K, lane_id, 0, 1);
   if (lane_id == 0) {
-    y[m] = sumf;
+    y[m] = sumf + (residual != nullptr ? residual[m] : 0.0F);
   }
 }
 
@@ -38,7 +39,8 @@ __launch_bounds__(WavesPerBlock * 32, 4) __global__
                                   core::GgmlType type,
                                   const float* __restrict__ x,
                                   float* __restrict__ y, std::size_t M,
-                                  std::size_t K) {
+                                  std::size_t K,
+                                  const float* __restrict__ residual) {
   // F32 denotes runtime format dispatch here; the common packed formats
   // specialize this same arithmetic body to remove per-block type branches.
   if constexpr (StaticType != core::GgmlType::kF32) {
@@ -93,9 +95,9 @@ __launch_bounds__(WavesPerBlock * 32, 4) __global__
     }
 
     if (lane_id == 0) {
-      y[m0] = sum0;
+      y[m0] = sum0 + (residual != nullptr ? residual[m0] : 0.0F);
       if (m1 < M) {
-        y[m1] = sum1;
+        y[m1] = sum1 + (residual != nullptr ? residual[m1] : 0.0F);
       }
     }
     return;
@@ -139,9 +141,9 @@ __launch_bounds__(WavesPerBlock * 32, 4) __global__
     }
 
     if (lane_id == 0) {
-      y[m0] = sum0;
+      y[m0] = sum0 + (residual != nullptr ? residual[m0] : 0.0F);
       if (m1 < M) {
-        y[m1] = sum1;
+        y[m1] = sum1 + (residual != nullptr ? residual[m1] : 0.0F);
       }
     }
     return;
@@ -151,17 +153,19 @@ __launch_bounds__(WavesPerBlock * 32, 4) __global__
   const float s1 =
       (m1 < M) ? QuantWarpBlockDot(type, A, m1, x, K, lane_id, 0, 1) : 0.0F;
   if (lane_id == 0) {
-    y[m0] = s0;
+    y[m0] = s0 + (residual != nullptr ? residual[m0] : 0.0F);
     if (m1 < M) {
-      y[m1] = s1;
+      y[m1] = s1 + (residual != nullptr ? residual[m1] : 0.0F);
     }
   }
 }
 
-// opt-c1xx-q8k-gemv: launches the Q8_K / Q8_0 block GEMV.
+// opt-c1xx-q8k-gemv: launches the Q8_K / Q8_0 block GEMV. `residual` adds a
+// fused epilogue (3.3): y[m] = residual[m] + A[m]·x — nullptr keeps the
+// plain store. `y` may alias `residual` (each row reads before it writes).
 void LaunchQ8KBlockGEMV(const void* A, core::GgmlType type, const float* x,
                         float* y, std::size_t M, std::size_t K,
-                        hipStream_t stream) {
+                        hipStream_t stream, const float* residual) {
   constexpr std::uint32_t kWavesPerBlock = 4;
   constexpr std::uint32_t kBlockThreads = kWavesPerBlock * 32;
 
@@ -170,7 +174,7 @@ void LaunchQ8KBlockGEMV(const void* A, core::GgmlType type, const float* x,
     const std::size_t grid = (num_pairs + kWavesPerBlock - 1U) / kWavesPerBlock;
     const auto launch = [&]<core::GgmlType StaticType>() {
       Q8KBlockGEMVKernel_2Rows<kWavesPerBlock, StaticType>
-          <<<grid, kBlockThreads, 0, stream>>>(A, type, x, y, M, K);
+          <<<grid, kBlockThreads, 0, stream>>>(A, type, x, y, M, K, residual);
     };
     switch (type) {
       case core::GgmlType::kQ4_K:
@@ -191,7 +195,7 @@ void LaunchQ8KBlockGEMV(const void* A, core::GgmlType type, const float* x,
 
   const std::size_t grid = (M + kWavesPerBlock - 1U) / kWavesPerBlock;
   Q8KBlockGEMVKernel<kWavesPerBlock>
-      <<<grid, kBlockThreads, 0, stream>>>(A, type, x, y, M, K);
+      <<<grid, kBlockThreads, 0, stream>>>(A, type, x, y, M, K, residual);
 }
 
 }  // namespace gufo::hip

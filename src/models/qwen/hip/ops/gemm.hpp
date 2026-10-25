@@ -102,7 +102,20 @@ void LaunchGEMV(
 /// end); weights are not dequantized to fp16. Requires K % 256 == 0.
 void LaunchQ8KBlockGEMV(const void* A, core::GgmlType type, const float* x,
                         float* y, std::size_t M, std::size_t K,
-                        hipStream_t stream = nullptr);
+                        hipStream_t stream = nullptr,
+                        const float* residual = nullptr);
+
+/// GEMV with fused residual epilogue (3.3): out[m] = residual[m] + A[m]·x.
+/// `residual_and_out` may alias itself (each row is read before it is
+/// written), so the caller can accumulate a projection straight into the
+/// hidden vector and skip the separate residual-add launch. Every decode
+/// route supports the epilogue (quant block-GEMV and the dense fixture
+/// kernels alike); unknown routes abort.
+void LaunchGEMVResidual(const void* A, core::GgmlType a_type, const float* x,
+                        float* residual_and_out, std::size_t M, std::size_t K,
+                        hipStream_t stream = nullptr,
+                        models::qwen::QwenGemmMode mode =
+                            models::qwen::QwenGemmMode::kHipDecode);
 
 /// Dequantizes a block_q8_K weight region ({ float d; int8_t qs[256]; int16_t
 /// bsums[16]; }, QK=256) into a BF16 scratch buffer for the prefill hipblas

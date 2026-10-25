@@ -78,14 +78,18 @@ void LaunchFlintFusedMoESwiGLU(const void* gate_stack, const void* up_stack,
 /// `job_list` (or every expert when `job_list` is null) the down kernel
 /// writes weights_full[e] * (down_e · act[e]) for all hidden rows into the
 /// DISJOINT partials[job_slot * hidden + row] slot — no float atomics — and
-/// the reduce kernel then sums the slots in fixed job order into `mlp_out`.
-/// `partials` needs max_jobs * hidden floats. `slab_bytes` must be the
-/// encoded per-expert slab of the DOWN tensor's own type; the shared matrix
-/// decodes with `shared_type`.
+/// the reduce kernel then sums the slots in fixed job order. With
+/// `residual_hidden` (3.3 epilogue fusion) the reduce adds the sum straight
+/// into that vector and `mlp_out` is not written; with null it stores the
+/// sum into `mlp_out` (test/bench path). `partials` needs
+/// max_jobs * hidden floats. `slab_bytes` must be the encoded per-expert
+/// slab of the DOWN tensor's own type; the shared matrix decodes with
+/// `shared_type`.
 void LaunchFlintFusedMoEDown(const void* down_stack,
                              const void* down_shared, core::GgmlType type,
                              core::GgmlType shared_type, const float* act,
                              float* partials, float* mlp_out,
+                             float* residual_hidden,
                              const float* weights_full,
                              const int* job_list, std::size_t max_jobs,
                              std::size_t expert_count, std::size_t expert_ff,

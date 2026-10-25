@@ -594,7 +594,7 @@ __global__ void __launch_bounds__(kMoEWavesPerBlock * 32, 4)
 __global__ void FlintFusedMoEReduceKernel(
     const float* __restrict__ partials, const int* __restrict__ job_list,
     const float* __restrict__ weights_full, float* __restrict__ mlp_out,
-    std::size_t hidden, int jobs) {
+    float* __restrict__ residual_hidden, std::size_t hidden, int jobs) {
   const std::size_t row =
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (row >= hidden) {
@@ -610,6 +610,12 @@ __global__ void FlintFusedMoEReduceKernel(
       continue;  // the down kernel left this job's slot unwritten
     }
     acc += partials[static_cast<std::size_t>(j) * hidden + row];
+  }
+  if (residual_hidden != nullptr) {
+    // Epilogue fusion (3.3): the FFN residual-add folds into the reduce —
+    // hidden += MoE output — and mlp_out is not written at all.
+    residual_hidden[row] += acc;
+    return;
   }
   mlp_out[row] = acc;
 }
@@ -662,6 +668,7 @@ void LaunchFlintFusedMoEDown(const void* down_stack,
                              const void* down_shared, core::GgmlType type,
                              core::GgmlType shared_type, const float* act,
                              float* partials, float* mlp_out,
+                             float* residual_hidden,
                              const float* weights_full,
                              const int* job_list, std::size_t max_jobs,
                              std::size_t expert_count, std::size_t expert_ff,
@@ -677,7 +684,7 @@ void LaunchFlintFusedMoEDown(const void* down_stack,
       slab_bytes, job_list);
   FlintFusedMoEReduceKernel<<<static_cast<unsigned>((hidden + 255) / 256), 256,
                               0, stream>>>(
-      partials, job_list, weights_full, mlp_out, hidden,
+      partials, job_list, weights_full, mlp_out, residual_hidden, hidden,
       static_cast<int>(jobs));
 }
 
