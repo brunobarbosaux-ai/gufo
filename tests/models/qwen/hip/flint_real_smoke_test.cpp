@@ -17,6 +17,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 #include <hip/hip_runtime.h>
@@ -242,6 +243,158 @@ void RunOnlineDecodeCheck() {
     std::exit(1);
   }
   std::cout << "  onlinedecode: PASS\n";
+}
+
+// Flash prefill attention check (2.6): FlintWmmaCausalAttention vs a CPU
+// double-precision reference at the flint geometry, batch 16 and 512,
+// with and without window, sinks always on. Needs no artifact.
+void RunFlashCheck() {
+  using gufo::hip::detail::FlintKernelPolicy;
+  constexpr std::uint32_t kHeads = 32;
+  constexpr std::uint32_t kKvHeads = 4;
+  constexpr std::uint32_t kHeadDim = 128;
+  constexpr std::uint32_t kMaxContext = 4096;
+  constexpr std::size_t kKvWidth = kKvHeads * kHeadDim;
+  constexpr float kScale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
+
+  hipStream_t stream = nullptr;
+  HIP_CHECK(hipStreamCreate(&stream));
+
+  std::uint32_t lcg = 0x9e3779b9;
+  const auto next = [&lcg] {
+    lcg = lcg * 1664525u + 1013904223u;
+    return static_cast<float>(static_cast<double>(lcg >> 8) / 16777216.0 -
+                              0.5);
+  };
+
+  std::vector<float> h_sink(kHeads);
+  for (auto& s : h_sink) {
+    s = next() * 2.0F;
+  }
+  // Cache filled for the whole context so every visible key is populated.
+  const std::size_t cache_elems =
+      static_cast<std::size_t>(kKvHeads) * kMaxContext * kHeadDim;
+  std::vector<float> h_k(cache_elems);
+  std::vector<float> h_v(cache_elems);
+  for (auto& v : h_k) {
+    v = next();
+  }
+  for (auto& v : h_v) {
+    v = next();
+  }
+
+  float *d_q = nullptr, *d_k = nullptr, *d_v = nullptr, *d_sink = nullptr,
+        *d_out = nullptr;
+  HIP_CHECK(hipMalloc(&d_q, static_cast<std::size_t>(1024) * kHeads * kHeadDim *
+                                sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_sink, h_sink.size() * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_k, h_k.size() * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_v, h_v.size() * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_out, static_cast<std::size_t>(1024) * kHeads *
+                                  kHeadDim * sizeof(float)));
+  HIP_CHECK(hipMemcpy(d_sink, h_sink.data(), h_sink.size() * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_k, h_k.data(), h_k.size() * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_v, h_v.data(), h_v.size() * sizeof(float),
+                      hipMemcpyHostToDevice));
+
+  int failures = 0;
+  for (const auto [batch, start_pos, window] :
+       std::vector<std::tuple<std::size_t, std::uint32_t, std::uint32_t>>{
+           {16, 0, 0}, {16, 0, 513}, {512, 0, 513}, {512, 1024, 513}}) {
+    std::vector<float> h_q(static_cast<std::size_t>(batch) * kHeads * kHeadDim);
+    for (auto& v : h_q) {
+      v = next();
+    }
+    HIP_CHECK(hipMemcpy(d_q, h_q.data(), h_q.size() * sizeof(float),
+                        hipMemcpyHostToDevice));
+    const FlintKernelPolicy policy{d_sink, window};
+    HIP_CHECK(hipMemsetAsync(
+        d_out, 0,
+        static_cast<std::size_t>(batch) * kHeads * kHeadDim * sizeof(float),
+        stream));
+    if (!gufo::hip::LaunchFlintWmmaAttention(
+            d_q, d_k, d_v, d_out, /*layer_idx=*/0, start_pos, batch,
+            kMaxContext, stream, &policy)) {
+      std::cerr << "FAIL: launcher refused batch=" << batch << "\n";
+      ++failures;
+      continue;
+    }
+    HIP_CHECK(hipStreamSynchronize(stream));
+    std::vector<float> got(h_q.size());
+    HIP_CHECK(hipMemcpy(got.data(), d_out, got.size() * sizeof(float),
+                        hipMemcpyDeviceToHost));
+
+    // CPU double reference.
+    double max_abs = 0.0;
+    double dot = 0.0, nr = 0.0, ng = 0.0;
+    for (std::size_t t = 0; t < batch; ++t) {
+      const std::uint32_t absolute = start_pos + static_cast<std::uint32_t>(t);
+      const std::size_t p_begin =
+          window != 0 && absolute + 1 > window ? absolute + 1 - window : 0;
+      for (std::uint32_t h = 0; h < kHeads; ++h) {
+        const std::uint32_t kv_h = h / (kHeads / kKvHeads);
+        const float* q_h =
+            h_q.data() + (t * kHeads + h) * kHeadDim;
+        double m = h_sink[h];
+        std::vector<double> scores(absolute + 1 - p_begin);
+        for (std::size_t p = p_begin; p <= absolute; ++p) {
+          const float* k_p =
+              h_k.data() +
+              ((std::size_t{0} * kKvHeads + kv_h) * kMaxContext + p) *
+                  kHeadDim;
+          double dotk = 0.0;
+          for (std::size_t d = 0; d < kHeadDim; ++d) {
+            dotk += static_cast<double>(q_h[d]) * static_cast<double>(k_p[d]);
+          }
+          scores[p - p_begin] = dotk * kScale;
+          m = std::max(m, scores[p - p_begin]);
+        }
+        double l = std::exp(static_cast<double>(h_sink[h]) - m);
+        for (auto& s : scores) {
+          s = std::exp(s - m);
+          l += s;
+        }
+        for (std::size_t d = 0; d < kHeadDim; ++d) {
+          double acc = 0.0;
+          for (std::size_t p = p_begin; p <= absolute; ++p) {
+            const float* v_p =
+                h_v.data() +
+                ((std::size_t{0} * kKvHeads + kv_h) * kMaxContext + p) *
+                    kHeadDim;
+            acc += scores[p - p_begin] * static_cast<double>(v_p[d]);
+          }
+          const double ref = acc / l;
+          const double g =
+              got[(t * kHeads + h) * kHeadDim + d];
+          max_abs = std::max(max_abs, std::abs(ref - g));
+          dot += ref * g;
+          nr += ref * ref;
+          ng += g * g;
+        }
+      }
+    }
+    const double cos = dot / (std::sqrt(nr) * std::sqrt(ng) + 1e-30);
+    std::cout << "  flashcheck batch=" << batch << " start=" << start_pos
+              << " window=" << window << ": cos=" << cos
+              << " max_abs=" << max_abs << "\n";
+    if (!(cos > 0.99999) || max_abs > 2e-4) {
+      std::cerr << "FAIL: flash parity\n";
+      ++failures;
+    }
+  }
+
+  HIP_CHECK(hipFree(d_q));
+  HIP_CHECK(hipFree(d_sink));
+  HIP_CHECK(hipFree(d_k));
+  HIP_CHECK(hipFree(d_v));
+  HIP_CHECK(hipFree(d_out));
+  HIP_CHECK(hipStreamDestroy(stream));
+  if (failures != 0) {
+    std::exit(1);
+  }
+  std::cout << "  flashcheck: PASS\n";
 }
 
 }  // namespace
@@ -1124,6 +1277,10 @@ int main(int argc, char** argv) {
   }
   if (argc > 1 && std::string_view(argv[1]) == "onlinedecode") {
     RunOnlineDecodeCheck();
+    return 0;
+  }
+  if (argc > 1 && std::string_view(argv[1]) == "flashcheck") {
+    RunFlashCheck();
     return 0;
   }
   const char* env = std::getenv("GUFO_FLINT_GGUF");

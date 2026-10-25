@@ -290,8 +290,18 @@ void ExecuteFlintPrefillChunk(const models::FlintModelWeights& weights,
         layer.attrs.windowed ? config.sliding_window : 0U};
     static const bool attn_scalar = std::getenv("GUFO_FLINT_ATTN_SCALAR") !=
                                     nullptr;
+    // Layer-range A/B for divergence bisecting: flash only for layers in
+    // [GUFO_FLINT_FLASH_FROM, GUFO_FLINT_FLASH_TO) (defaults: all).
+    static const int flash_from = [] {
+      const char* v = std::getenv("GUFO_FLINT_FLASH_FROM");
+      return v != nullptr ? std::atoi(v) : 0;
+    }();
+    static const int flash_to = [] {
+      const char* v = std::getenv("GUFO_FLINT_FLASH_TO");
+      return v != nullptr ? std::atoi(v) : 1000;
+    }();
     bool wmma_attention = false;
-    if (!attn_scalar) {
+    if (!attn_scalar && layer_idx >= flash_from && layer_idx < flash_to) {
       // 2.6 flash route: the WMMA kernel reads the cache, so stage this
       // chunk's K/V first (the batched kernel would otherwise do it).
       LaunchBatchedKvWrite(prefill.k, prefill.v, buffers.k_cache,

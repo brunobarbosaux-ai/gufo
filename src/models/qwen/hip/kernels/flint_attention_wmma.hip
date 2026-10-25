@@ -102,11 +102,20 @@ static_assert(kFKRegs * 256 == kFKeys * (kFHeadDim / 8), "K stages evenly");
 static_assert(kFVRegs * 256 * 8 == kFKeys * kFHeadDim, "V stages evenly");
 
 constexpr std::uint32_t kFKvLdsHalves =
-    kFKeys * kFKStride > kFHeadDim * kFVtStride ? kFKeys * kFKStride
-                                                : kFHeadDim * kFVtStride;
+    2 * (kFKeys * kFKStride) + kFHeadDim * kFVtStride;
+// Layout: [0, 16*136) K hi, [16*136, 2*16*136) K lo, then V^T. The K lo
+// plane carries the f16 residual (x - f16(x)): QK runs two WMMA
+// accumulations so the score error stays at the Q-only quantization
+// level (see FPack8Lo).
+constexpr std::uint32_t kFKHiHalves = kFKeys * kFKStride;
 
 // 8 halves packed from 8 fp32 source values (2 x float4). K and V arrive
 // from flint's fp32 KV plane; the fragment/LDS staging stays f16.
+// FPack8HiLo additionally produces the f16 residual (x - f16(x)): the
+// two-term K decomposition keeps the WMMA score error at the Q-only
+// quantization level instead of Q+K. The attention output error feeds 49
+// layers of router near-ties — the G4 cjk fork (rank #3 at 5.5 nats) was
+// traced to the single-f16 K quantization.
 __device__ __forceinline__ uint4 FPack8(const float* p) {
   union {
     uint4 u;
@@ -122,6 +131,22 @@ __device__ __forceinline__ uint4 FPack8(const float* p) {
   cvt.h[5] = __float2half_rn(f1.y);
   cvt.h[6] = __float2half_rn(f1.z);
   cvt.h[7] = __float2half_rn(f1.w);
+  return cvt.u;
+}
+
+__device__ __forceinline__ uint4 FPack8Lo(const float* p) {
+  union {
+    uint4 u;
+    __half h[8];
+  } cvt;
+  const float4 f0 = *reinterpret_cast<const float4*>(p);
+  const float4 f1 = *reinterpret_cast<const float4*>(p + 4);
+  const float vals[8] = {f0.x, f0.y, f0.z, f0.w, f1.x, f1.y, f1.z, f1.w};
+#pragma unroll
+  for (std::uint32_t i = 0; i < 8; ++i) {
+    const __half hi = __float2half_rn(vals[i]);
+    cvt.h[i] = __float2half_rn(vals[i] - __half2float(hi));
+  }
   return cvt.u;
 }
 
@@ -245,31 +270,39 @@ __global__ void __launch_bounds__(256, 2) FlintWmmaCausalAttention(
       dst[j] = live ? FPack8(src + (j * 8)) : make_uint4(0u, 0u, 0u, 0u);
     }
   };
-  const auto load_k = [&](std::uint32_t key_start, uint4* dst) {
+  const auto load_k = [&](std::uint32_t key_start, uint4* dst,
+                          uint4* dst_lo) {
 #pragma unroll
     for (std::uint32_t n = 0; n < kFKRegs; ++n) {
       const std::uint32_t idx = tid + (n * 256);
       const std::uint32_t key_position = key_start + (idx / (kFHeadDim / 8));
       const std::uint32_t d8 = (idx % (kFHeadDim / 8)) * 8;
-      dst[n] =
-          (key_position < context_end)
-              ? FPack8(k_base +
-                       (static_cast<std::size_t>(key_position) * kv_stride) +
-                       d8)
-              : make_uint4(0u, 0u, 0u, 0u);
+      const bool live = key_position < context_end;
+      dst[n] = live ? FPack8(k_base +
+                             (static_cast<std::size_t>(key_position) *
+                              kv_stride) +
+                             d8)
+                    : make_uint4(0u, 0u, 0u, 0u);
+      dst_lo[n] = live ? FPack8Lo(k_base +
+                                  (static_cast<std::size_t>(key_position) *
+                                   kv_stride) +
+                                  d8)
+                       : make_uint4(0u, 0u, 0u, 0u);
     }
   };
 
   uint4 k_cur[kFKRegs];
   uint4 v_cur[kVRegs];
+  uint4 k_lo_cur[kFKRegs];
   uint4 k_pre[kFKRegs] = {};
+  uint4 k_lo_pre[kFKRegs] = {};
   uint4 v_pre[kVRegs] = {};
-  load_k(sweep_begin, k_cur);
+  load_k(sweep_begin, k_cur, k_lo_cur);
   load_v(sweep_begin, v_cur);
 
   for (std::uint32_t key_start = sweep_begin; key_start < max_visible;
        key_start += kFKeys) {
-    // --- stage K from the registers the previous iteration prefetched
+    // --- stage K hi/lo from the registers the previous iteration prefetched
     __syncthreads();
 #pragma unroll
     for (std::uint32_t n = 0; n < kFKRegs; ++n) {
@@ -278,25 +311,31 @@ __global__ void __launch_bounds__(256, 2) FlintWmmaCausalAttention(
       const std::uint32_t d8 = (idx % (kFHeadDim / 8)) * 8;
       *reinterpret_cast<uint4*>(&kv_lds[(key_row * kFKStride) + d8]) =
           k_cur[n];
+      *reinterpret_cast<uint4*>(
+          &kv_lds[kFKHiHalves + (key_row * kFKStride) + d8]) = k_lo_cur[n];
     }
     __syncthreads();
 
     // --- prefetch the next key tile
     const std::uint32_t next_start = key_start + kFKeys;
     if (next_start < max_visible) {
-      load_k(next_start, k_pre);
+      load_k(next_start, k_pre, k_lo_pre);
       load_v(next_start, v_pre);
     }
 
-    // --- S = Q K^T
+    // --- S = Q (K_hi + K_lo)^T — two accumulations keep the score error
+    // at the Q-only f16 quantization level
     {
       v8f s_acc = {};
 #pragma unroll
       for (std::uint32_t ks = 0; ks < kFKStepsPerWave; ++ks) {
         const std::uint32_t d0 = ((s_kh * kFKStepsPerWave) + ks) * 16;
-        const v16h k_frag =
-            FLoadFrag(&kv_lds[(((s_kb * 16) + sub) * kFKStride) + d0]);
-        s_acc = FWmma(q_frag[ks], k_frag, s_acc);
+        const v16h k_hi = FLoadFrag(
+            &kv_lds[(((s_kb * 16) + sub) * kFKStride) + d0]);
+        s_acc = FWmma(q_frag[ks], k_hi, s_acc);
+        const v16h k_lo = FLoadFrag(
+            &kv_lds[kFKHiHalves + (((s_kb * 16) + sub) * kFKStride) + d0]);
+        s_acc = FWmma(q_frag[ks], k_lo, s_acc);
       }
 #pragma unroll
       for (std::uint32_t i = 0; i < 8; ++i) {
@@ -449,6 +488,7 @@ __global__ void __launch_bounds__(256, 2) FlintWmmaCausalAttention(
 #pragma unroll
     for (std::uint32_t n = 0; n < kFKRegs; ++n) {
       k_cur[n] = k_pre[n];
+      k_lo_cur[n] = k_lo_pre[n];
     }
 #pragma unroll
     for (std::uint32_t n = 0; n < kVRegs; ++n) {
