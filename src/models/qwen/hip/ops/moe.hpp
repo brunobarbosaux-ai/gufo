@@ -63,14 +63,15 @@ void LaunchFlintRouterTopKFull(const float* logits, std::size_t expert_count,
 /// checkpoints quantise them independently, e.g. Q6_K routed / Q8_0 shared).
 void LaunchFlintFusedMoESwiGLU(const void* gate_stack, const void* up_stack,
                                const void* gate_shared, const void* up_shared,
-                               core::GgmlType type,
+                               core::GgmlType gate_type, core::GgmlType up_type,
                                core::GgmlType shared_gate_type,
                                core::GgmlType shared_up_type, const float* x,
                                float* act, const float* weights_full,
                                const int* job_list, std::size_t max_jobs,
                                std::size_t expert_count, std::size_t expert_ff,
                                std::size_t shared_ff, std::size_t hidden,
-                               std::size_t slab_bytes,
+                               std::size_t gate_slab_bytes,
+                               std::size_t up_slab_bytes,
                                hipStream_t stream = nullptr);
 
 /// Fused MoE branch, phase 2 (F-J1): for every job in `job_list` (or every

@@ -189,11 +189,13 @@ __global__ void __launch_bounds__(kMoEWavesPerBlock * 32, 4)
     FlintFusedMoESwiGLUKernel(
         const void* __restrict__ gate_stack, const void* __restrict__ up_stack,
         const void* __restrict__ gate_shared, const void* __restrict__ up_shared,
-        core::GgmlType type, core::GgmlType shared_gate_type,
+        core::GgmlType gate_type, core::GgmlType up_type,
+        core::GgmlType shared_gate_type,
         core::GgmlType shared_up_type, const float* __restrict__ x,
         float* __restrict__ act, const float* __restrict__ weights_full,
         int expert_count, std::size_t expert_ff, std::size_t shared_ff,
-        std::size_t hidden, std::size_t slab_bytes,
+        std::size_t hidden, std::size_t gate_slab_bytes,
+        std::size_t up_slab_bytes,
         const int* __restrict__ job_list) {
   const int e = job_list != nullptr
                     ? job_list[blockIdx.x]
@@ -210,16 +212,18 @@ __global__ void __launch_bounds__(kMoEWavesPerBlock * 32, 4)
   const void* gate = is_shared
                          ? gate_shared
                          : static_cast<const char*>(gate_stack) +
-                               static_cast<std::size_t>(e) * slab_bytes;
+                               static_cast<std::size_t>(e) * gate_slab_bytes;
   const void* up = is_shared
                        ? up_shared
                        : static_cast<const char*>(up_stack) +
-                             static_cast<std::size_t>(e) * slab_bytes;
+                             static_cast<std::size_t>(e) * up_slab_bytes;
   // UD checkpoints quantise the shared expert independently of the routed
   // stacks (Flint UD-Q6_K_XL: gate/up Q6_K routed, everything shared Q8_0),
-  // so each matrix decodes with its own type.
-  const core::GgmlType gt = is_shared ? shared_gate_type : type;
-  const core::GgmlType ut = is_shared ? shared_up_type : type;
+  // so each matrix decodes with its own type. The routed stacks may ALSO
+  // differ from each other (bartowski IQ4_XS blk.2: gate IQ4_XS + up Q5_K),
+  // each with its own slab stride.
+  const core::GgmlType gt = is_shared ? shared_gate_type : gate_type;
+  const core::GgmlType ut = is_shared ? shared_up_type : up_type;
   float* act_e =
       act + (is_shared ? static_cast<std::size_t>(expert_count) * expert_ff
                        : static_cast<std::size_t>(e) * expert_ff);
@@ -426,23 +430,25 @@ void LaunchFlintRouterTopKFull(const float* logits, std::size_t expert_count,
 
 void LaunchFlintFusedMoESwiGLU(const void* gate_stack, const void* up_stack,
                                const void* gate_shared, const void* up_shared,
-                               core::GgmlType type,
+                               core::GgmlType gate_type, core::GgmlType up_type,
                                core::GgmlType shared_gate_type,
                                core::GgmlType shared_up_type, const float* x,
                                float* act, const float* weights_full,
                                const int* job_list, std::size_t max_jobs,
                                std::size_t expert_count, std::size_t expert_ff,
                                std::size_t shared_ff, std::size_t hidden,
-                               std::size_t slab_bytes, hipStream_t stream) {
+                               std::size_t gate_slab_bytes,
+                               std::size_t up_slab_bytes, hipStream_t stream) {
   const std::size_t rows = std::max(expert_ff, shared_ff);
   const std::size_t jobs =
       job_list != nullptr ? max_jobs : expert_count + 1;
   const dim3 grid(jobs,
                   (rows + kMoERowsPerBlock - 1) / kMoERowsPerBlock);
   FlintFusedMoESwiGLUKernel<<<grid, kMoEWavesPerBlock * 32, 0, stream>>>(
-      gate_stack, up_stack, gate_shared, up_shared, type, shared_gate_type,
-      shared_up_type, x, act, weights_full, static_cast<int>(expert_count),
-      expert_ff, shared_ff, hidden, slab_bytes, job_list);
+      gate_stack, up_stack, gate_shared, up_shared, gate_type, up_type,
+      shared_gate_type, shared_up_type, x, act, weights_full,
+      static_cast<int>(expert_count), expert_ff, shared_ff, hidden,
+      gate_slab_bytes, up_slab_bytes, job_list);
 }
 
 void LaunchFlintFusedMoEDown(const void* down_stack,

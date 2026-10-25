@@ -489,8 +489,8 @@ void SynthQ8SwiGLUCheck() {
   }
   gufo::hip::LaunchFlintFusedMoESwiGLU(
       d_gate, d_up, d_gate, d_up, GgmlType::kQ8_0, GgmlType::kQ8_0,
-      GgmlType::kQ8_0, d_x, d_act_moe, d_weights_full, nullptr, 0, 256, kM,
-      kM, kK, kSlabBytes, stream);
+      GgmlType::kQ8_0, GgmlType::kQ8_0, d_x, d_act_moe, d_weights_full,
+      nullptr, 0, 256, kM, kM, kK, kSlabBytes, kSlabBytes, stream);
   HIP_CHECK(hipStreamSynchronize(stream));
 
   std::vector<float> act_leg(kM), act_fus(kM);
@@ -724,13 +724,16 @@ void ProbeMoEBranch(const gufo::models::FlintModelWeights& gpu_weights,
                                          job_list, stream);
     const std::size_t down_slab_bytes = gufo::quant::EncodedSizeBytes(
         layer.ffn_down_exps.type, expert_slab);
+    const std::size_t up_slab_bytes = gufo::quant::EncodedSizeBytes(
+        layer.ffn_up_exps.type, expert_slab);
     gufo::hip::LaunchFlintFusedMoESwiGLU(
         layer.ffn_gate_exps.data, layer.ffn_up_exps.data,
         layer.ffn_gate_shexp.data, layer.ffn_up_shexp.data,
-        layer.ffn_gate_exps.type, layer.ffn_gate_shexp.type,
-        layer.ffn_up_shexp.type, x, act_moe, weights_full, job_list,
-        config.expert_used_count + 1, config.expert_count, expert_ff,
-        shared_ff, hidden, slab_bytes, stream);
+        layer.ffn_gate_exps.type, layer.ffn_up_exps.type,
+        layer.ffn_gate_shexp.type, layer.ffn_up_shexp.type, x, act_moe,
+        weights_full, job_list, config.expert_used_count + 1,
+        config.expert_count, expert_ff, shared_ff, hidden, slab_bytes,
+        up_slab_bytes, stream);
     gufo::hip::LaunchFlintFusedMoEDown(layer.ffn_down_exps.data,
                                        layer.ffn_down_shexp.data,
                                        layer.ffn_down_exps.type,
@@ -785,13 +788,16 @@ void ProbeMoEBranch(const gufo::models::FlintModelWeights& gpu_weights,
       HIP_CHECK(hipStreamSynchronize(stream));
     });
     const double f_swiglu_us = timed([&] {
+      const std::size_t up_slab_bytes = gufo::quant::EncodedSizeBytes(
+          layer.ffn_up_exps.type, expert_slab);
       gufo::hip::LaunchFlintFusedMoESwiGLU(
           layer.ffn_gate_exps.data, layer.ffn_up_exps.data,
           layer.ffn_gate_shexp.data, layer.ffn_up_shexp.data,
-          layer.ffn_gate_exps.type, layer.ffn_gate_shexp.type,
-          layer.ffn_up_shexp.type, x, act_moe, weights_full, job_list,
-          config.expert_used_count + 1, config.expert_count, expert_ff,
-          shared_ff, hidden, slab_bytes, stream);
+          layer.ffn_gate_exps.type, layer.ffn_up_exps.type,
+          layer.ffn_gate_shexp.type, layer.ffn_up_shexp.type, x, act_moe,
+          weights_full, job_list, config.expert_used_count + 1,
+          config.expert_count, expert_ff, shared_ff, hidden, slab_bytes,
+          up_slab_bytes, stream);
       HIP_CHECK(hipStreamSynchronize(stream));
     });
     const double f_down_us = timed([&] {

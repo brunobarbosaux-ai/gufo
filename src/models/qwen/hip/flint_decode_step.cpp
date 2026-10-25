@@ -185,8 +185,8 @@ void RunFlintLayer(const models::FlintModelWeights& weights,
     // UD-Q6_K_XL is mixed like this on every MoE layer (gate/up Q6_K,
     // down Q8_0, shared Q8_0).
     const bool fused =
-        layer.ffn_gate_exps.type == layer.ffn_up_exps.type &&
         FusedMoESupported(layer.ffn_gate_exps.type) &&
+        FusedMoESupported(layer.ffn_up_exps.type) &&
         FusedMoESupported(layer.ffn_down_exps.type) &&
         FusedMoESupported(layer.ffn_gate_shexp.type) &&
         FusedMoESupported(layer.ffn_up_shexp.type) &&
@@ -195,8 +195,10 @@ void RunFlintLayer(const models::FlintModelWeights& weights,
         b.expert_weights_full != nullptr && b.act_moe != nullptr &&
         b.expert_job_list != nullptr;
     if (fused) {
-      const std::size_t swiglu_slab_bytes =
+      const std::size_t gate_slab_bytes =
           quant::EncodedSizeBytes(layer.ffn_gate_exps.type, expert_slab);
+      const std::size_t up_slab_bytes =
+          quant::EncodedSizeBytes(layer.ffn_up_exps.type, expert_slab);
       const std::size_t down_slab_bytes =
           quant::EncodedSizeBytes(layer.ffn_down_exps.type, expert_slab);
       LaunchFlintRouterTopKFull(b.router_logits, config.expert_count, used,
@@ -209,12 +211,13 @@ void RunFlintLayer(const models::FlintModelWeights& weights,
                                 layer.ffn_gate_shexp.data,
                                 layer.ffn_up_shexp.data,
                                 layer.ffn_gate_exps.type,
+                                layer.ffn_up_exps.type,
                                 layer.ffn_gate_shexp.type,
                                 layer.ffn_up_shexp.type, b.normed, b.act_moe,
                                 b.expert_weights_full, b.expert_job_list,
                                 used + 1, config.expert_count,
                                 expert_ff, shared_ff, hidden_size,
-                                swiglu_slab_bytes, b.stream);
+                                gate_slab_bytes, up_slab_bytes, b.stream);
       LaunchFlintFusedMoEDown(layer.ffn_down_exps.data,
                               layer.ffn_down_shexp.data,
                               layer.ffn_down_exps.type,
