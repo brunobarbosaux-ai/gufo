@@ -209,12 +209,18 @@ __global__ void __launch_bounds__(256, 2) FlintWmmaCausalAttention(
   const std::uint32_t max_visible =
       min(context_end, start_pos + query_start + kFQueryRows);
   // Window: the block's earliest row edge is the first query row's
-  // p_begin; deeper rows mask through the softmax predicate.
+  // p_begin; deeper rows mask through the softmax predicate. The sweep
+  // start is FLOORED to the 16-key tile grid: off-grid starts would shift
+  // every tile's key grouping and change f32 summation order (the G6
+  // multi-split test caught exactly that). Leading keys below the first
+  // row's edge are fully masked — exact no-ops — so flooring never moves
+  // a result.
   const std::uint32_t sweep_begin =
       policy.window != 0
-          ? (start_pos + query_start + 1 > policy.window
-                 ? start_pos + query_start + 1 - policy.window
-                 : 0)
+          ? ((start_pos + query_start + 1 > policy.window
+                  ? start_pos + query_start + 1 - policy.window
+                  : 0) &
+             ~(kFKeys - 1u))
           : 0;
 
   constexpr std::uint32_t kVRegs = kFVRegs;

@@ -916,6 +916,87 @@ void RunChunkParity(const gufo::hip::FlintGpuModel& model,
                       split_logits.size() * sizeof(float),
                       hipMemcpyDeviceToHost));
 
+  // G6, multiple split points (1.5): every split of the same chunk must
+  // reproduce the unsplit logits bit-exactly — the flash kernel's fixed
+  // 16-key tile order makes the accumulation position-determined only.
+  // Split points cover the tile boundaries, a 1-token tail, and uneven
+  // three-way splits.
+  if (std::getenv("GUFO_FLINT_SPLITS") != nullptr) {
+    int split_failures = 0;
+    for (const std::size_t k : {std::size_t{2}, std::size_t{128},
+                                std::size_t{255}, std::size_t{256},
+                                std::size_t{257}, std::size_t{383},
+                                std::size_t{384}, std::size_t{511},
+                                std::size_t{512}}) {
+      if (k >= n || n - k < 1) {
+        continue;
+      }
+      gufo::hip::ExecuteFlintPrefillChunk(
+          model.GetWeights(), std::span<const std::uint32_t>(tokens.data(), k),
+          0, /*compute_logits=*/false, buffers, prefill);
+      gufo::hip::ExecuteFlintPrefillChunk(
+          model.GetWeights(),
+          std::span<const std::uint32_t>(tokens.data() + k, n - k),
+          static_cast<std::uint32_t>(k), /*compute_logits=*/true, buffers,
+          prefill);
+      HIP_CHECK(hipStreamSynchronize(buffers.stream));
+      HIP_CHECK(hipMemcpy(split_logits.data(), buffers.logits,
+                          split_logits.size() * sizeof(float),
+                          hipMemcpyDeviceToHost));
+      const bool exact =
+          std::equal(split_logits.begin(), split_logits.end(),
+                     chunk_logits.begin());
+      if (!exact) {
+        double max_abs = 0.0;
+        for (std::size_t i = 0; i < split_logits.size(); ++i) {
+          max_abs = std::max(
+              max_abs,
+              std::abs(static_cast<double>(split_logits[i]) - chunk_logits[i]));
+        }
+        std::cout << "  split@" << k << ": NOT bit-exact (max_abs " << max_abs
+                  << ")\n";
+        ++split_failures;
+      } else {
+        std::cout << "  split@" << k << ": bit-exact\n";
+      }
+    }
+    // Three-way split: 341 + 341 + remainder.
+    if (n >= 3) {
+      const std::size_t k1 = n / 3;
+      const std::size_t k2 = 2 * (n / 3);
+      gufo::hip::ExecuteFlintPrefillChunk(
+          model.GetWeights(),
+          std::span<const std::uint32_t>(tokens.data(), k1), 0,
+          /*compute_logits=*/false, buffers, prefill);
+      gufo::hip::ExecuteFlintPrefillChunk(
+          model.GetWeights(),
+          std::span<const std::uint32_t>(tokens.data() + k1, k2 - k1),
+          static_cast<std::uint32_t>(k1), /*compute_logits=*/false, buffers,
+          prefill);
+      gufo::hip::ExecuteFlintPrefillChunk(
+          model.GetWeights(),
+          std::span<const std::uint32_t>(tokens.data() + k2, n - k2),
+          static_cast<std::uint32_t>(k2), /*compute_logits=*/true, buffers,
+          prefill);
+      HIP_CHECK(hipStreamSynchronize(buffers.stream));
+      HIP_CHECK(hipMemcpy(split_logits.data(), buffers.logits,
+                          split_logits.size() * sizeof(float),
+                          hipMemcpyDeviceToHost));
+      const bool exact = std::equal(split_logits.begin(), split_logits.end(),
+                                    chunk_logits.begin());
+      std::cout << "  split@3way(" << k1 << "," << k2 << "): "
+                << (exact ? "bit-exact" : "NOT bit-exact") << "\n";
+      if (!exact) {
+        ++split_failures;
+      }
+    }
+    if (split_failures != 0) {
+      std::cout << "  G6 multi-split: FAIL (" << split_failures << ")\n";
+    } else {
+      std::cout << "  G6 multi-split: PASS\n";
+    }
+  }
+
   const auto vs_token = CompareLogits(token_logits, chunk_logits);
   const auto vs_split = CompareLogits(chunk_logits, split_logits);
   // Where does the chunk-vs-token disagreement live? Quantised-activation
