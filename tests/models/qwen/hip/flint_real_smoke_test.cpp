@@ -1053,7 +1053,9 @@ void RunChunkParity(const gufo::hip::FlintGpuModel& model,
   for (std::size_t i = 0; i < n; ++i) {
     gufo::hip::ExecuteFlintDecodeStep(model.GetWeights(), tokens[i],
                                       static_cast<std::uint32_t>(i),
-                                      /*compute_logits=*/i + 1 == n, buffers);
+                                      /*compute_logits=*/i + 1 == n, buffers,
+                                      /*timings=*/nullptr,
+                                      arena.GetGraphState());
   }
   HIP_CHECK(hipStreamSynchronize(buffers.stream));
   HIP_CHECK(hipMemcpy(token_logits.data(), buffers.logits,
@@ -1414,7 +1416,8 @@ int main(int argc, char** argv) {
       gufo::hip::FlintDecodeTimings dt;
       gufo::hip::ExecuteFlintDecodeStep(gpu_model->GetWeights(), token, step,
                                         /*compute_logits=*/true, buffers,
-                                        profile_decode ? &dt : nullptr);
+                                        profile_decode ? &dt : nullptr,
+                                        gpu_arena.GetGraphState());
       HIP_CHECK(hipStreamSynchronize(buffers.stream));
       const auto t1 = std::chrono::steady_clock::now();
       total_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();

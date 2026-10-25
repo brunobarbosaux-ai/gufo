@@ -77,6 +77,12 @@ class FlintGpuArena {
   [[nodiscard]] FlintGpuStepBuffers GetBuffers() const noexcept {
     return buffers_;
   }
+  /// Capture-once decode graph state (3.1); owned by the arena, released in
+  /// FreeAll. Callers pass it to ExecuteFlintDecodeStep to opt into graph
+  /// replay.
+  [[nodiscard]] FlintDecodeGraphState* GetGraphState() noexcept {
+    return &graph_state_;
+  }
   [[nodiscard]] FlintPrefillBuffers GetPrefillBuffers() const noexcept {
     return prefill_;
   }
@@ -97,6 +103,7 @@ class FlintGpuArena {
   std::size_t scratch_bytes_{0};
   FlintGpuStepBuffers buffers_{};
   FlintPrefillBuffers prefill_{};
+  FlintDecodeGraphState graph_state_{};
 };
 
 }  // namespace gufo::hip

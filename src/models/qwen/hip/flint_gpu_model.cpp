@@ -282,6 +282,9 @@ FlintGpuArena::FlintGpuArena(FlintGpuArena&& other) noexcept
   other.scratch_bytes_ = 0;
   other.buffers_ = {};
   other.prefill_ = {};
+  // Graph execs are captured on (and reference) this arena's stream and
+  // buffers; they never survive a move — the destination re-captures.
+  other.graph_state_.Release();
 }
 
 FlintGpuArena& FlintGpuArena::operator=(FlintGpuArena&& other) noexcept {
@@ -295,11 +298,13 @@ FlintGpuArena& FlintGpuArena::operator=(FlintGpuArena&& other) noexcept {
     other.scratch_bytes_ = 0;
     other.buffers_ = {};
     other.prefill_ = {};
+    other.graph_state_.Release();
   }
   return *this;
 }
 
 void FlintGpuArena::FreeAll() noexcept {
+  graph_state_.Release();
   if (buffers_.hidden != nullptr) {
     (void)hipFree(buffers_.hidden);
   }

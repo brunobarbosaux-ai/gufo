@@ -8,6 +8,8 @@
 #include "src/models/qwen/hip/detail/flint_decode_step.hpp"
 
 #include <cstdint>
+#include <cstdlib>
+#include <string_view>
 #include <vector>
 
 #include "src/core/hip/hip_utils.hpp"
@@ -82,7 +84,8 @@ void RunFlintLayer(const models::FlintModelWeights& weights,
                    const FlintGpuStepBuffers& b,
                    FlintDecodeTimings* timings,
                    std::vector<hipEvent_t>* marks,
-                   char* is_moe_layer) {
+                   char* is_moe_layer,
+                   const std::uint32_t* d_control = nullptr) {
   const auto& config = weights.config;
   const std::size_t hidden_size = config.hidden_size;
   const std::size_t attention_size =
@@ -122,24 +125,46 @@ void RunFlintLayer(const models::FlintModelWeights& weights,
                        kFlintRmsEps, b.stream);
 
   // 4. RoPE on rope layers; NoPE layers keep position-invariant Q/K (F-D3).
+  // Graph mode reads the position from d_control ([1]) so the captured
+  // nodes are position-independent.
   if (layer.attrs.rope) {
-    LaunchRoPE(b.q, b.k, config.num_attention_heads, config.num_key_value_heads,
-               config.head_dim, config.rotary_dim, pos, config.rope_theta,
-               b.stream);
+    if (d_control != nullptr) {
+      LaunchRoPE(b.q, b.k, config.num_attention_heads,
+                 config.num_key_value_heads, config.head_dim,
+                 config.rotary_dim, d_control + 1, config.rope_theta,
+                 b.stream);
+    } else {
+      LaunchRoPE(b.q, b.k, config.num_attention_heads,
+                 config.num_key_value_heads, config.head_dim,
+                 config.rotary_dim, pos, config.rope_theta, b.stream);
+    }
   }
 
   mark(2);
   // 5. Attention with sinks + optional sliding window (F-D1/F-D2). The
-  // policy gates dispatch to the sink-capable baseline kernels.
+  // policy gates dispatch to the sink-capable baseline kernels. Graph mode
+  // routes to the fixed-grid/fixed-LDS online-tile kernel reading d_pos —
+  // the baseline's seq-sized LDS score row is not capturable and caps the
+  // context at 16128.
   const detail::FlintKernelPolicy policy{
       static_cast<const float*>(layer.attn_sinks.data),
       layer.attrs.windowed ? config.sliding_window : 0U};
-  LaunchAttention(b.q, b.k, b.v, /*gate=*/nullptr, b.k_cache, b.v_cache,
-                  /*k_cache_f16=*/nullptr, /*v_cache_f16=*/nullptr, b.attn_out,
-                  layer_idx, pos, b.max_context, config.num_attention_heads,
-                  config.num_key_value_heads, config.head_dim, b.stream,
-                  /*split_k_scratch=*/nullptr, /*skip_kv_write=*/false,
-                  &policy);
+  if (d_control != nullptr) {
+    LaunchAttention(b.q, b.k, b.v, /*gate=*/nullptr, b.k_cache, b.v_cache,
+                    /*k_cache_f16=*/nullptr, /*v_cache_f16=*/nullptr,
+                    b.attn_out, layer_idx, d_control + 1, b.max_context,
+                    config.num_attention_heads, config.num_key_value_heads,
+                    config.head_dim, b.stream,
+                    /*skip_kv_write=*/false, &policy);
+  } else {
+    LaunchAttention(b.q, b.k, b.v, /*gate=*/nullptr, b.k_cache, b.v_cache,
+                    /*k_cache_f16=*/nullptr, /*v_cache_f16=*/nullptr,
+                    b.attn_out, layer_idx, pos, b.max_context,
+                    config.num_attention_heads, config.num_key_value_heads,
+                    config.head_dim, b.stream,
+                    /*split_k_scratch=*/nullptr, /*skip_kv_write=*/false,
+                    &policy);
+  }
 
   // 6. O-projection + residual.
   mark(3);
@@ -308,15 +333,125 @@ void ResolveDecodeTimings(FlintDecodeTimings& timings,
   timings.total_ms = elapsed(embed_start, step_end);
 }
 
+/// Graph-mode eligibility (3.1): fp32 KV cache plane (the online-tile Ptr
+/// kernel's format), the argmax output, and every MoE layer on the fused
+/// sync-free dispatch (a readback sync cannot be captured). GUFO_FLINT_
+/// DECODE_GRAPH=0 forces the legacy path (A/B profiling).
+[[nodiscard]] bool DecodeGraphSupported(const models::FlintModelWeights& weights,
+                                        const FlintGpuStepBuffers& b) {
+  const char* env = std::getenv("GUFO_FLINT_DECODE_GRAPH");
+  if (env != nullptr && std::string_view(env) == "0") {
+    return false;
+  }
+  if (b.k_cache == nullptr || b.v_cache == nullptr ||
+      b.d_out_token == nullptr || b.expert_weights_full == nullptr ||
+      b.act_moe == nullptr || b.expert_job_list == nullptr) {
+    return false;
+  }
+  for (const auto& layer : weights.layers) {
+    if (layer.attrs.dense_ffn) {
+      continue;
+    }
+    if (!(FusedMoESupported(layer.ffn_gate_exps.type) &&
+          FusedMoESupported(layer.ffn_up_exps.type) &&
+          FusedMoESupported(layer.ffn_down_exps.type) &&
+          FusedMoESupported(layer.ffn_gate_shexp.type) &&
+          FusedMoESupported(layer.ffn_up_shexp.type) &&
+          FusedMoESupported(layer.ffn_down_shexp.type))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/// The captured step: embedding (token from d_control) -> 49 layers ->
+/// [final norm -> unembed -> argmax]. Kernels are position- and
+/// token-independent; per-step scalars arrive through d_control written by
+/// LaunchFlintWriteControl outside the graph. Capture runs the same
+/// enqueue sequence as the legacy path with device-arg variants.
+void CaptureFlintDecodeGraph(const models::FlintModelWeights& weights,
+                             const FlintGpuStepBuffers& b, bool compute_logits,
+                             FlintDecodeGraphState* graph) {
+  const auto& config = weights.config;
+  const std::size_t hidden_size = config.hidden_size;
+  const auto capture_fn = [&]() {
+    LaunchEmbeddingLookup(weights.token_embd.data, weights.token_embd.type,
+                          graph->d_control, b.hidden, hidden_size, b.stream);
+    for (std::uint32_t layer_idx = 0; layer_idx < config.num_layers;
+         ++layer_idx) {
+      RunFlintLayer(weights, weights.layers[layer_idx], layer_idx,
+                    /*pos=*/0, b, nullptr, nullptr, nullptr,
+                    graph->d_control);
+    }
+    if (compute_logits) {
+      LaunchRMSNorm(b.hidden,
+                    static_cast<const float*>(weights.output_norm.data),
+                    b.normed, hidden_size, kFlintRmsEps, b.stream);
+      LaunchGEMV(weights.output.data, weights.output.type, b.normed, b.logits,
+                 config.vocab_size, hidden_size, b.stream);
+      LaunchGPUArgmax(b.logits, b.d_out_token, config.vocab_size, b.stream);
+    }
+  };
+  auto& executor = compute_logits ? graph->exec_logits : graph->exec_hidden;
+  if (!executor.TryCapture(b.stream, detail::HipGraphCaptureKey{},
+                           capture_fn)) {
+    throw std::runtime_error(
+        "flint decode graph capture failed (see graph dispatch telemetry)");
+  }
+}
+
 }  // namespace
+
+void FlintDecodeGraphState::Release() noexcept {
+  exec_logits.Reset();
+  exec_hidden.Reset();
+  if (d_control != nullptr) {
+    (void)hipFree(d_control);
+    d_control = nullptr;
+  }
+  tried = false;
+  supported = false;
+}
 
 void ExecuteFlintDecodeStep(const models::FlintModelWeights& weights,
                             std::uint32_t token_id, std::uint32_t pos,
                             bool compute_logits,
                             const FlintGpuStepBuffers& b,
-                            FlintDecodeTimings* timings) {
+                            FlintDecodeTimings* timings,
+                            FlintDecodeGraphState* graph) {
   const auto& config = weights.config;
   const std::size_t hidden_size = config.hidden_size;
+
+  // Graph mode (3.1): eligibility is decided once; one exec per tail
+  // variant is captured lazily on its first step; every step (including
+  // the capture one — stream capture records without executing) then runs
+  // as one control-scalar launch + one hipGraphLaunch.
+  if (graph != nullptr && timings == nullptr) {
+    if (!graph->tried) {
+      graph->tried = true;
+      graph->supported = DecodeGraphSupported(weights, b);
+      if (graph->supported) {
+        HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&graph->d_control),
+                            2 * sizeof(std::uint32_t)));
+      }
+    }
+    if (graph->supported) {
+      auto& executor = compute_logits ? graph->exec_logits
+                                      : graph->exec_hidden;
+      if (!executor.IsCaptured()) {
+        try {
+          CaptureFlintDecodeGraph(weights, b, compute_logits, graph);
+        } catch (const std::exception&) {
+          graph->supported = false;  // permanent legacy fallback
+        }
+      }
+      if (graph->supported && executor.IsCaptured()) {
+        LaunchFlintWriteControl(graph->d_control, token_id, pos, b.stream);
+        executor.Launch(b.stream, detail::HipGraphCaptureKey{});
+        return;
+      }
+    }
+  }
 
   // Profiling scaffolding: 8 marks per layer + embed/tail boundaries.
   // All events are stream-ordered; stage sums resolve after one final

@@ -865,7 +865,8 @@ void GenerateFlintGpuResponse(
   for (std::size_t i = 0; i < prompt_tokens.size(); ++i) {
     const bool last = i + 1 == prompt_tokens.size();
     hip::ExecuteFlintDecodeStep(model.GetWeights(), prompt_tokens[i], position,
-                                last, buffers);
+                                last, buffers, /*timings=*/nullptr,
+                                arena.GetGraphState());
     if (last) {
       HIP_CHECK(hipStreamSynchronize(buffers.stream));
       HIP_CHECK(hipMemcpy(logits.data(), buffers.logits,
@@ -882,7 +883,8 @@ void GenerateFlintGpuResponse(
     if (generated >= opt.max_tokens || position >= max_context)
       break;
     hip::ExecuteFlintDecodeStep(model.GetWeights(), token, position,
-                                /*compute_logits=*/true, buffers);
+                                /*compute_logits=*/true, buffers,
+                                /*timings=*/nullptr, arena.GetGraphState());
     HIP_CHECK(hipStreamSynchronize(buffers.stream));
     HIP_CHECK(hipMemcpy(logits.data(), buffers.logits,
                         logits.size() * sizeof(float),

@@ -66,7 +66,8 @@ void LaunchAttention(const float* q, const float* k, const float* v,
                      std::uint32_t layer_idx, const std::uint32_t* d_pos,
                      std::uint32_t max_context, std::uint32_t num_heads,
                      std::uint32_t num_kv_heads, std::uint32_t head_dim,
-                     hipStream_t stream = nullptr, bool skip_kv_write = false);
+                     hipStream_t stream = nullptr, bool skip_kv_write = false,
+                     const detail::FlintKernelPolicy* policy = nullptr);
 
 /// Fuses per-head Q/K RMSNorm, RoPE, and the KV-cache write for a single decode
 /// token into one launch (opt-c010-qk-rope-kv). Writes the normed+roped Q into

@@ -100,5 +100,22 @@ void LaunchEmbeddingLookup(const void* table, core::GgmlType type,
       table, type, d_token_id, out_hidden, hidden_size);
 }
 
+/// Writes the flint decode step's control scalars (token id, position) into
+/// device memory. Launched OUTSIDE the captured decode graph with the values
+/// as kernel arguments: arguments are attached at enqueue time, so replays
+/// can be queued ahead on the stream without the host overwriting a staging
+/// buffer a pending graph still has to read.
+__global__ void FlintWriteControlKernel(std::uint32_t* __restrict__ control,
+                                        std::uint32_t token_id,
+                                        std::uint32_t pos) {
+  control[0] = token_id;
+  control[1] = pos;
+}
+
+void LaunchFlintWriteControl(std::uint32_t* d_control, std::uint32_t token_id,
+                             std::uint32_t pos, hipStream_t stream) {
+  FlintWriteControlKernel<<<1, 1, 0, stream>>>(d_control, token_id, pos);
+}
+
 }  // namespace gufo::hip
 #endif

@@ -2346,6 +2346,10 @@ public:
   [[nodiscard]] hip::FlintGpuStepBuffers buffers() const noexcept {
     return buffers_;
   }
+  /// Capture-once decode graph state owned by the arena (3.1).
+  [[nodiscard]] hip::FlintDecodeGraphState* graph_state() noexcept {
+    return arena_.GetGraphState();
+  }
   [[nodiscard]] const hip::FlintPrefillBuffers& prefill_buffers() const
       noexcept {
     return prefill_;
@@ -2566,7 +2570,7 @@ public:
       hip::ExecuteFlintDecodeStep(
           model_->GetWeights(), prompt[offset + i],
           static_cast<std::uint32_t>(offset + i), compute_logits,
-          flint.buffers());
+          flint.buffers(), /*timings=*/nullptr, flint.graph_state());
       if (compute_logits) {
         HIP_CHECK(hipStreamSynchronize(flint.buffers().stream));
         HIP_CHECK(hipMemcpy(flint.logits().data(), flint.buffers().logits,
@@ -2609,7 +2613,8 @@ public:
     }
     hip::ExecuteFlintDecodeStep(model_->GetWeights(), token,
                                 static_cast<std::uint32_t>(flint.position()),
-                                /*compute_logits=*/true, flint.buffers());
+                                /*compute_logits=*/true, flint.buffers(),
+                                /*timings=*/nullptr, flint.graph_state());
     HIP_CHECK(hipStreamSynchronize(flint.buffers().stream));
     HIP_CHECK(hipMemcpy(flint.logits().data(), flint.buffers().logits,
                         flint.logits().size() * sizeof(float),

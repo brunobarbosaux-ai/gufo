@@ -291,18 +291,328 @@ __launch_bounds__(32) __global__ void QwenDecodeOnlineAttentionHalfPtrKernel(
   }
 }
 
+/// Fixed-LDS twin of AttentionKernel (attention_decode.hip) for graph
+/// capture: identical arithmetic and summation order, but the score row is
+/// a compile-time LDS array instead of a seq-sized dynamic allocation —
+/// dynamic LDS is baked into the graph node and cannot vary with position.
+/// The kernel reads the position from d_pos and only touches s_scores[0,
+/// span). kSpan comes from the capture-time worst case (windowed: the
+/// sliding window at 513; global: max_context on the 4096/8192 ladder —
+/// 8192 floats + the 1 KiB reduce row is the 64 KiB static-LDS ceiling;
+/// beyond it the online-tile kernel takes over, as in the legacy path).
+template <std::size_t kSpan>
+__global__ void AttentionKernelGraph(
+    const float* __restrict__ q, const float* __restrict__ gate,
+    const float* __restrict__ k_cache, const float* __restrict__ v_cache,
+    float* __restrict__ out_context, std::uint32_t layer_idx,
+    const std::uint32_t* __restrict__ d_pos, std::uint32_t max_context,
+    std::uint32_t num_heads, std::uint32_t num_kv_heads,
+    std::uint32_t head_dim, detail::FlintKernelPolicy policy) {
+  const std::uint32_t h = blockIdx.x;
+  if (h >= num_heads) {
+    return;
+  }
+
+  const std::uint32_t group_size =
+      (num_kv_heads > 0) ? (num_heads / num_kv_heads) : 1;
+  const std::uint32_t kv_h = h / group_size;
+  const std::size_t tid = threadIdx.x;
+
+  const float* q_h = q + (static_cast<std::size_t>(h) * head_dim);
+  const float scale = 1.0F / sqrtf(static_cast<float>(head_dim));
+  const std::uint32_t pos = *d_pos;
+  const std::size_t seq_len = static_cast<std::size_t>(pos) + 1;
+  // F-D2: the window keeps the last `window` keys; scores use relative
+  // indexing so the LDS row spans only the visible range.
+  const std::size_t p_begin =
+      (policy.window != 0 && seq_len > policy.window)
+          ? seq_len - policy.window
+          : 0;
+  const std::size_t span = seq_len - p_begin;
+  // F-D1: the sink joins max and denominator (F-D6 order: scale -> sink ->
+  // softmax -> weighted sum) and contributes no value.
+  const bool has_sink = policy.sinks != nullptr;
+  const float sink = has_sink ? policy.sinks[h] : 0.0F;
+
+  __shared__ float s_scores[kSpan];
+  __shared__ float s_scratch[256];
+
+  // Step 1: Compute scores for each position p = p_begin..seq_len-1
+  for (std::size_t p = p_begin; p < seq_len; ++p) {
+    const std::size_t p_offset =
+        (((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) *
+              max_context +
+          p) *
+         head_dim);
+    const float* k_p = k_cache + p_offset;
+
+    float dot = 0.0F;
+    for (std::size_t d = tid; d < head_dim; d += blockDim.x) {
+      dot += q_h[d] * k_p[d];
+    }
+    s_scratch[tid] = dot;
+    __syncthreads();
+    for (std::size_t stride = blockDim.x / 2; stride > 0; stride /= 2) {
+      if (tid < stride) {
+        s_scratch[tid] += s_scratch[tid + stride];
+      }
+      __syncthreads();
+    }
+    if (tid == 0) {
+      s_scores[p - p_begin] = s_scratch[0] * scale;
+    }
+    __syncthreads();
+  }
+
+  // Step 2: Softmax across s_scores[0..span-1]
+  float local_max = -1e30F;
+  for (std::size_t p = tid; p < span; p += blockDim.x) {
+    local_max = fmaxf(local_max, s_scores[p]);
+  }
+  s_scratch[tid] = local_max;
+  __syncthreads();
+  for (std::size_t stride = blockDim.x / 2; stride > 0; stride /= 2) {
+    if (tid < stride) {
+      s_scratch[tid] = fmaxf(s_scratch[tid], s_scratch[tid + stride]);
+    }
+    __syncthreads();
+  }
+  float max_score = s_scratch[0];
+  if (has_sink) {
+    max_score = fmaxf(max_score, sink);
+  }
+  __syncthreads();
+
+  float local_sum = 0.0F;
+  for (std::size_t p = tid; p < span; p += blockDim.x) {
+    const float e = expf(s_scores[p] - max_score);
+    s_scores[p] = e;
+    local_sum += e;
+  }
+  if (has_sink && tid == 0) {
+    local_sum += expf(sink - max_score);
+  }
+  s_scratch[tid] = local_sum;
+  __syncthreads();
+  for (std::size_t stride = blockDim.x / 2; stride > 0; stride /= 2) {
+    if (tid < stride) {
+      s_scratch[tid] += s_scratch[tid + stride];
+    }
+    __syncthreads();
+  }
+  const float inv_sum_exp = 1.0F / (s_scratch[0] + 1e-9F);
+  __syncthreads();
+
+  for (std::size_t p = tid; p < span; p += blockDim.x) {
+    s_scores[p] *= inv_sum_exp;
+  }
+  __syncthreads();
+
+  // Step 3: Weighted sum of V
+  if (tid < head_dim) {
+    float ctx = 0.0F;
+    for (std::size_t p = p_begin; p < seq_len; ++p) {
+      const std::size_t p_offset =
+          (((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) *
+                max_context +
+            p) *
+           head_dim);
+      const float* v_p = v_cache + p_offset;
+      ctx += s_scores[p - p_begin] * v_p[tid];
+    }
+
+    if (gate != nullptr) {
+      const float g = gate[static_cast<std::size_t>(h) * head_dim + tid];
+      const float sig = 1.0F / (1.0F + expf(-g));
+      ctx *= sig;
+    }
+    out_context[static_cast<std::size_t>(h) * head_dim + tid] = ctx;
+  }
+}
+
+/// d_pos twin of FlintDecodeOnlineAttentionKernel (attention_decode.hip):
+/// identical arithmetic and tile order — the kernel only reads the position
+/// from device memory so a captured graph serves every position. Fixed grid
+/// (num_heads blocks, 256 threads) and fixed LDS (two 256-float rows) — the
+/// graph-capture requirements the baseline's seq-sized score row breaks.
+__global__ void FlintDecodeOnlineAttentionPtrKernel(
+    const float* __restrict__ q, const float* __restrict__ k_cache,
+    const float* __restrict__ v_cache, float* __restrict__ out_context,
+    std::uint32_t layer_idx, const std::uint32_t* __restrict__ d_pos,
+    std::uint32_t max_context, std::uint32_t num_heads,
+    std::uint32_t num_kv_heads, std::uint32_t head_dim,
+    detail::FlintKernelPolicy policy) {
+  constexpr std::size_t kTile = 256;
+  const std::uint32_t h = blockIdx.x;
+  if (h >= num_heads) {
+    return;
+  }
+  const std::uint32_t group_size =
+      (num_kv_heads > 0) ? (num_heads / num_kv_heads) : 1;
+  const std::uint32_t kv_h = h / group_size;
+  const std::size_t tid = threadIdx.x;
+
+  const float* q_h = q + static_cast<std::size_t>(h) * head_dim;
+  const float scale = 1.0F / sqrtf(static_cast<float>(head_dim));
+  const std::uint32_t pos = *d_pos;
+  const std::size_t seq_len = static_cast<std::size_t>(pos) + 1;
+  const std::size_t p_begin =
+      (policy.window != 0 && seq_len > policy.window)
+          ? seq_len - policy.window
+          : 0;
+  const bool has_sink = policy.sinks != nullptr;
+  const float sink = has_sink ? policy.sinks[h] : 0.0F;
+
+  __shared__ float s_scores[kTile];
+  __shared__ float s_reduce[kTile];
+  __shared__ float s_m;     // running max
+  __shared__ float s_l;     // running denominator
+  __shared__ float s_alpha; // this tile's O rescale
+
+  float o = 0.0F; // thread-private output dim (tid < head_dim)
+
+  if (tid == 0) {
+    s_m = has_sink ? sink : -INFINITY;
+    s_l = has_sink ? 1.0F : 0.0F;
+  }
+  __syncthreads();
+
+  for (std::size_t tile = p_begin; tile < seq_len; tile += kTile) {
+    const std::size_t tile_end = std::min(tile + kTile, seq_len);
+    const std::size_t n = tile_end - tile;
+    // 1. Scores for this tile (thread-strided over keys, full dot per key).
+    for (std::size_t i = tid; i < n; i += kTile) {
+      const std::size_t p = tile + i;
+      const std::size_t p_offset =
+          (((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) *
+                max_context +
+            p) *
+           head_dim);
+      const float* k_p = k_cache + p_offset;
+      float dot = 0.0F;
+      for (std::size_t d = 0; d < head_dim; ++d) {
+        dot += q_h[d] * k_p[d];
+      }
+      s_scores[i] = dot * scale;
+    }
+    __syncthreads();
+    // 2. Tile max -> running max + rescale.
+    float local_max = -INFINITY;
+    for (std::size_t i = tid; i < n; i += kTile) {
+      local_max = fmaxf(local_max, s_scores[i]);
+    }
+    s_reduce[tid] = local_max;
+    __syncthreads();
+    for (std::size_t stride = kTile / 2; stride > 0; stride >>= 1) {
+      if (tid < stride) {
+        s_reduce[tid] = fmaxf(s_reduce[tid], s_reduce[tid + stride]);
+      }
+      __syncthreads();
+    }
+    if (tid == 0) {
+      const float m_new = fmaxf(s_m, s_reduce[0]);
+      s_alpha = expf(s_m - m_new);
+      s_m = m_new;
+    }
+    __syncthreads();
+    const float alpha = s_alpha;
+    // 3. Exponentiates + tile sum -> running denominator.
+    float local_sum = 0.0F;
+    for (std::size_t i = tid; i < n; i += kTile) {
+      const float e = expf(s_scores[i] - s_m);
+      s_scores[i] = e;
+      local_sum += e;
+    }
+    s_reduce[tid] = local_sum;
+    __syncthreads();
+    for (std::size_t stride = kTile / 2; stride > 0; stride >>= 1) {
+      if (tid < stride) {
+        s_reduce[tid] += s_reduce[tid + stride];
+      }
+      __syncthreads();
+    }
+    if (tid == 0) {
+      s_l = s_l * alpha + s_reduce[0];
+    }
+    // 4. O accumulation: rescale then add this tile's weighted V row.
+    if (tid < head_dim) {
+      o *= alpha;
+      const std::size_t v_base =
+          ((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) *
+               max_context +
+           tile) *
+          head_dim;
+      for (std::size_t i = 0; i < n; ++i) {
+        o += s_scores[i] * v_cache[v_base + i * head_dim + tid];
+      }
+    }
+    __syncthreads();
+  }
+  if (tid < head_dim) {
+    out_context[static_cast<std::size_t>(h) * head_dim + tid] = o / s_l;
+  }
+}
+
 void LaunchAttention(const float* q, const float* k, const float* v,
                      const float* gate, float* k_cache, float* v_cache,
                      void* k_cache_f16, void* v_cache_f16, float* out_context,
                      std::uint32_t layer_idx, const std::uint32_t* d_pos,
                      std::uint32_t max_context, std::uint32_t num_heads,
                      std::uint32_t num_kv_heads, std::uint32_t head_dim,
-                     hipStream_t stream, bool skip_kv_write) {
+                     hipStream_t stream, bool skip_kv_write,
+                     const detail::FlintKernelPolicy* policy) {
   if (!skip_kv_write) {
     WriteKVCachePtrKernel<<<num_kv_heads, 256, 0, stream>>>(
         k, v, k_cache, v_cache, static_cast<__half*>(k_cache_f16),
         static_cast<__half*>(v_cache_f16), layer_idx, d_pos, max_context,
         num_kv_heads, head_dim);
+  }
+
+  // F-D1/F-D2 graph route: the flint policy (sinks + window, fp32 cache
+  // plane) takes the fixed-LDS baseline clone — identical arithmetic to the
+  // legacy baseline, LDS sized at capture time from the worst-case span
+  // (windowed: the sliding window; global: max_context on the ladder).
+  // Past the 64 KiB LDS budget (span > 16384) the online-tile kernel takes
+  // over, exactly like the legacy path past 16128.
+  if (policy != nullptr) {
+    if (k_cache != nullptr && v_cache != nullptr) {
+      const std::size_t span_needed =
+          policy->window != 0
+              ? std::min<std::size_t>(policy->window, max_context)
+              : max_context;
+      if (span_needed <= 513) {
+        detail::EmitAttentionDispatch("decode_baseline_flint_graph", "");
+        AttentionKernelGraph<513><<<num_heads, 256, 0, stream>>>(
+            q, gate, k_cache, v_cache, out_context, layer_idx, d_pos,
+            max_context, num_heads, num_kv_heads, head_dim, *policy);
+        return;
+      }
+      if (span_needed <= 4096) {
+        detail::EmitAttentionDispatch("decode_baseline_flint_graph", "");
+        AttentionKernelGraph<4096><<<num_heads, 256, 0, stream>>>(
+            q, gate, k_cache, v_cache, out_context, layer_idx, d_pos,
+            max_context, num_heads, num_kv_heads, head_dim, *policy);
+        return;
+      }
+      if (span_needed <= 8192) {
+        detail::EmitAttentionDispatch("decode_baseline_flint_graph", "");
+        AttentionKernelGraph<8192><<<num_heads, 256, 0, stream>>>(
+            q, gate, k_cache, v_cache, out_context, layer_idx, d_pos,
+            max_context, num_heads, num_kv_heads, head_dim, *policy);
+        return;
+      }
+      // 8192 floats + the 1 KiB reduce row is the static-LDS ceiling (the
+      // 16384 tier would exceed the 64 KiB block budget); beyond it the
+      // online-tile kernel takes over, as in the legacy path past 16128.
+      detail::EmitAttentionDispatch("decode_online_flint_graph", "");
+      FlintDecodeOnlineAttentionPtrKernel<<<num_heads, 256, 0, stream>>>(
+          q, k_cache, v_cache, out_context, layer_idx, d_pos, max_context,
+          num_heads, num_kv_heads, head_dim, *policy);
+      return;
+    }
+    detail::EmitAttentionDispatch(
+        "none", "decode_online_flint_graph: requires_fp32_caches");
+    return;
   }
 
   if (head_dim == 256 && num_kv_heads > 0 && (num_heads % num_kv_heads) == 0) {

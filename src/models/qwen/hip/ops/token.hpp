@@ -113,6 +113,14 @@ void LaunchEmbeddingLookup(const void* table, core::GgmlType type,
                            std::size_t hidden_size,
                            hipStream_t stream = nullptr);
 
+/// Writes the flint decode step control scalars ([0] = token id, [1] =
+/// position) into d_control. The values ride as kernel arguments, so a
+/// captured decode graph reading d_control can be replayed with fresh
+/// per-step scalars without touching the captured nodes.
+void LaunchFlintWriteControl(std::uint32_t* d_control, std::uint32_t token_id,
+                             std::uint32_t pos,
+                             hipStream_t stream = nullptr);
+
 /// De-interleaves [Q0 (head_dim), Gate0 (head_dim), Q1, Gate1, ...] into
 /// separate Q and Gate buffers
 void LaunchUnpackQG(const float* qg_interleaved, float* q_out, float* gate_out,

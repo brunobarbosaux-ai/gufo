@@ -9,6 +9,8 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
 
+#include "src/core/hip/detail/hip_graph_decode_executor.hpp"
+
 namespace gufo::hip {
 
 /// Device buffers for one flint decode step. All pointers are device memory
@@ -57,6 +59,28 @@ struct FlintGpuStepBuffers {
   std::uint32_t max_context = 0;
 
   hipStream_t stream = nullptr;
+};
+
+/// Capture-once decode graph state (3.1). Owned by the arena; a pointer is
+/// passed to ExecuteFlintDecodeStep. On the first step the step function
+/// decides eligibility (fp32 KV plane, argmax output, every MoE layer on the
+/// fused sync-free dispatch) and lazily instantiates one exec per tail
+/// variant (with/without logits); every later step is one control-scalar
+/// launch + one hipGraphLaunch. Per-step scalars (token id, position) reach
+/// the kernels through d_control, written by LaunchFlintWriteControl OUTSIDE
+/// the graph with the values as kernel arguments — enqueue-time semantics
+/// keep queued-ahead replays race-free. Graph-mode attention is the
+/// fixed-grid/fixed-LDS online-tile kernel at every position, so one capture
+/// serves the whole context (the legacy baseline's seq-sized LDS score row
+/// is not capturable and caps at 16128).
+struct FlintDecodeGraphState {
+  detail::HipGraphDecodeExecutor exec_logits;  ///< capture includes the tail
+  detail::HipGraphDecodeExecutor exec_hidden;  ///< capture stops at layers
+  std::uint32_t* d_control = nullptr;          ///< [0] = token id, [1] = position
+  bool tried = false;      ///< eligibility decided (first step)
+  bool supported = false;  ///< graph mode active
+
+  void Release() noexcept;
 };
 
 /// Runs one full flint decode step (embedding -> 49 attention layers ->
@@ -108,7 +132,8 @@ void ExecuteFlintDecodeStep(const models::FlintModelWeights& weights,
                             std::uint32_t token_id, std::uint32_t pos,
                             bool compute_logits,
                             const FlintGpuStepBuffers& buffers,
-                            FlintDecodeTimings* timings = nullptr);
+                            FlintDecodeTimings* timings = nullptr,
+                            FlintDecodeGraphState* graph = nullptr);
 
 }  // namespace gufo::hip
 
