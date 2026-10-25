@@ -9,6 +9,7 @@ results and qualification gaps live in:
 - [Qwen3-TTS](models/qwen3-tts/BENCHMARKS.md)
 - [Qwen3-ASR](models/qwen3-asr/BENCHMARKS.md)
 - [MiniMax H3](models/minimax-h3/BENCHMARKS.md)
+- [Flint 40B](models/flint-40b/BENCHMARKS.md)
 
 ## Model benchmark driver
 
