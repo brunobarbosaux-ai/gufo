@@ -115,6 +115,28 @@ void AttnProfileRead(unsigned long long out[4], hipStream_t stream);
 /// skip time (hipEvent A/B — clock64 proved unreliable across barriers).
 void AttnProfileSetSkip(unsigned skip, hipStream_t stream);
 
+/// Flint-shaped WMMA prefill attention (32/4/128 + sinks + window), the
+/// 2.6 flash route: per-head blocks spanning 32 queries with K/V reuse,
+/// online softmax, fixed 16-key tile order (G6 split-invariant). K/V come
+/// from flint's fp32 KV plane (head-major) and are converted to f16
+/// fragments at load — the same quantize trade the qwen WMMA path makes.
+/// Returns false when the caller should use the scalar batched kernel.
+bool LaunchFlintWmmaAttention(
+    const float* q, const float* k_cache, const float* v_cache,
+    float* out_context, std::uint32_t layer_idx, std::uint32_t start_pos,
+    std::size_t batch_size, std::uint32_t max_context, hipStream_t stream,
+    const detail::FlintKernelPolicy* policy);
+
+/// The batched-path KV write kernel, exposed for callers whose attention
+/// reads the cache directly (the flint WMMA route) and therefore must
+/// stage the current chunk's K/V first. Writes every non-null plane.
+void LaunchBatchedKvWrite(const float* k, const float* v,
+                          float* k_cache, float* v_cache,
+                          std::uint32_t layer_idx, std::uint32_t start_pos,
+                          std::size_t batch_size, std::uint32_t max_context,
+                          std::uint32_t num_kv_heads, std::uint32_t head_dim,
+                          hipStream_t stream);
+
 /// Batched fuse of per-head Q/K RMSNorm, RoPE, and the KV-cache write across B
 /// tokens into one launch (opt-c010-qk-rope-kv). Writes the normed+roped Q into
 /// q_out and the normed+roped K into k_out, and K/V into every non-null cache

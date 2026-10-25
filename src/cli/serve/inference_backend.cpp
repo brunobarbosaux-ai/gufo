@@ -2511,10 +2511,11 @@ public:
     // the token-by-token path.
     std::size_t batched = 0;
     if (hip::FlintPrefillSupported(model_->GetWeights()) &&
-        offset < hip::kFlintPrefillMaxPosition) {
-      batched = std::min(consumed,
-                         static_cast<std::size_t>(hip::kFlintPrefillMaxPosition -
-                                                  offset));
+        offset < hip::FlintPrefillPositionCap(max_context_)) {
+      batched = std::min(
+          consumed,
+          hip::FlintPrefillPositionCap(max_context_) -
+              static_cast<std::size_t>(offset));
     }
     std::size_t done = 0;
     const auto prefill_t0 = std::chrono::steady_clock::now();

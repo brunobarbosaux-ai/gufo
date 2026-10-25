@@ -18,7 +18,7 @@ namespace gufo::hip {
 /// what makes the grouped expert kernels worth their launch: at 512 tokens a
 /// bucket holds about twelve rows, so a decoded weight block feeds twelve
 /// tokens instead of one.
-inline constexpr std::size_t kFlintPrefillBatchCapacity = 512;
+inline constexpr std::size_t kFlintPrefillBatchCapacity = 1024;
 
 /// Upper bound on the slot tables for a chunk of `tokens`: the compact slot
 /// count plus the 16-row bucket padding the grouped WMMA route requires (at
@@ -35,6 +35,12 @@ inline constexpr std::size_t kFlintPrefillBatchCapacity = 512;
 /// the global layers cover the full causal prefix; chunks that would cross
 /// this position are handed to the token-by-token path instead.
 inline constexpr std::size_t kFlintPrefillMaxPosition = 16000;
+
+/// The position cap in effect for this process. With the WMMA flash
+/// attention (2.6) the batched path has no LDS dependence on position, so
+/// the cap is the served context; with GUFO_FLINT_ATTN_SCALAR the scalar
+/// kernel's 64 KiB score row re-imposes kFlintPrefillMaxPosition.
+[[nodiscard]] std::size_t FlintPrefillPositionCap(std::uint32_t max_context);
 
 /// Chunk-prefill scratch. Sized once per session from the config; the decode
 /// buffers (FlintGpuStepBuffers) are reused only for the KV cache, the logits

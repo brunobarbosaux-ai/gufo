@@ -85,6 +85,13 @@ void ProjectFromQ8(const models::QwenTensorRef& w, const void* q8_x,
 
 }  // namespace
 
+std::size_t FlintPrefillPositionCap(std::uint32_t max_context) {
+  static const bool attn_scalar =
+      std::getenv("GUFO_FLINT_ATTN_SCALAR") != nullptr;
+  return attn_scalar ? kFlintPrefillMaxPosition
+                     : static_cast<std::size_t>(max_context);
+}
+
 bool FlintPrefillSupported(const models::FlintModelWeights& weights) noexcept {
   const auto& config = weights.config;
   if (config.expert_used_count == 0 || config.expert_count == 0) {
@@ -281,13 +288,29 @@ void ExecuteFlintPrefillChunk(const models::FlintModelWeights& weights,
     const detail::FlintKernelPolicy policy{
         static_cast<const float*>(layer.attn_sinks.data),
         layer.attrs.windowed ? config.sliding_window : 0U};
-    LaunchBatchedAttention(
-        prefill.q, prefill.k, prefill.v, /*gate=*/nullptr, buffers.k_cache,
-        buffers.v_cache, /*k_cache_f16=*/nullptr, /*v_cache_f16=*/nullptr,
-        prefill.attn_out, layer_idx, start_pos, n, buffers.max_context,
-        config.num_attention_heads, config.num_key_value_heads,
-        config.head_dim, stream, /*skip_kv_write=*/false,
-        /*out_context_bf16=*/nullptr, &policy);
+    static const bool attn_scalar = std::getenv("GUFO_FLINT_ATTN_SCALAR") !=
+                                    nullptr;
+    bool wmma_attention = false;
+    if (!attn_scalar) {
+      // 2.6 flash route: the WMMA kernel reads the cache, so stage this
+      // chunk's K/V first (the batched kernel would otherwise do it).
+      LaunchBatchedKvWrite(prefill.k, prefill.v, buffers.k_cache,
+                           buffers.v_cache, layer_idx, start_pos, n,
+                           buffers.max_context, config.num_key_value_heads,
+                           config.head_dim, stream);
+      wmma_attention = LaunchFlintWmmaAttention(
+          prefill.q, buffers.k_cache, buffers.v_cache, prefill.attn_out,
+          layer_idx, start_pos, n, buffers.max_context, stream, &policy);
+    }
+    if (!wmma_attention) {
+      LaunchBatchedAttention(
+          prefill.q, prefill.k, prefill.v, /*gate=*/nullptr, buffers.k_cache,
+          buffers.v_cache, /*k_cache_f16=*/nullptr, /*v_cache_f16=*/nullptr,
+          prefill.attn_out, layer_idx, start_pos, n, buffers.max_context,
+          config.num_attention_heads, config.num_key_value_heads,
+          config.head_dim, stream, /*skip_kv_write=*/false,
+          /*out_context_bf16=*/nullptr, &policy);
+    }
     mark(kAttention);
 
     Project(layer.attn_output, prefill.attn_out, n, hidden, attention_size, q8,
