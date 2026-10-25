@@ -7,6 +7,7 @@
 #include "src/models/qwen/state.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 #include "src/core/hip/detail/hip_graph_decode_executor.hpp"
@@ -56,6 +57,11 @@ struct FlintGpuStepBuffers {
 
   float* k_cache = nullptr;
   float* v_cache = nullptr;
+  /// Token-major f16 twin planes (GUFO_FLINT_KV_F16, default on): written
+  /// alongside fp32 by the KV-write kernels, read by the f16 attention
+  /// instantiations — half the KV bytes on the global-layer decode steps.
+  __half* k_cache_f16 = nullptr;
+  __half* v_cache_f16 = nullptr;
   std::uint32_t max_context = 0;
 
   hipStream_t stream = nullptr;

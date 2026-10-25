@@ -8,6 +8,7 @@
 #include "src/models/qwen/hip/detail/flint_decode_step.hpp"
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <string_view>
 #include <vector>
@@ -151,14 +152,14 @@ void RunFlintLayer(const models::FlintModelWeights& weights,
       layer.attrs.windowed ? config.sliding_window : 0U};
   if (d_control != nullptr) {
     LaunchAttention(b.q, b.k, b.v, /*gate=*/nullptr, b.k_cache, b.v_cache,
-                    /*k_cache_f16=*/nullptr, /*v_cache_f16=*/nullptr,
+                    b.k_cache_f16, b.v_cache_f16,
                     b.attn_out, layer_idx, d_control + 1, b.max_context,
                     config.num_attention_heads, config.num_key_value_heads,
                     config.head_dim, b.stream,
                     /*skip_kv_write=*/false, &policy);
   } else {
     LaunchAttention(b.q, b.k, b.v, /*gate=*/nullptr, b.k_cache, b.v_cache,
-                    /*k_cache_f16=*/nullptr, /*v_cache_f16=*/nullptr,
+                    b.k_cache_f16, b.v_cache_f16,
                     b.attn_out, layer_idx, pos, b.max_context,
                     config.num_attention_heads, config.num_key_value_heads,
                     config.head_dim, b.stream,
@@ -421,6 +422,130 @@ void ExecuteFlintDecodeStep(const models::FlintModelWeights& weights,
                             FlintDecodeGraphState* graph) {
   const auto& config = weights.config;
   const std::size_t hidden_size = config.hidden_size;
+
+  // KV-plane debug hash (f16-KV bring-up): FNV-1a over layer 0's logical
+  // rows [0, min(pos+1, 64)) in BOTH planes after the step. Print when
+  // GUFO_FLINT_KV_DEBUG=1 — cross-request diffs expose stale/divergent
+  // cache content directly.
+  static const bool kv_debug = [] {
+    const char* v = std::getenv("GUFO_FLINT_KV_DEBUG");
+    return v != nullptr && v[0] == '1';
+  }();
+  auto kv_hash = [](const void* data, std::size_t bytes) {
+    const auto* p = static_cast<const std::uint8_t*>(data);
+    std::uint32_t h = 2166136261u;
+    for (std::size_t i = 0; i < bytes; ++i) {
+      h = (h ^ p[i]) * 16777619u;
+    }
+    return h;
+  };
+  if (kv_debug && pos < 40) {
+    // Recent-window hash: rows [max(0,pos-63), pos] — the region the
+    // current step actually reads most of; a fixed [0,64) hash never
+    // covers the mid-generation rows where a divergence would live.
+    const std::uint32_t lo = pos >= 63 ? pos - 63 : 0;
+    const std::uint32_t n = pos - lo + 1;
+    const std::size_t kv_width =
+        static_cast<std::size_t>(config.num_key_value_heads) *
+        config.head_dim;
+    std::vector<float> f32_rows(n * kv_width);
+    std::vector<std::uint16_t> f16_rows(n * kv_width);
+    for (std::uint32_t kv_h = 0; kv_h < config.num_key_value_heads;
+         ++kv_h) {
+      for (std::uint32_t p = 0; p < n; ++p) {
+        const std::uint32_t p_abs = lo + p;
+        const std::size_t f32_off =
+            ((static_cast<std::size_t>(0) * config.num_key_value_heads +
+              kv_h) *
+                 b.max_context +
+             p_abs) *
+            config.head_dim;
+        const std::size_t f16_off =
+            (static_cast<std::size_t>(p_abs) * kv_width) +
+            static_cast<std::size_t>(kv_h) * config.head_dim;
+        HIP_CHECK(hipMemcpy(
+            f32_rows.data() + static_cast<std::size_t>(p) * kv_width +
+                static_cast<std::size_t>(kv_h) * config.head_dim,
+            b.k_cache + f32_off, config.head_dim * sizeof(float),
+            hipMemcpyDeviceToHost));
+        if (b.k_cache_f16 != nullptr) {
+          HIP_CHECK(hipMemcpy(
+              f16_rows.data() + static_cast<std::size_t>(p) * kv_width +
+                  static_cast<std::size_t>(kv_h) * config.head_dim,
+              b.k_cache_f16 + f16_off, config.head_dim * sizeof(std::uint16_t),
+              hipMemcpyDeviceToHost));
+        }
+      }
+    }
+    std::uint32_t f32_h = 0;
+    for (const float v : f32_rows) {
+      f32_h = kv_hash(&v, sizeof(v)) ^ (f32_h << 1);
+    }
+    std::uint32_t f16_h = 0;
+    for (const auto v : f16_rows) {
+      f16_h = kv_hash(&v, sizeof(v)) ^ (f16_h << 1);
+    }
+    // V plane, same rows.
+    std::vector<float> v32_rows(n * kv_width);
+    for (std::uint32_t kv_h = 0; kv_h < config.num_key_value_heads;
+         ++kv_h) {
+      for (std::uint32_t p = 0; p < n; ++p) {
+        const std::uint32_t p_abs = lo + p;
+        const std::size_t f32_off =
+            ((static_cast<std::size_t>(0) * config.num_key_value_heads +
+              kv_h) *
+                 b.max_context +
+             p_abs) *
+            config.head_dim;
+        HIP_CHECK(hipMemcpy(
+            v32_rows.data() + static_cast<std::size_t>(p) * kv_width +
+                static_cast<std::size_t>(kv_h) * config.head_dim,
+            b.v_cache + f32_off, config.head_dim * sizeof(float),
+            hipMemcpyDeviceToHost));
+      }
+    }
+    std::uint32_t v32_h = 0;
+    for (const float v : v32_rows) {
+      v32_h = kv_hash(&v, sizeof(v)) ^ (v32_h << 1);
+    }
+    // Raw last-written row (layer 0, kv 0) in both planes — distinguishes
+    // "never written" (zeros) from "written with divergent values".
+    float raw32[8] = {};
+    std::uint16_t raw16[8] = {};
+    const std::uint32_t last = pos;
+    HIP_CHECK(hipMemcpy(raw32, b.k_cache + last * config.head_dim,
+                        sizeof(raw32), hipMemcpyDeviceToHost));
+    if (b.k_cache_f16 != nullptr) {
+      HIP_CHECK(hipMemcpy(
+          raw16,
+          b.k_cache_f16 + static_cast<std::size_t>(last) * kv_width,
+          sizeof(raw16), hipMemcpyDeviceToHost));
+    }
+    static const void* prev_k = nullptr;
+    std::uint32_t ctl[2] = {};
+    if (graph != nullptr && graph->d_control != nullptr) {
+      HIP_CHECK(hipMemcpy(ctl, graph->d_control, sizeof(ctl),
+                          hipMemcpyDeviceToHost));
+    }
+    std::fprintf(stderr,
+                 "kvdbg pos=%u ctl=[%u,%u] kc=%p k16c=%p same=%d k32=%08x "
+                 "k16=%08x v32=%08x last32=",
+                 pos, ctl[0], ctl[1], static_cast<const void*>(b.k_cache),
+                 static_cast<const void*>(b.k_cache_f16),
+                 prev_k == static_cast<const void*>(b.k_cache), f32_h,
+                 f16_h, v32_h);
+    prev_k = b.k_cache;
+    for (int i = 0; i < 4; ++i) {
+      std::fprintf(stderr, "%+.4f,", raw32[i]);
+    }
+    std::fprintf(stderr, " last16=");
+    for (int i = 0; i < 4; ++i) {
+      const float h = __half2float(*reinterpret_cast<const __half*>(
+          &raw16[i]));
+      std::fprintf(stderr, "%+.4f,", h);
+    }
+    std::fprintf(stderr, "\n");
+  }
 
   // Graph mode (3.1): eligibility is decided once; one exec per tail
   // variant is captured lazily on its first step; every step (including

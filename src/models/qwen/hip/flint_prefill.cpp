@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <numeric>
@@ -146,6 +147,11 @@ void ExecuteFlintPrefillChunk(const models::FlintModelWeights& weights,
                               FlintPrefillTimings* timings) {
   const auto& config = weights.config;
   const std::size_t n = tokens.size();
+  if (std::getenv("GUFO_FLINT_KV_DEBUG") != nullptr) {
+    std::fprintf(stderr, "prefill dbg start=%u n=%zu kc=%p k16c=%p\n",
+                 start_pos, n, static_cast<const void*>(buffers.k_cache),
+                 static_cast<const void*>(buffers.k_cache_f16));
+  }
   if (n == 0) {
     return;
   }
@@ -305,7 +311,8 @@ void ExecuteFlintPrefillChunk(const models::FlintModelWeights& weights,
       // 2.6 flash route: the WMMA kernel reads the cache, so stage this
       // chunk's K/V first (the batched kernel would otherwise do it).
       LaunchBatchedKvWrite(prefill.k, prefill.v, buffers.k_cache,
-                           buffers.v_cache, layer_idx, start_pos, n,
+                           buffers.v_cache, buffers.k_cache_f16,
+                           buffers.v_cache_f16, layer_idx, start_pos, n,
                            buffers.max_context, config.num_key_value_heads,
                            config.head_dim, stream);
       wmma_attention = LaunchFlintWmmaAttention(
@@ -315,7 +322,7 @@ void ExecuteFlintPrefillChunk(const models::FlintModelWeights& weights,
     if (!wmma_attention) {
       LaunchBatchedAttention(
           prefill.q, prefill.k, prefill.v, /*gate=*/nullptr, buffers.k_cache,
-          buffers.v_cache, /*k_cache_f16=*/nullptr, /*v_cache_f16=*/nullptr,
+          buffers.v_cache, buffers.k_cache_f16, buffers.v_cache_f16,
           prefill.attn_out, layer_idx, start_pos, n, buffers.max_context,
           config.num_attention_heads, config.num_key_value_heads,
           config.head_dim, stream, /*skip_kv_write=*/false,

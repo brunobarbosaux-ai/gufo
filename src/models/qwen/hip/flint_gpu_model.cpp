@@ -2,6 +2,7 @@
 #include "src/models/qwen/hip/flint_gpu_model.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <numeric>
 
@@ -168,6 +169,22 @@ FlintGpuArena::FlintGpuArena(const core::ModelConfig& config,
   buffers_.logits = alloc(config.vocab_size);
   buffers_.k_cache = alloc(plane);
   buffers_.v_cache = alloc(plane);
+  // f16 KV twin planes (GUFO_FLINT_KV_F16, default OFF while the serve's
+  // multi-request determinism issue is open — see the f16-KV investigation
+  // notes; =1 opts in): token-major layout, same element count as one
+  // fp32 plane, half the bytes. Written alongside fp32 by every KV-write
+  // kernel; the f16 attention instantiations read these, halving the
+  // global-layer KV bytes per decode step.
+  static const bool kv_f16_enabled = [] {
+    const char* v = std::getenv("GUFO_FLINT_KV_F16");
+    return v != nullptr && v[0] == '1';
+  }();
+  if (kv_f16_enabled) {
+    HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&buffers_.k_cache_f16),
+                        plane * sizeof(__half)));
+    HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&buffers_.v_cache_f16),
+                        plane * sizeof(__half)));
+  }
   buffers_.expert_weights = alloc(8);
   HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&buffers_.selected),
                       8 * sizeof(std::uint32_t)));
@@ -316,6 +333,12 @@ void FlintGpuArena::FreeAll() noexcept {
   }
   if (buffers_.expert_job_list != nullptr) {
     (void)hipFree(buffers_.expert_job_list);
+  }
+  if (buffers_.k_cache_f16 != nullptr) {
+    (void)hipFree(buffers_.k_cache_f16);
+  }
+  if (buffers_.v_cache_f16 != nullptr) {
+    (void)hipFree(buffers_.v_cache_f16);
   }
   if (prefill_.hidden != nullptr) {
     (void)hipFree(prefill_.hidden);

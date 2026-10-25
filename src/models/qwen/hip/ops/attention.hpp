@@ -130,9 +130,11 @@ bool LaunchFlintWmmaAttention(
 
 /// The batched-path KV write kernel, exposed for callers whose attention
 /// reads the cache directly (the flint WMMA route) and therefore must
-/// stage the current chunk's K/V first. Writes every non-null plane.
+/// stage the current chunk's K/V first. Writes every non-null plane
+/// (fp32 and/or the token-major f16 twin).
 void LaunchBatchedKvWrite(const float* k, const float* v,
                           float* k_cache, float* v_cache,
+                          void* k_cache_f16, void* v_cache_f16,
                           std::uint32_t layer_idx, std::uint32_t start_pos,
                           std::size_t batch_size, std::uint32_t max_context,
                           std::uint32_t num_kv_heads, std::uint32_t head_dim,

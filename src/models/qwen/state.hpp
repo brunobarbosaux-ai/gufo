@@ -246,6 +246,14 @@ public:
   }
   void AdvancePos() noexcept { ++current_pos_; }
 
+  /// Stores K/V through the f16 grid (round-to-nearest-even) on write —
+  /// mirrors the GPU's f16 KV twin planes (GUFO_FLINT_KV_F16) so the CPU
+  /// oracle computes the same math and the G3 gate keeps its teeth. Only
+  /// the flint write path (FlintWriteKv) honors this; the qwen forward
+  /// writes through the slices directly and is unaffected.
+  void SetF16Rounding(bool on) noexcept { f16_rounding_ = on; }
+  [[nodiscard]] bool StoresF16() const noexcept { return f16_rounding_; }
+
   [[nodiscard]] std::span<float> GetKeySlice(std::uint32_t layer,
                                              std::uint32_t kv_head,
                                              std::uint32_t pos) noexcept;
@@ -268,6 +276,7 @@ private:
   std::uint32_t current_pos_{0};
   std::vector<float> k_data_;
   std::vector<float> v_data_;
+  bool f16_rounding_{false};
 };
 
 /// Preallocated activation scratch arena for zero-heap-allocation decode

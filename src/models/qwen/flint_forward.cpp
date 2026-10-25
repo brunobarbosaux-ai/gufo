@@ -132,17 +132,33 @@ void FlintMoeForward(std::span<const float> x, const FlintLayerWeights& layer,
   }
 }
 
+/// Host-side f16 round-to-nearest-even (the __float2half_rn semantics the
+/// GPU KV-write kernels use): rounds through the binary16 grid. Used by the
+/// CPU oracle's KV write when the cache mirrors the GPU's f16 twin planes.
+inline float RoundThroughF16(float value) noexcept {
+  const _Float16 half = static_cast<_Float16>(value);
+  return static_cast<float>(half);
+}
+
 void FlintWriteKv(const std::span<float>& k, const std::span<float>& v,
                   QwenKvCache& kv, std::uint32_t layer_idx,
                   std::uint32_t num_kv_heads, std::uint32_t head_dim,
                   std::uint32_t pos) noexcept {
+  const bool f16 = kv.StoresF16();
   for (std::uint32_t kv_h = 0; kv_h < num_kv_heads; ++kv_h) {
     const auto k_src = k.subspan(static_cast<std::size_t>(kv_h) * head_dim,
                                  head_dim);
     const auto v_src = v.subspan(static_cast<std::size_t>(kv_h) * head_dim,
                                  head_dim);
-    std::ranges::copy(k_src, kv.GetKeySlice(layer_idx, kv_h, pos).begin());
-    std::ranges::copy(v_src, kv.GetValueSlice(layer_idx, kv_h, pos).begin());
+    const auto k_dst = kv.GetKeySlice(layer_idx, kv_h, pos);
+    const auto v_dst = kv.GetValueSlice(layer_idx, kv_h, pos);
+    if (f16) {
+      std::ranges::transform(k_src, k_dst.begin(), RoundThroughF16);
+      std::ranges::transform(v_src, v_dst.begin(), RoundThroughF16);
+    } else {
+      std::ranges::copy(k_src, k_dst.begin());
+      std::ranges::copy(v_src, v_dst.begin());
+    }
   }
 }
 

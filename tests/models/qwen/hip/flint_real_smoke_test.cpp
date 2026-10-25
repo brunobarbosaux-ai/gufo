@@ -1505,6 +1505,14 @@ int main(int argc, char** argv) {
   gufo::models::QwenKvCache kv(config.num_layers,
                                config.num_key_value_heads, max_context,
                                config.head_dim);
+  // Mirror the GPU's f16 KV twin planes (GUFO_FLINT_KV_F16=1 opts in —
+  // default OFF while the serve determinism issue is open): round-once-
+  // at-write is part of the computation under test, so the CPU oracle
+  // stores the same rounded K/V and the G3 gate keeps its teeth.
+  kv.SetF16Rounding([] {
+    const char* v = std::getenv("GUFO_FLINT_KV_F16");
+    return v != nullptr && v[0] == '1';
+  }());
   gufo::models::FlintScratchArena arena(config);
   std::vector<float> cpu_logits(config.vocab_size);
 
@@ -1553,10 +1561,22 @@ int main(int argc, char** argv) {
                           gpu_logits.size() * sizeof(float),
                           hipMemcpyDeviceToHost));
       const auto parity = CompareLogits(cpu_logits, gpu_logits);
-      Expect(parity.cosine >= 0.999,
+      // G3 thresholds: under the f16 KV mirror both sides store the same
+      // rounded K/V, but the f16 grid noise compounds through the
+      // trajectory and forks near-ties (this artifact is near-tie-prone —
+      // findings 18/19; the fp32 run already shows step 4 elevated at
+      // 3.6e-4, and under f16 step 4's cycle-restart tie forks with
+      // dlogp ~5.8 while cos stays >= 0.995 and the token sequence holds).
+      // Cosine is the bug-catcher here (a cache addressing bug craters it
+      // at step 0, not drift); dlogp only bounds the fork depth. The fp32
+      // path keeps the original gates.
+      const bool f16_kv = kv.StoresF16();
+      const double cos_gate = f16_kv ? 0.995 : 0.999;
+      const double logp_gate = f16_kv ? 10.0 : 5e-3;
+      Expect(parity.cosine >= cos_gate,
              "cosine at step " + std::to_string(step) + " = " +
                  std::to_string(parity.cosine));
-      Expect(parity.max_logp_diff <= 5e-3,
+      Expect(parity.max_logp_diff <= logp_gate,
              "max |delta log p| at step " + std::to_string(step) + " = " +
                  std::to_string(parity.max_logp_diff));
       Expect(parity.argmax_cpu == parity.argmax_gpu,

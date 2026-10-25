@@ -9,11 +9,15 @@
 
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
+#include "src/models/qwen/hip/detail/flint_kv.hpp"
 #include "src/models/qwen/hip/kernels/attention_decode_split_k.hpp"
 #include "src/models/qwen/hip/kernels/attention_decode_verify_wave64.hpp"
 #include "src/models/qwen/hip/ops/attention.hpp"
 
 namespace gufo::hip {
+
+using detail::FlintKvLoad;
+using detail::FlintKvOffset;
 
 __global__ void WriteKVCacheKernel(
     const float* __restrict__ k, const float* __restrict__ v,
@@ -66,9 +70,10 @@ __device__ __forceinline__ float4 LoadHalf4(const __half* source) {
 
 // Long-position decode attention (defined below LaunchAttention): online
 // tiled kernel for positions past the LDS score-row budget.
+template <typename KVT = float>
 __global__ void FlintDecodeOnlineAttentionKernel(
-    const float* __restrict__ q, const float* __restrict__ k_cache,
-    const float* __restrict__ v_cache, float* __restrict__ out_context,
+    const float* __restrict__ q, const KVT* __restrict__ k_cache,
+    const KVT* __restrict__ v_cache, float* __restrict__ out_context,
     std::uint32_t layer_idx, std::uint32_t pos, std::uint32_t max_context,
     std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t head_dim,
     detail::FlintKernelPolicy policy);
@@ -938,7 +943,15 @@ void LaunchAttention(const float* q, const float* k, const float* v,
       // Past the LDS budget the baseline cannot even launch (dynamic
       // shared > 64 KiB — the device-lost at position 16129). The online
       // tile kernel needs no score row and carries the same sink/window
-      // semantics; fp32 caches only (the decode step's plane).
+      // semantics; both cache planes supported.
+      if (k_cache_f16 != nullptr && v_cache_f16 != nullptr) {
+        detail::EmitAttentionDispatch("decode_online_flint_f16", "");
+        FlintDecodeOnlineAttentionKernel<__half><<<num_heads, 256, 0, stream>>>(
+            q, static_cast<const __half*>(k_cache_f16),
+            static_cast<const __half*>(v_cache_f16), out_context, layer_idx,
+            pos, max_context, num_heads, num_kv_heads, head_dim, flint);
+        return;
+      }
       if (k_cache != nullptr && v_cache != nullptr) {
         detail::EmitAttentionDispatch("decode_online_flint", "");
         FlintDecodeOnlineAttentionKernel<<<num_heads, 256, 0, stream>>>(
@@ -947,7 +960,7 @@ void LaunchAttention(const float* q, const float* k, const float* v,
         return;
       }
       throw std::invalid_argument(
-          "flint decode attention past the LDS budget requires fp32 caches");
+          "flint decode attention past the LDS budget requires a KV cache");
     }
     if (k_cache != nullptr && v_cache != nullptr) {
       detail::EmitAttentionDispatch(
@@ -978,9 +991,10 @@ void LaunchAttention(const float* q, const float* k, const float* v,
 /// no value. The per-thread O accumulator keeps one output dim, so the
 /// final normalization divides one register. Fixed tile order keeps the
 /// summation order independent of anything but position (deterministic).
+template <typename KVT>
 __global__ void FlintDecodeOnlineAttentionKernel(
-    const float* __restrict__ q, const float* __restrict__ k_cache,
-    const float* __restrict__ v_cache, float* __restrict__ out_context,
+    const float* __restrict__ q, const KVT* __restrict__ k_cache,
+    const KVT* __restrict__ v_cache, float* __restrict__ out_context,
     std::uint32_t layer_idx, std::uint32_t pos, std::uint32_t max_context,
     std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t head_dim,
     detail::FlintKernelPolicy policy) {
@@ -1024,15 +1038,12 @@ __global__ void FlintDecodeOnlineAttentionKernel(
     // 1. Scores for this tile (thread-strided over keys, full dot per key).
     for (std::size_t i = tid; i < n; i += kTile) {
       const std::size_t p = tile + i;
-      const std::size_t p_offset =
-          (((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) *
-                max_context +
-            p) *
-           head_dim);
-      const float* k_p = k_cache + p_offset;
+      const std::size_t p_offset = FlintKvOffset<KVT>(
+          layer_idx, kv_h, p, num_kv_heads, max_context, head_dim);
+      const KVT* k_p = k_cache + p_offset;
       float dot = 0.0F;
       for (std::size_t d = 0; d < head_dim; ++d) {
-        dot += q_h[d] * k_p[d];
+        dot += q_h[d] * FlintKvLoad(k_p + d);
       }
       s_scores[i] = dot * scale;
     }
@@ -1078,13 +1089,10 @@ __global__ void FlintDecodeOnlineAttentionKernel(
     // 4. O accumulation: rescale then add this tile's weighted V row.
     if (tid < head_dim) {
       o *= alpha;
-      const std::size_t v_base =
-          ((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) *
-               max_context +
-           tile) *
-          head_dim;
       for (std::size_t i = 0; i < n; ++i) {
-        o += s_scores[i] * v_cache[v_base + i * head_dim + tid];
+        const std::size_t v_offset = FlintKvOffset<KVT>(
+            layer_idx, kv_h, tile + i, num_kv_heads, max_context, head_dim);
+        o += s_scores[i] * FlintKvLoad(v_cache + v_offset + tid);
       }
     }
     __syncthreads();

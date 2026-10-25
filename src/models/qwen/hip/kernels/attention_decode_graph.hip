@@ -5,11 +5,16 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
+#include "src/models/qwen/hip/detail/flint_kv.hpp"
 #include "src/models/qwen/hip/ops/attention.hpp"
 
 namespace gufo::hip {
+
+using detail::FlintKvLoad;
+using detail::FlintKvOffset;
 
 __global__ void WriteKVCachePtrKernel(
     const float* __restrict__ k, const float* __restrict__ v,
@@ -300,10 +305,10 @@ __launch_bounds__(32) __global__ void QwenDecodeOnlineAttentionHalfPtrKernel(
 /// sliding window at 513; global: max_context on the 4096/8192 ladder —
 /// 8192 floats + the 1 KiB reduce row is the 64 KiB static-LDS ceiling;
 /// beyond it the online-tile kernel takes over, as in the legacy path).
-template <std::size_t kSpan>
+template <std::size_t kSpan, typename KVT = float>
 __global__ void AttentionKernelGraph(
     const float* __restrict__ q, const float* __restrict__ gate,
-    const float* __restrict__ k_cache, const float* __restrict__ v_cache,
+    const KVT* __restrict__ k_cache, const KVT* __restrict__ v_cache,
     float* __restrict__ out_context, std::uint32_t layer_idx,
     const std::uint32_t* __restrict__ d_pos, std::uint32_t max_context,
     std::uint32_t num_heads, std::uint32_t num_kv_heads,
@@ -339,16 +344,13 @@ __global__ void AttentionKernelGraph(
 
   // Step 1: Compute scores for each position p = p_begin..seq_len-1
   for (std::size_t p = p_begin; p < seq_len; ++p) {
-    const std::size_t p_offset =
-        (((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) *
-              max_context +
-          p) *
-         head_dim);
-    const float* k_p = k_cache + p_offset;
+    const std::size_t p_offset = FlintKvOffset<KVT>(
+        layer_idx, kv_h, p, num_kv_heads, max_context, head_dim);
+    const KVT* k_p = k_cache + p_offset;
 
     float dot = 0.0F;
     for (std::size_t d = tid; d < head_dim; d += blockDim.x) {
-      dot += q_h[d] * k_p[d];
+      dot += q_h[d] * FlintKvLoad(k_p + d);
     }
     s_scratch[tid] = dot;
     __syncthreads();
@@ -412,13 +414,10 @@ __global__ void AttentionKernelGraph(
   if (tid < head_dim) {
     float ctx = 0.0F;
     for (std::size_t p = p_begin; p < seq_len; ++p) {
-      const std::size_t p_offset =
-          (((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) *
-                max_context +
-            p) *
-           head_dim);
-      const float* v_p = v_cache + p_offset;
-      ctx += s_scores[p - p_begin] * v_p[tid];
+      const std::size_t p_offset = FlintKvOffset<KVT>(
+          layer_idx, kv_h, p, num_kv_heads, max_context, head_dim);
+      const KVT* v_p = v_cache + p_offset;
+      ctx += s_scores[p - p_begin] * FlintKvLoad(v_p + tid);
     }
 
     if (gate != nullptr) {
@@ -435,9 +434,10 @@ __global__ void AttentionKernelGraph(
 /// from device memory so a captured graph serves every position. Fixed grid
 /// (num_heads blocks, 256 threads) and fixed LDS (two 256-float rows) — the
 /// graph-capture requirements the baseline's seq-sized score row breaks.
+template <typename KVT = float>
 __global__ void FlintDecodeOnlineAttentionPtrKernel(
-    const float* __restrict__ q, const float* __restrict__ k_cache,
-    const float* __restrict__ v_cache, float* __restrict__ out_context,
+    const float* __restrict__ q, const KVT* __restrict__ k_cache,
+    const KVT* __restrict__ v_cache, float* __restrict__ out_context,
     std::uint32_t layer_idx, const std::uint32_t* __restrict__ d_pos,
     std::uint32_t max_context, std::uint32_t num_heads,
     std::uint32_t num_kv_heads, std::uint32_t head_dim,
@@ -483,15 +483,12 @@ __global__ void FlintDecodeOnlineAttentionPtrKernel(
     // 1. Scores for this tile (thread-strided over keys, full dot per key).
     for (std::size_t i = tid; i < n; i += kTile) {
       const std::size_t p = tile + i;
-      const std::size_t p_offset =
-          (((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) *
-                max_context +
-            p) *
-           head_dim);
-      const float* k_p = k_cache + p_offset;
+      const std::size_t p_offset = FlintKvOffset<KVT>(
+          layer_idx, kv_h, p, num_kv_heads, max_context, head_dim);
+      const KVT* k_p = k_cache + p_offset;
       float dot = 0.0F;
       for (std::size_t d = 0; d < head_dim; ++d) {
-        dot += q_h[d] * k_p[d];
+        dot += q_h[d] * FlintKvLoad(k_p + d);
       }
       s_scores[i] = dot * scale;
     }
@@ -537,13 +534,10 @@ __global__ void FlintDecodeOnlineAttentionPtrKernel(
     // 4. O accumulation: rescale then add this tile's weighted V row.
     if (tid < head_dim) {
       o *= alpha;
-      const std::size_t v_base =
-          ((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) *
-               max_context +
-           tile) *
-          head_dim;
       for (std::size_t i = 0; i < n; ++i) {
-        o += s_scores[i] * v_cache[v_base + i * head_dim + tid];
+        const std::size_t v_offset = FlintKvOffset<KVT>(
+            layer_idx, kv_h, tile + i, num_kv_heads, max_context, head_dim);
+        o += s_scores[i] * FlintKvLoad(v_cache + v_offset + tid);
       }
     }
     __syncthreads();
@@ -575,11 +569,46 @@ void LaunchAttention(const float* q, const float* k, const float* v,
   // Past the 64 KiB LDS budget (span > 16384) the online-tile kernel takes
   // over, exactly like the legacy path past 16128.
   if (policy != nullptr) {
+    const std::size_t span_needed =
+        policy->window != 0
+            ? std::min<std::size_t>(policy->window, max_context)
+            : max_context;
+    if (k_cache_f16 != nullptr && v_cache_f16 != nullptr) {
+      // f16 KV plane (GUFO_FLINT_KV_F16): the same ladder with f16 loads —
+      // half the KV bytes per global-layer decode step, the long-context
+      // lever. Arithmetic otherwise identical (f16 values are the rn-rounded
+      // fp32 plane values; prefill's WMMA fragments already consume exactly
+      // these).
+      const auto* k16 = static_cast<const __half*>(k_cache_f16);
+      const auto* v16 = static_cast<const __half*>(v_cache_f16);
+      if (span_needed <= 513) {
+        detail::EmitAttentionDispatch("decode_baseline_flint_graph_f16", "");
+        AttentionKernelGraph<513, __half><<<num_heads, 256, 0, stream>>>(
+            q, gate, k16, v16, out_context, layer_idx, d_pos, max_context,
+            num_heads, num_kv_heads, head_dim, *policy);
+        return;
+      }
+      if (span_needed <= 4096) {
+        detail::EmitAttentionDispatch("decode_baseline_flint_graph_f16", "");
+        AttentionKernelGraph<4096, __half><<<num_heads, 256, 0, stream>>>(
+            q, gate, k16, v16, out_context, layer_idx, d_pos, max_context,
+            num_heads, num_kv_heads, head_dim, *policy);
+        return;
+      }
+      if (span_needed <= 8192) {
+        detail::EmitAttentionDispatch("decode_baseline_flint_graph_f16", "");
+        AttentionKernelGraph<8192, __half><<<num_heads, 256, 0, stream>>>(
+            q, gate, k16, v16, out_context, layer_idx, d_pos, max_context,
+            num_heads, num_kv_heads, head_dim, *policy);
+        return;
+      }
+      detail::EmitAttentionDispatch("decode_online_flint_graph_f16", "");
+      FlintDecodeOnlineAttentionPtrKernel<__half><<<num_heads, 256, 0, stream>>>(
+          q, k16, v16, out_context, layer_idx, d_pos, max_context, num_heads,
+          num_kv_heads, head_dim, *policy);
+      return;
+    }
     if (k_cache != nullptr && v_cache != nullptr) {
-      const std::size_t span_needed =
-          policy->window != 0
-              ? std::min<std::size_t>(policy->window, max_context)
-              : max_context;
       if (span_needed <= 513) {
         detail::EmitAttentionDispatch("decode_baseline_flint_graph", "");
         AttentionKernelGraph<513><<<num_heads, 256, 0, stream>>>(
@@ -611,7 +640,7 @@ void LaunchAttention(const float* q, const float* k, const float* v,
       return;
     }
     detail::EmitAttentionDispatch(
-        "none", "decode_online_flint_graph: requires_fp32_caches");
+        "none", "decode_online_flint_graph: requires_cache");
     return;
   }
 
