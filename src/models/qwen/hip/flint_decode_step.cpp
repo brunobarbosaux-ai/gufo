@@ -219,7 +219,7 @@ void RunFlintLayer(const models::FlintModelWeights& weights,
         FusedMoESupported(layer.ffn_down_shexp.type) &&
         used + 1 <= kFlintMoeMaxJobs &&
         b.expert_weights_full != nullptr && b.act_moe != nullptr &&
-        b.expert_job_list != nullptr;
+        b.expert_job_list != nullptr && b.moe_partials != nullptr;
     if (fused) {
       const std::size_t gate_slab_bytes =
           quant::EncodedSizeBytes(layer.ffn_gate_exps.type, expert_slab);
@@ -247,7 +247,8 @@ void RunFlintLayer(const models::FlintModelWeights& weights,
       LaunchFlintFusedMoEDown(layer.ffn_down_exps.data,
                               layer.ffn_down_shexp.data,
                               layer.ffn_down_exps.type,
-                              layer.ffn_down_shexp.type, b.act_moe, b.mlp_out,
+                              layer.ffn_down_shexp.type, b.act_moe,
+                              b.moe_partials, b.mlp_out,
                               b.expert_weights_full, b.expert_job_list,
                               used + 1, config.expert_count,
                               expert_ff, shared_ff, hidden_size,
@@ -346,7 +347,8 @@ void ResolveDecodeTimings(FlintDecodeTimings& timings,
   }
   if (b.k_cache == nullptr || b.v_cache == nullptr ||
       b.d_out_token == nullptr || b.expert_weights_full == nullptr ||
-      b.act_moe == nullptr || b.expert_job_list == nullptr) {
+      b.act_moe == nullptr || b.expert_job_list == nullptr ||
+      b.moe_partials == nullptr) {
     return false;
   }
   for (const auto& layer : weights.layers) {
@@ -439,12 +441,21 @@ void ExecuteFlintDecodeStep(const models::FlintModelWeights& weights,
     }
     return h;
   };
-  if (kv_debug && pos < 40) {
-    // Recent-window hash: rows [max(0,pos-63), pos] — the region the
-    // current step actually reads most of; a fixed [0,64) hash never
-    // covers the mid-generation rows where a divergence would live.
-    const std::uint32_t lo = pos >= 63 ? pos - 63 : 0;
-    const std::uint32_t n = pos - lo + 1;
+  if (kv_debug) {
+    // The instrument reads with hipMemcpy (legacy NULL stream); the arena
+    // stream is a blocking stream so the copies serialize after it — but
+    // only if we sync first: queued (not yet scheduled) work would otherwise
+    // let the copies run BEFORE the step's kernels land (the night-3
+    // "frozen zeros" readings were exactly this lag, void).
+    HIP_CHECK(hipStreamSynchronize(b.stream));
+    // Cross-request probe: rows [0, pos) — every row in that window was
+    // written by THIS request (prefill rows [0, prompt) + decode rows
+    // [prompt, pos)), so for identical requests the per-step hash sequences
+    // must match bit-exactly. (The old [pos-63, pos] window mixed in the
+    // not-yet-rewritten tail — stale rows from the previous request — and
+    // could not be compared across runs.)
+    const std::uint32_t lo = 0;
+    const std::uint32_t n = pos;
     const std::size_t kv_width =
         static_cast<std::size_t>(config.num_key_value_heads) *
         config.head_dim;
@@ -508,43 +519,41 @@ void ExecuteFlintDecodeStep(const models::FlintModelWeights& weights,
     for (const float v : v32_rows) {
       v32_h = kv_hash(&v, sizeof(v)) ^ (v32_h << 1);
     }
-    // Raw last-written row (layer 0, kv 0) in both planes — distinguishes
-    // "never written" (zeros) from "written with divergent values".
-    float raw32[8] = {};
-    std::uint16_t raw16[8] = {};
-    const std::uint32_t last = pos;
-    HIP_CHECK(hipMemcpy(raw32, b.k_cache + last * config.head_dim,
-                        sizeof(raw32), hipMemcpyDeviceToHost));
-    if (b.k_cache_f16 != nullptr) {
-      HIP_CHECK(hipMemcpy(
-          raw16,
-          b.k_cache_f16 + static_cast<std::size_t>(last) * kv_width,
-          sizeof(raw16), hipMemcpyDeviceToHost));
-    }
     static const void* prev_k = nullptr;
     std::uint32_t ctl[2] = {};
     if (graph != nullptr && graph->d_control != nullptr) {
       HIP_CHECK(hipMemcpy(ctl, graph->d_control, sizeof(ctl),
                           hipMemcpyDeviceToHost));
     }
+    // Previous-step final hidden + logits hashes: b.hidden/b.logits still
+    // hold the last step's outputs at this point (the step hasn't run).
+    // Cross-run diffs quantify device-side numeric noise directly.
+    std::uint32_t hid_h = 0;
+    std::uint32_t lg_h = 0;
+    {
+      std::vector<float> buf(hidden_size);
+      HIP_CHECK(hipMemcpy(buf.data(), b.hidden,
+                          hidden_size * sizeof(float),
+                          hipMemcpyDeviceToHost));
+      for (const float v : buf) {
+        hid_h = kv_hash(&v, sizeof(v)) ^ (hid_h << 1);
+      }
+      std::vector<float> lg(config.vocab_size);
+      HIP_CHECK(hipMemcpy(lg.data(), b.logits,
+                          config.vocab_size * sizeof(float),
+                          hipMemcpyDeviceToHost));
+      for (const float v : lg) {
+        lg_h = kv_hash(&v, sizeof(v)) ^ (lg_h << 1);
+      }
+    }
     std::fprintf(stderr,
-                 "kvdbg pos=%u ctl=[%u,%u] kc=%p k16c=%p same=%d k32=%08x "
-                 "k16=%08x v32=%08x last32=",
+                 "kvdbg pos=%u ctl=[%u,%u] kc=%p k16c=%p same=%d "
+                 "k32=%08x k16=%08x v32=%08x H=%08x LG=%08x\n",
                  pos, ctl[0], ctl[1], static_cast<const void*>(b.k_cache),
                  static_cast<const void*>(b.k_cache_f16),
                  prev_k == static_cast<const void*>(b.k_cache), f32_h,
-                 f16_h, v32_h);
+                 f16_h, v32_h, hid_h, lg_h);
     prev_k = b.k_cache;
-    for (int i = 0; i < 4; ++i) {
-      std::fprintf(stderr, "%+.4f,", raw32[i]);
-    }
-    std::fprintf(stderr, " last16=");
-    for (int i = 0; i < 4; ++i) {
-      const float h = __half2float(*reinterpret_cast<const __half*>(
-          &raw16[i]));
-      std::fprintf(stderr, "%+.4f,", h);
-    }
-    std::fprintf(stderr, "\n");
   }
 
   // Graph mode (3.1): eligibility is decided once; one exec per tail
@@ -572,7 +581,15 @@ void ExecuteFlintDecodeStep(const models::FlintModelWeights& weights,
       }
       if (graph->supported && executor.IsCaptured()) {
         LaunchFlintWriteControl(graph->d_control, token_id, pos, b.stream);
-        executor.Launch(b.stream, detail::HipGraphCaptureKey{});
+        if (!executor.Launch(b.stream, detail::HipGraphCaptureKey{})) {
+          // A failed graph launch would silently reuse the previous step's
+          // logits/hidden — the exact "wandering outputs" signature. Make it
+          // impossible to miss while debugging.
+          std::fprintf(stderr,
+                       "flint: decode graph launch FAILED (pos=%u) — step "
+                       "not computed\n",
+                       pos);
+        }
         return;
       }
     }

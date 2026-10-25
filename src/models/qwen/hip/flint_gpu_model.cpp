@@ -192,6 +192,7 @@ FlintGpuArena::FlintGpuArena(const core::ModelConfig& config,
                       sizeof(std::uint32_t)));
   HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&buffers_.expert_job_list),
                       gufo::hip::kFlintMoeMaxJobs * sizeof(int)));
+  buffers_.moe_partials = alloc(gufo::hip::kFlintMoeMaxJobs * hidden_size);
   buffers_.max_context = max_context;
   HIP_CHECK(hipStreamCreate(&buffers_.stream));
 

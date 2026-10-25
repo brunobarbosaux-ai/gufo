@@ -732,7 +732,8 @@ void ProbeMoEBranch(const gufo::models::FlintModelWeights& gpu_weights,
       8 +  // selected weights (top-k readback)
       config.expert_count + 1 +  // weights_full
       expert_ff +  // act
-      config.expert_count * expert_ff + shared_ff;  // act_moe
+      config.expert_count * expert_ff + shared_ff +  // act_moe
+      gufo::hip::kFlintMoeMaxJobs * hidden;  // down partials (3.6)
   float* block_start = nullptr;
   HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&block_start),
                       scratch_floats * sizeof(float)));
@@ -751,6 +752,8 @@ void ProbeMoEBranch(const gufo::models::FlintModelWeights& gpu_weights,
   float* expert_out = carve(hidden);
   float* mlp_legacy = carve(hidden);
   float* mlp_fused = carve(hidden);
+  float* moe_partials =
+      carve(gufo::hip::kFlintMoeMaxJobs * hidden);  // 3.6 down partials
   // Compacted job list for the fused kernels (router fills it per layer).
   int* job_list = nullptr;
   HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&job_list),
@@ -847,7 +850,8 @@ void ProbeMoEBranch(const gufo::models::FlintModelWeights& gpu_weights,
     gufo::hip::LaunchFlintFusedMoEDown(layer.ffn_down_exps.data,
                                        layer.ffn_down_shexp.data,
                                        layer.ffn_down_exps.type,
-                                       layer.ffn_down_shexp.type, act_moe, mlp,
+                                       layer.ffn_down_shexp.type, act_moe,
+                                       moe_partials, mlp,
                                        weights_full, job_list,
                                        config.expert_used_count + 1,
                                        config.expert_count, expert_ff,
@@ -914,7 +918,8 @@ void ProbeMoEBranch(const gufo::models::FlintModelWeights& gpu_weights,
       gufo::hip::LaunchFlintFusedMoEDown(
           layer.ffn_down_exps.data, layer.ffn_down_shexp.data,
           layer.ffn_down_exps.type, layer.ffn_down_shexp.type, act_moe,
-          mlp_fused, weights_full, job_list, config.expert_used_count + 1,
+          moe_partials, mlp_fused, weights_full, job_list,
+          config.expert_used_count + 1,
           config.expert_count, expert_ff, shared_ff, hidden,
           gufo::quant::EncodedSizeBytes(layer.ffn_down_exps.type,
                                         expert_slab),

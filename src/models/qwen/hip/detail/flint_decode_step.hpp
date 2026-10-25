@@ -53,6 +53,12 @@ struct FlintGpuStepBuffers {
   /// kFlintMoeMaxJobs ints. The fused kernels index experts through it so
   /// their grids span only real jobs.
   int* expert_job_list = nullptr;
+  /// Deterministic MoE accumulation (3.6): per-job-slot down-projection
+  /// partials, kFlintMoeMaxJobs * hidden floats. The down kernel writes the
+  /// disjoint slot rows; FlintFusedMoEReduceKernel sums them in job order
+  /// (the atomicAdd it replaces ordered float adds by wave schedule —
+  /// run-to-run noise that flipped fragile argmax ties).
+  float* moe_partials = nullptr;
   float* logits = nullptr;
 
   float* k_cache = nullptr;

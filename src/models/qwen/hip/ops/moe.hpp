@@ -74,15 +74,19 @@ void LaunchFlintFusedMoESwiGLU(const void* gate_stack, const void* up_stack,
                                std::size_t up_slab_bytes,
                                hipStream_t stream = nullptr);
 
-/// Fused MoE branch, phase 2 (F-J1): for every job in `job_list` (or every
-/// expert when `job_list` is null), mlp_out += weights_full[e] *
-/// (down_e · act[e]) over hidden rows, accumulated atomically. `slab_bytes`
-/// must be the encoded per-expert slab of the DOWN tensor's own type; the
-/// shared matrix decodes with `shared_type`.
+/// Fused MoE branch, phase 2 (F-J1 + 3.6 determinism): for every job in
+/// `job_list` (or every expert when `job_list` is null) the down kernel
+/// writes weights_full[e] * (down_e · act[e]) for all hidden rows into the
+/// DISJOINT partials[job_slot * hidden + row] slot — no float atomics — and
+/// the reduce kernel then sums the slots in fixed job order into `mlp_out`.
+/// `partials` needs max_jobs * hidden floats. `slab_bytes` must be the
+/// encoded per-expert slab of the DOWN tensor's own type; the shared matrix
+/// decodes with `shared_type`.
 void LaunchFlintFusedMoEDown(const void* down_stack,
                              const void* down_shared, core::GgmlType type,
                              core::GgmlType shared_type, const float* act,
-                             float* mlp_out, const float* weights_full,
+                             float* partials, float* mlp_out,
+                             const float* weights_full,
                              const int* job_list, std::size_t max_jobs,
                              std::size_t expert_count, std::size_t expert_ff,
                              std::size_t shared_ff, std::size_t hidden,

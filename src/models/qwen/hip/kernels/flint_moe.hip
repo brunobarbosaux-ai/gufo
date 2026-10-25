@@ -422,7 +422,7 @@ __global__ void __launch_bounds__(kMoEWavesPerBlock * 32, 4)
         const void* __restrict__ down_stack,
         const void* __restrict__ down_shared, core::GgmlType type,
         core::GgmlType shared_type, const float* __restrict__ act,
-        float* __restrict__ mlp_out, const float* __restrict__ weights_full,
+        float* __restrict__ partials, const float* __restrict__ weights_full,
         int expert_count, std::size_t expert_ff, std::size_t shared_ff,
         std::size_t hidden, std::size_t slab_bytes,
         const int* __restrict__ job_list) {
@@ -443,6 +443,11 @@ __global__ void __launch_bounds__(kMoEWavesPerBlock * 32, 4)
   __syncthreads();
   const bool is_shared = (e == expert_count);
   const std::size_t ff = is_shared ? shared_ff : expert_ff;
+  // Deterministic accumulation (3.6): each job slot owns a disjoint
+  // partials[job_slot * hidden + row] row — written once, no float atomics.
+  // FlintFusedMoEReduceKernel sums the slots in fixed job order.
+  const std::size_t job_slot = blockIdx.x;
+  float* out_rows = partials + job_slot * hidden;
   const void* down = is_shared
                          ? down_shared
                          : static_cast<const char*>(down_stack) +
@@ -494,9 +499,9 @@ __global__ void __launch_bounds__(kMoEWavesPerBlock * 32, 4)
       sum1 += __shfl_xor(sum1, off);
     }
     if (lane == 0) {
-      atomicAdd(&mlp_out[r0], w * sum0);
+      out_rows[r0] = w * sum0;
       if (has_r1) {
-        atomicAdd(&mlp_out[r0 + 1], w * sum1);
+        out_rows[r0 + 1] = w * sum1;
       }
     }
     return;
@@ -558,9 +563,9 @@ __global__ void __launch_bounds__(kMoEWavesPerBlock * 32, 4)
       sum1 += __shfl_xor(sum1, off);
     }
     if (lane == 0) {
-      atomicAdd(&mlp_out[r0], w * sum0);
+      out_rows[r0] = w * sum0;
       if (has_r1) {
-        atomicAdd(&mlp_out[r0 + 1], w * sum1);
+        out_rows[r0 + 1] = w * sum1;
       }
     }
     return;
@@ -572,14 +577,42 @@ __global__ void __launch_bounds__(kMoEWavesPerBlock * 32, 4)
     s1 = QuantWarpBlockDot(dt, down, r0 + 1, act_e, ff, lane, 0, 1);
   }
   if (lane == 0) {
-    atomicAdd(&mlp_out[r0], w * s0);
+    out_rows[r0] = w * s0;
     if (has_r1) {
-      atomicAdd(&mlp_out[r0 + 1], w * s1);
+      out_rows[r0 + 1] = w * s1;
     }
   }
 }
 
 }  // namespace
+
+/// Deterministic MoE accumulation (3.6): the down kernel writes one
+/// disjoint partials row per job slot; this kernel sums the slots in fixed
+/// job-list order and writes the final mlp_out row. Replaces the previous
+/// per-row atomicAdd — float atomic order is wave-scheduling dependent,
+/// which surfaced as run-to-run logit noise (the serve "wander" bug).
+__global__ void FlintFusedMoEReduceKernel(
+    const float* __restrict__ partials, const int* __restrict__ job_list,
+    const float* __restrict__ weights_full, float* __restrict__ mlp_out,
+    std::size_t hidden, int jobs) {
+  const std::size_t row =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (row >= hidden) {
+    return;
+  }
+  float acc = 0.0F;
+  for (int j = 0; j < jobs; ++j) {
+    const int e = job_list[j];
+    if (e < 0) {
+      continue;
+    }
+    if (weights_full[e] == 0.0F) {
+      continue;  // the down kernel left this job's slot unwritten
+    }
+    acc += partials[static_cast<std::size_t>(j) * hidden + row];
+  }
+  mlp_out[row] = acc;
+}
 
 void LaunchFlintRouterTopK(const float* logits, std::size_t expert_count,
                            std::uint32_t used, bool norm, float scale,
@@ -628,7 +661,8 @@ void LaunchFlintFusedMoESwiGLU(const void* gate_stack, const void* up_stack,
 void LaunchFlintFusedMoEDown(const void* down_stack,
                              const void* down_shared, core::GgmlType type,
                              core::GgmlType shared_type, const float* act,
-                             float* mlp_out, const float* weights_full,
+                             float* partials, float* mlp_out,
+                             const float* weights_full,
                              const int* job_list, std::size_t max_jobs,
                              std::size_t expert_count, std::size_t expert_ff,
                              std::size_t shared_ff, std::size_t hidden,
@@ -638,9 +672,13 @@ void LaunchFlintFusedMoEDown(const void* down_stack,
   const dim3 grid(jobs,
                   (hidden + kMoERowsPerBlock - 1) / kMoERowsPerBlock);
   FlintFusedMoEDownKernel<<<grid, kMoEWavesPerBlock * 32, 0, stream>>>(
-      down_stack, down_shared, type, shared_type, act, mlp_out, weights_full,
+      down_stack, down_shared, type, shared_type, act, partials, weights_full,
       static_cast<int>(expert_count), expert_ff, shared_ff, hidden,
       slab_bytes, job_list);
+  FlintFusedMoEReduceKernel<<<static_cast<unsigned>((hidden + 255) / 256), 256,
+                              0, stream>>>(
+      partials, job_list, weights_full, mlp_out, hidden,
+      static_cast<int>(jobs));
 }
 
 void LaunchFlintExpertAccumulate(float* out, const float* expert_out,
