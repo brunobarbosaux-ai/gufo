@@ -595,13 +595,11 @@ void LaunchAttention(const float* q, const float* k, const float* v,
             num_heads, num_kv_heads, head_dim, *policy);
         return;
       }
-      if (span_needed <= 8192) {
-        detail::EmitAttentionDispatch("decode_baseline_flint_graph_f16", "");
-        AttentionKernelGraph<8192, __half><<<num_heads, 256, 0, stream>>>(
-            q, gate, k16, v16, out_context, layer_idx, d_pos, max_context,
-            num_heads, num_kv_heads, head_dim, *policy);
-        return;
-      }
+      // 3.7: the fixed-LDS <8192> tier measured 2.4x SLOWER than the
+      // online-tile at 6.6K spans (night-4: doc decode 8.2 vs 19.8 t/s came
+      // from -c selecting this tier). Route every span above the <4096>
+      // tier to the online-tile so the fast path is the default, not a
+      // -c accident.
       detail::EmitAttentionDispatch("decode_online_flint_graph_f16", "");
       FlintDecodeOnlineAttentionPtrKernel<__half><<<num_heads, 256, 0, stream>>>(
           q, k16, v16, out_context, layer_idx, d_pos, max_context, num_heads,
@@ -623,13 +621,9 @@ void LaunchAttention(const float* q, const float* k, const float* v,
             max_context, num_heads, num_kv_heads, head_dim, *policy);
         return;
       }
-      if (span_needed <= 8192) {
-        detail::EmitAttentionDispatch("decode_baseline_flint_graph", "");
-        AttentionKernelGraph<8192><<<num_heads, 256, 0, stream>>>(
-            q, gate, k_cache, v_cache, out_context, layer_idx, d_pos,
-            max_context, num_heads, num_kv_heads, head_dim, *policy);
-        return;
-      }
+      // 3.7: same routing as the f16 branch — the <8192> fixed-LDS tier is
+      // 2.4x slower than online-tile at 6.6K spans; online-tile takes over
+      // above the <4096> tier.
       // 8192 floats + the 1 KiB reduce row is the static-LDS ceiling (the
       // 16384 tier would exceed the 64 KiB block budget); beyond it the
       // online-tile kernel takes over, as in the legacy path past 16128.
