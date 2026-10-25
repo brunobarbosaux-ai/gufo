@@ -131,6 +131,69 @@ void TestKeyRangeEdges() {
   std::cout << "TestKeyRangeEdges ok\n";
 }
 
+void TestWindow513Multiples() {
+  // F-D7 boundary cases from item 1.8: prompts shorter than the window,
+  // the exact window multiples 513*k, and the 1024-token prefill chunk
+  // edges. KeyRangeStart is pos+1-window once pos+1 exceeds the window.
+  auto policy = BasePolicy();
+  policy.windowed = true;
+  policy.window = 513;
+  Expect(policy.KeyRangeStart(1) == 0, "1-token sequence sees its prefix");
+  Expect(policy.KeyRangeStart(513) == 1, "pos 513 = 513*1 drops key 0");
+  Expect(policy.KeyRangeStart(1024) == 512,
+         "pos 1024 (1024-chunk edge) keeps keys 512..1023");
+  Expect(policy.KeyRangeStart(1537) == 1025, "pos 1537 (3*513-2)");
+  Expect(policy.KeyRangeStart(1538) == 1026, "pos 1538 (3*513-1)");
+  Expect(policy.KeyRangeStart(1539) == 1027, "pos 1539 (3*513)");
+  std::cout << "TestWindow513Multiples ok\n";
+}
+
+void TestSingleTokenSequence() {
+  // F-D7 degenerate: a 1-token sequence attends only itself; with a sink,
+  // the sink still takes its mass share (F-D1 order is position-free).
+  QwenKvCache kv(1, kKvHeads, 16, kHeadDim);
+  FillUniformCache(kv, 0, 1);
+  const std::vector<float> q = {2.0F, 0.0F, 0.0F, 0.0F};
+  std::vector<float> scores(16, 0.0F);
+  std::vector<float> out(kHeadDim, 0.0F);
+
+  auto policy = BasePolicy();
+  policy.windowed = true;
+  policy.window = 513;
+  gufo::models::FlintAttentionReference(policy, q.data(), kv, 0, 0,
+                                        scores.data(), out.data());
+  ExpectNear(out[0], 1.0F, 1e-5F, "1-token sequence attends only itself");
+
+  const float sink = 1.0F;
+  policy.sinks = &sink;
+  gufo::models::FlintAttentionReference(policy, q.data(), kv, 0, 0,
+                                        scores.data(), out.data());
+  ExpectNear(out[0], 0.5F, 1e-5F, "sink shares the 1-key denominator");
+  std::cout << "TestSingleTokenSequence ok\n";
+}
+
+void TestChunkCrossingWindow() {
+  // F-D7 with the flint-real window across a 1024-token prefill chunk
+  // boundary: the query at 1024 must see exactly keys [512, 1024] — the
+  // previous chunk's keys stay reachable through the cache.
+  QwenKvCache kv(1, kKvHeads, 2048, kHeadDim);
+  FillUniformCache(kv, 0, 1025);
+  const std::vector<float> q = {2.0F, 0.0F, 0.0F, 0.0F};
+  std::vector<float> scores(513, 0.0F);
+  std::vector<float> out(kHeadDim, 0.0F);
+
+  auto policy = BasePolicy();
+  policy.windowed = true;
+  policy.window = 513;
+  gufo::models::FlintAttentionReference(policy, q.data(), kv, 0, 1024,
+                                        scores.data(), out.data());
+  // Uniform scores over v[512..1024]: mean = ((512+1) + (1024+1)) / 2 = 769.
+  // Float accumulation over 513 terms costs ~n*ulp(769) ≈ 0.05; missing the
+  // window by one key shifts the mean ~0.5, so 0.1 still discriminates.
+  ExpectNear(out[0], 769.0F, 0.1F, "chunk-crossing window range (F-D7)");
+  std::cout << "TestChunkCrossingWindow ok\n";
+}
+
 void TestWindowIgnoresOldKeys() {
   QwenKvCache kv(1, kKvHeads, 16, kHeadDim);
   FillUniformCache(kv, 0, 6);
@@ -194,6 +257,9 @@ int main() {
   TestSinkEqualScoreSharesMass();
   TestSinkExtremes();
   TestKeyRangeEdges();
+  TestWindow513Multiples();
+  TestSingleTokenSequence();
+  TestChunkCrossingWindow();
   TestWindowIgnoresOldKeys();
   TestGqaGrouping();
   TestPerHeadSinksDiffer();

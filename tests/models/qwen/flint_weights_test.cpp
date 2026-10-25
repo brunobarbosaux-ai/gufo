@@ -21,6 +21,9 @@
 #include "src/core/gguf_reader.hpp"
 #include "src/core/quant/ggml_dequant.hpp"
 
+#include <algorithm>
+#include <memory>
+
 namespace {
 
 void Expect(bool condition, std::string_view msg) {
@@ -142,6 +145,7 @@ class FlintGgufBuilder {
 struct FlintFixtureOptions {
   std::string omit_tensor;  // exact tensor name to drop (negative tests)
   gufo::core::GgmlType router_type = gufo::core::GgmlType::kBF16;
+  std::vector<std::uint8_t> rope_pattern = {0, 1, 1};  // layer 0 NoPE (F-D3)
 };
 
 constexpr std::uint64_t kHidden = 64;
@@ -186,7 +190,7 @@ std::vector<std::uint8_t> BuildFlintFixture(const FlintFixtureOptions& opt = {})
   b.AddMetadataUint32("flint.attention.sliding_window", 8);
   b.AddMetadataUint8Array("flint.attention.sliding_window_pattern",
                           {0, 1, 1});
-  b.AddMetadataUint8Array("flint.attention.rope_pattern", {0, 1, 1});
+  b.AddMetadataUint8Array("flint.attention.rope_pattern", opt.rope_pattern);
 
   const auto F32 = gufo::core::GgmlType::kF32;
   const auto Q8 = gufo::core::GgmlType::kQ8_0;
@@ -450,6 +454,80 @@ void TestForwardModelSmoke() {
   std::cout << "TestForwardModelSmoke ok\n";
 }
 
+// F-D3 (1.8): rope_pattern drives RoPE in the forward path. Two fixtures
+// identical except rope_pattern ({0,1,1} vs {0,0,0}): layer 0 is NoPE in
+// both, so its K is bit-identical across fixtures and position-invariant;
+// layer 1 sees an identical input in both runs (layer 0 unchanged), so its
+// K differs only when the pattern says RoPE — and its V (never rotated)
+// must stay bit-identical.
+void TestNopeHonoredInForward() {
+  const auto bytes_rope = BuildFlintFixture();
+  const auto bytes_nope =
+      BuildFlintFixture({.omit_tensor = "", .rope_pattern = {0, 0, 0}});
+  std::unique_ptr<gufo::core::GgufReader> reader_rope;
+  std::unique_ptr<gufo::core::GgufReader> reader_nope;
+  std::string err;
+  auto* r_rope = OpenFixture(bytes_rope, reader_rope, err);
+  Expect(r_rope != nullptr, "rope fixture opens");
+  auto* r_nope = OpenFixture(bytes_nope, reader_nope, err);
+  Expect(r_nope != nullptr, "nope fixture opens");
+
+  std::string load_err;
+  const auto rope_weights =
+      gufo::models::FlintModelWeights::LoadFromGguf(*r_rope, &load_err);
+  Expect(rope_weights.has_value(), "rope fixture loads: " + load_err);
+  const auto nope_weights =
+      gufo::models::FlintModelWeights::LoadFromGguf(*r_nope, &load_err);
+  Expect(nope_weights.has_value(), "nope fixture loads: " + load_err);
+
+  const auto& config = rope_weights->config;
+  Expect(config.IsRopeLayer(0) == false, "layer 0 NoPE by pattern");
+  Expect(config.IsRopeLayer(1) && config.IsRopeLayer(2),
+         "layers 1-2 apply RoPE by pattern");
+  Expect(config.IsWindowedLayer(0) == false, "layer 0 global by pattern");
+  Expect(config.IsWindowedLayer(1) && config.IsWindowedLayer(2),
+         "layers 1-2 windowed by pattern");
+
+  constexpr std::uint32_t kPos = 7;
+  const auto run_at = [&](const gufo::models::FlintModelWeights& weights,
+                          gufo::models::QwenKvCache& kv) {
+    gufo::models::FlintScratchArena arena(weights.config);
+    std::vector<float> logits(kVocab, 0.0F);
+    gufo::models::FlintForwardModel(0, kPos, weights, kv, arena, logits);
+  };
+  gufo::models::QwenKvCache kv_rope(kLayers, kKvHeads, 1024, kHeadDim);
+  gufo::models::QwenKvCache kv_nope(kLayers, kKvHeads, 1024, kHeadDim);
+  run_at(*rope_weights, kv_rope);
+  run_at(*nope_weights, kv_nope);
+
+  // NoPE layer: K is position-independent and rope_pattern-blind.
+  const auto k0_rope = kv_rope.GetKeySlice(0, 0, kPos);
+  const auto k0_nope = kv_nope.GetKeySlice(0, 0, kPos);
+  Expect(std::equal(k0_rope.begin(), k0_rope.end(), k0_nope.begin()),
+         "NoPE layer K unaffected by rope_pattern (F-D3)");
+  gufo::models::QwenKvCache kv_pos0(kLayers, kKvHeads, 1024, kHeadDim);
+  {
+    gufo::models::FlintScratchArena arena(config);
+    std::vector<float> logits(kVocab, 0.0F);
+    gufo::models::FlintForwardModel(0, 0, *rope_weights, kv_pos0, arena,
+                                    logits);
+  }
+  const auto k0_pos0 = kv_pos0.GetKeySlice(0, 0, 0);
+  Expect(std::equal(k0_pos0.begin(), k0_pos0.end(), k0_rope.begin()),
+         "NoPE layer K is position-invariant (F-D3)");
+
+  // Rope layer: K rotates exactly where the pattern says; V never rotates.
+  const auto k1_rope = kv_rope.GetKeySlice(1, 0, kPos);
+  const auto k1_nope = kv_nope.GetKeySlice(1, 0, kPos);
+  Expect(!std::equal(k1_rope.begin(), k1_rope.end(), k1_nope.begin()),
+         "rope layer K rotates when the pattern says rope (F-D3)");
+  const auto v1_rope = kv_rope.GetValueSlice(1, 0, kPos);
+  const auto v1_nope = kv_nope.GetValueSlice(1, 0, kPos);
+  Expect(std::equal(v1_rope.begin(), v1_rope.end(), v1_nope.begin()),
+         "V is never rotated by RoPE (F-D3)");
+  std::cout << "TestNopeHonoredInForward ok\n";
+}
+
 // F-C3: walk the pinned artifact's real header. Header-only mmap; runs
 // wherever GUFO_FLINT_GGUF is set (skipped elsewhere).
 void TestRealArtifactInventory() {
@@ -468,6 +546,18 @@ void TestRealArtifactInventory() {
   Expect(weights.has_value(), "real artifact loads: " + load_err);
   Expect(weights->layers.size() == 49, "49 layers");
   Expect(weights->config.FullAttentionLayerCount() == 49, "KV 49 layers");
+
+  // F-D3 (1.8): the 14 global layers are exactly the NoPE layers — the
+  // window and rope patterns mirror each other on the pinned artifact.
+  std::size_t global_layers = 0;
+  for (std::uint32_t i = 0; i < weights->config.num_layers; ++i) {
+    if (!weights->config.IsWindowedLayer(i)) {
+      ++global_layers;
+      Expect(!weights->config.IsRopeLayer(i),
+             "global layer " + std::to_string(i) + " is NoPE (F-D3)");
+    }
+  }
+  Expect(global_layers == 14, "14 global layers of 49");
 
   // The UD quantizer mixes Q6_K and Q8_0 gate/up experts across layers;
   // both must be accepted by the projection role (F-C3 coverage proof).
@@ -534,6 +624,7 @@ int main() {
   TestScratchArenaHasNoSsmState();
   TestFlintOptionGate();
   TestForwardModelSmoke();
+  TestNopeHonoredInForward();
   TestRealArtifactInventory();
   std::cout << "flint_weights_test: all tests passed\n";
   return 0;

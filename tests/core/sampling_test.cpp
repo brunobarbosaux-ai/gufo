@@ -1,4 +1,5 @@
 #include "src/core/sampling.hpp"
+#include "src/core/text_sampling_defaults.hpp"
 
 #include <bit>
 #include <cstdlib>
@@ -242,6 +243,74 @@ void TestCompactTargetContract() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// F-H1 (1.9): flint sampling defaults come from the preset, not from Gufo's
+// own defaults. The flint artifact carries no sampler metadata, so the preset
+// supplies T 1.0 / p 0.95 / k 20; explicit request values must still win
+// (presence-independent: an explicit 0 overrides too).
+
+void TestFlintPresetSelection() {
+  using gufo::core::ModelConfig;
+  using gufo::sampling::TextModelPreset;
+  using gufo::sampling::TextPreset;
+
+  ModelConfig flint;
+  flint.architecture = "flint";
+  Expect(TextPreset(flint) == TextModelPreset::kFlint,
+         "flint architecture maps to kFlint");
+
+  ModelConfig other;
+  other.architecture = "llama";
+  Expect(TextPreset(other) == TextModelPreset::kUnspecified,
+         "unknown architecture maps to kUnspecified");
+  std::cout << "TestFlintPresetSelection ok\n";
+}
+
+void TestFlintSamplingDefaults() {
+  using gufo::core::ModelConfig;
+  using gufo::sampling::ResolveTextSampling;
+  using gufo::sampling::SamplingConfig;
+  using gufo::sampling::SamplingOverrides;
+  using gufo::sampling::TextModelPreset;
+  using gufo::sampling::TextPreset;
+
+  ModelConfig flint;
+  flint.architecture = "flint";
+
+  // Gufo's own server defaults (T 0 greedy, p 1, k off) must NOT survive the
+  // flint preset: with no sampler metadata in the artifact, F-H1 pins
+  // T 1.0 / p 0.95 / k 20.
+  SamplingConfig configured;  // T 0.0, top_k 0, top_p 1.0
+  const auto resolved = ResolveTextSampling(TextPreset(flint), std::nullopt,
+                                            configured, SamplingOverrides{});
+  Expect(resolved.temperature == 1.0F, "flint default temperature 1.0 (F-H1)");
+  Expect(resolved.top_p == 0.95F, "flint default top_p 0.95 (F-H1)");
+  Expect(resolved.top_k == 20, "flint default top_k 20 (F-H1)");
+
+  // Explicit request values override the preset — presence, not value: an
+  // explicit top_k 0 (off) and top_p 1.0 must both stick.
+  SamplingConfig requested = configured;
+  requested.temperature = 0.7F;
+  requested.top_k = 0;
+  requested.top_p = 1.0F;
+  SamplingOverrides supplied;
+  supplied.temperature = supplied.top_k = supplied.top_p = true;
+  const auto overridden =
+      ResolveTextSampling(TextPreset(flint), std::nullopt, requested, supplied);
+  Expect(overridden.temperature == 0.7F, "explicit temperature wins");
+  Expect(overridden.top_k == 0, "explicit top_k 0 wins (presence-based)");
+  Expect(overridden.top_p == 1.0F, "explicit top_p wins");
+
+  // An unspecified preset keeps the caller's values untouched.
+  const auto passthrough = ResolveTextSampling(TextModelPreset::kUnspecified,
+                                               std::nullopt, configured,
+                                               SamplingOverrides{});
+  Expect(passthrough.temperature == 0.0F && passthrough.top_k == 0 &&
+             passthrough.top_p == 1.0F,
+         "kUnspecified passthrough keeps configured values");
+  std::cout << "TestFlintSamplingDefaults ok\n";
+}
+
 }  // namespace
 
 int main() {
@@ -251,6 +320,8 @@ int main() {
   TestReasoningBudgetKeepsLiteralAnswer();
   TestReasoningBudgetWithGrammar();
   TestCompactTargetContract();
+  TestFlintPresetSelection();
+  TestFlintSamplingDefaults();
   std::cout << "sampling_test passed\n";
   return 0;
 }
