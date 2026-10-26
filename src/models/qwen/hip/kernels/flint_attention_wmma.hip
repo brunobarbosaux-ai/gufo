@@ -42,8 +42,11 @@
 
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
+#include "src/models/qwen/hip/detail/flint_keycount.hpp"
 
 namespace gufo::hip {
+
+GUFO_FLINT_KEYCOUNT_TU(wmma)
 
 namespace {
 
@@ -247,6 +250,9 @@ __global__ void __launch_bounds__(256, 2) FlintWmmaCausalAttention(
                   : 0) &
              ~(kFKeys - 1u))
           : 0;
+  if (blockIdx.y == 0 && threadIdx.x == 0) {
+    detail::FlintKeyCountAdd(layer_idx, max_visible - sweep_begin);
+  }
 
   constexpr std::uint32_t kVRegs = kFVRegs;
   const std::uint32_t v_key = lane % kFKeys;

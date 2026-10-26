@@ -12,6 +12,7 @@
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
 #include "src/core/hip/hip_utils.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
+#include "src/models/qwen/hip/detail/flint_keycount.hpp"
 #include "src/models/qwen/hip/ops/attention.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 
@@ -111,6 +112,26 @@ void AttnProfileSetSkip(unsigned skip, hipStream_t stream) {
   HIP_CHECK(hipStreamSynchronize(stream));
 }
 
+GUFO_FLINT_KEYCOUNT_TU(batched)
+
+void FlintKeyCountSet(bool on, hipStream_t stream) {
+  FlintKeyCountSet_batched(on, stream);
+  FlintKeyCountSet_decode(on, stream);
+  FlintKeyCountSet_graph(on, stream);
+  FlintKeyCountSet_wmma(on, stream);
+}
+
+void FlintKeyCountRead(unsigned int* out, std::size_t layers,
+                       hipStream_t stream) {
+  const std::size_t n =
+      std::min<std::size_t>(layers, detail::kFlintKeyCountMaxLayers);
+  std::fill(out, out + n, 0u);
+  FlintKeyCountMaxInto_batched(out, n, stream);
+  FlintKeyCountMaxInto_decode(out, n, stream);
+  FlintKeyCountMaxInto_graph(out, n, stream);
+  FlintKeyCountMaxInto_wmma(out, n, stream);
+}
+
 __global__ void BatchedAttentionKernel(
     const float* __restrict__ q, const float* __restrict__ gate,
     const float* __restrict__ k_cache, const float* __restrict__ v_cache,
@@ -143,6 +164,9 @@ __global__ void BatchedAttentionKernel(
                                   ? seq_len - policy.window
                                   : 0;
   const std::size_t span = seq_len - p_begin;
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    detail::FlintKeyCountAdd(layer_idx, static_cast<std::uint32_t>(span));
+  }
   // F-D1: sink joins max and denominator, contributes no value.
   const bool has_sink = policy.sinks != nullptr;
   const float sink = has_sink ? policy.sinks[h] : 0.0F;

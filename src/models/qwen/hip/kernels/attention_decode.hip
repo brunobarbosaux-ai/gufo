@@ -9,12 +9,15 @@
 
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
+#include "src/models/qwen/hip/detail/flint_keycount.hpp"
 #include "src/models/qwen/hip/detail/flint_kv.hpp"
 #include "src/models/qwen/hip/kernels/attention_decode_split_k.hpp"
 #include "src/models/qwen/hip/kernels/attention_decode_verify_wave64.hpp"
 #include "src/models/qwen/hip/ops/attention.hpp"
 
 namespace gufo::hip {
+
+GUFO_FLINT_KEYCOUNT_TU(decode)
 
 using detail::FlintKvLoad;
 using detail::FlintKvOffset;
@@ -104,6 +107,9 @@ __global__ void AttentionKernel(
                                                             policy.window
                                                       : 0;
   const std::size_t span = seq_len - p_begin;
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    detail::FlintKeyCountAdd(layer_idx, static_cast<std::uint32_t>(span));
+  }
   // F-D1: the sink joins max and denominator (F-D6 order: scale → sink →
   // softmax → weighted sum) and contributes no value.
   const bool has_sink = policy.sinks != nullptr;
@@ -231,6 +237,9 @@ __global__ void AttentionHalfKernel(
           ? sequence_length - policy.window
           : 0;
   const std::size_t span = sequence_length - p_begin;
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    detail::FlintKeyCountAdd(layer_idx, static_cast<std::uint32_t>(span));
+  }
   const bool has_sink = policy.sinks != nullptr;
   const float sink = has_sink ? policy.sinks[head] : 0.0F;
 
@@ -1015,6 +1024,10 @@ __global__ void FlintDecodeOnlineAttentionKernel(
       (policy.window != 0 && seq_len > policy.window)
           ? seq_len - policy.window
           : 0;
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    detail::FlintKeyCountAdd(layer_idx,
+                             static_cast<std::uint32_t>(seq_len - p_begin));
+  }
   const bool has_sink = policy.sinks != nullptr;
   const float sink = has_sink ? policy.sinks[h] : 0.0F;
 

@@ -116,6 +116,27 @@ void AttnProfileRead(unsigned long long out[4], hipStream_t stream);
 /// skip time (hipEvent A/B — clock64 proved unreliable across barriers).
 void AttnProfileSetSkip(unsigned skip, hipStream_t stream);
 
+/// F-J3 visited-key counter: arm/disable and zero the per-layer counters, or
+/// read them back. Each attention kernel records the max number of keys any
+/// query in the launch visited. Enable only for the key-count proof.
+void FlintKeyCountSet(bool on, hipStream_t stream);
+void FlintKeyCountRead(unsigned int* out, std::size_t layers,
+                       hipStream_t stream);
+/// Per-translation-unit halves of the counter (no RDC: each .hip file owns a
+/// private copy of the device variables). Public Set/Read fan out to these.
+void FlintKeyCountSet_batched(bool on, hipStream_t stream);
+void FlintKeyCountSet_decode(bool on, hipStream_t stream);
+void FlintKeyCountSet_graph(bool on, hipStream_t stream);
+void FlintKeyCountSet_wmma(bool on, hipStream_t stream);
+void FlintKeyCountMaxInto_batched(unsigned int* acc, std::size_t layers,
+                                  hipStream_t stream);
+void FlintKeyCountMaxInto_decode(unsigned int* acc, std::size_t layers,
+                                 hipStream_t stream);
+void FlintKeyCountMaxInto_graph(unsigned int* acc, std::size_t layers,
+                                hipStream_t stream);
+void FlintKeyCountMaxInto_wmma(unsigned int* acc, std::size_t layers,
+                               hipStream_t stream);
+
 /// Flint-shaped WMMA prefill attention (32/4/128 + sinks + window), the
 /// 2.6 flash route: per-head blocks spanning 32 queries with K/V reuse,
 /// online softmax, fixed 16-key tile order (G6 split-invariant). K/V come

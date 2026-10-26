@@ -1393,6 +1393,91 @@ void RunChunkParity(const gufo::hip::FlintGpuModel& model,
 
 }  // namespace
 
+namespace {
+
+/// F-J3 key-count proof: a decode step at 4k and 32k must touch exactly
+/// min(pos+1, window) keys on a windowed layer and pos+1 on a global layer.
+/// Runs the graph-captured path (default) and the legacy path
+/// (GUFO_FLINT_DECODE_GRAPH=0).
+void RunKeyCountProof(const gufo::hip::FlintGpuModel& model) {
+  const auto& config = model.GetConfig();
+  const auto& weights = model.GetWeights();
+  constexpr std::uint32_t kCtx = 32768;
+  const std::uint32_t positions[] = {4095u, 32767u};
+  for (int graph_pass = 0; graph_pass < 2; ++graph_pass) {
+    if (graph_pass == 1) {
+      setenv("GUFO_FLINT_DECODE_GRAPH", "0", 1);
+    }
+    gufo::hip::FlintGpuArena arena(config, kCtx);
+    const auto buffers = arena.GetBuffers();
+    for (const std::uint32_t pos : positions) {
+      gufo::hip::FlintKeyCountSet(true, buffers.stream);
+      gufo::hip::ExecuteFlintDecodeStep(weights, /*token=*/1u, pos,
+                                        /*compute_logits=*/false, buffers,
+                                        nullptr, arena.GetGraphState());
+      HIP_CHECK(hipStreamSynchronize(buffers.stream));
+      std::vector<unsigned int> counts(config.num_layers, 0u);
+      gufo::hip::FlintKeyCountRead(counts.data(), config.num_layers,
+                                   buffers.stream);
+      for (std::uint32_t l = 0; l < config.num_layers; ++l) {
+        const bool windowed = weights.layers[l].attrs.windowed;
+        const std::uint32_t expected =
+            windowed ? std::min<std::uint32_t>(pos + 1, config.sliding_window)
+                     : pos + 1;
+        Expect(counts[l] == expected,
+               "key count layer " + std::to_string(l) + " pos " +
+                   std::to_string(pos) + " graph " +
+                   std::to_string(graph_pass) + ": got " +
+                   std::to_string(counts[l]) + " expected " +
+                   std::to_string(expected));
+      }
+      gufo::hip::FlintKeyCountSet(false, buffers.stream);
+      std::cout << "  keycount graph=" << graph_pass << " pos=" << pos
+                << " ok (" << config.num_layers << " layers)\n";
+    }
+  }
+  // Prefill: a full chunk ending at the 32k cap. The flash kernel's counter
+  // is per 32-query block (floored to the 16-key tile grid), so a windowed
+  // layer is bounded by window + 31 + 15 keys; a global layer sees the whole
+  // prefix up to the chunk's last position.
+  if (gufo::hip::FlintPrefillSupported(weights)) {
+    const std::size_t n = gufo::hip::kFlintPrefillBatchCapacity;
+    const std::uint32_t start_pos = kCtx - static_cast<std::uint32_t>(n);
+    std::vector<gufo::tokenization::TokenId> tokens(n, 1u);
+    gufo::hip::FlintGpuArena arena(config, kCtx);
+    const auto buffers = arena.GetBuffers();
+    const auto prefill = arena.GetPrefillBuffers();
+    gufo::hip::FlintKeyCountSet(true, buffers.stream);
+    gufo::hip::ExecuteFlintPrefillChunk(weights, tokens, start_pos,
+                                        /*compute_logits=*/false, buffers,
+                                        prefill);
+    HIP_CHECK(hipStreamSynchronize(buffers.stream));
+    std::vector<unsigned int> counts(config.num_layers, 0u);
+    gufo::hip::FlintKeyCountRead(counts.data(), config.num_layers,
+                                 buffers.stream);
+    gufo::hip::FlintKeyCountSet(false, buffers.stream);
+    const std::uint32_t slack = 31u + 15u;
+    for (std::uint32_t l = 0; l < config.num_layers; ++l) {
+      if (weights.layers[l].attrs.windowed) {
+        Expect(counts[l] != 0 && counts[l] <= config.sliding_window + slack,
+               "prefill key count layer " + std::to_string(l) + ": got " +
+                   std::to_string(counts[l]) + " bound " +
+                   std::to_string(config.sliding_window + slack));
+      } else {
+        Expect(counts[l] > config.sliding_window + slack,
+               "prefill global layer " + std::to_string(l) +
+                   " must see the full prefix, got " +
+                   std::to_string(counts[l]));
+      }
+    }
+    std::cout << "  keycount prefill start_pos=" << start_pos << " n=" << n
+              << " ok (windowed <= " << config.sliding_window + slack << ")\n";
+  }
+  std::cout << "flint keycount proof ok\n";
+}
+
+}  // namespace
+
 int main(int argc, char** argv) {
   if (argc > 1 && std::string_view(argv[1]) == "synthq8") {
     SynthQ8SwiGLUCheck();
@@ -1422,7 +1507,7 @@ int main(int argc, char** argv) {
       argc > 1 ? std::string_view(argv[1]) : std::string_view{};
   bool probe = mode == "probe";
   const bool chunk = mode == "chunk";
-  if (!mode.empty() && !probe && !chunk)
+  if (!mode.empty() && !probe && !chunk && mode != "keycount")
     max_context = static_cast<std::uint32_t>(std::atoi(argv[1]));
   if (argc > 2) steps = static_cast<std::uint32_t>(std::atoi(argv[2]));
   Expect(steps > 0, "steps must be positive");
@@ -1489,6 +1574,11 @@ int main(int argc, char** argv) {
             ? static_cast<std::uint32_t>(std::atoi(argv[2]))
             : std::max<std::uint32_t>(max_context, 1024);
     RunChunkParity(*gpu_model, tokens, tokens_full, chunk_ctx);
+    return 0;
+  }
+
+  if (mode == "keycount") {
+    RunKeyCountProof(*gpu_model);
     return 0;
   }
 
