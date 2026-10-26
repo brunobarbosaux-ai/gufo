@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <span>
 
 #include "src/core/gguf_reader.hpp"
@@ -15,6 +16,13 @@
 #include <hipblas/hipblas.h>
 
 namespace gufo::hip {
+
+/// Sentinel for the `layer_base` parameter of the attention launches: the
+/// caller did not supply a per-layer KV base, so the launch derives the
+/// uniform (non-ring) base from `layer_idx` and `max_context`. The flint
+/// ring cache (F-I2) passes the arena's per-layer base instead.
+inline constexpr std::size_t kUniformKvBase =
+    std::numeric_limits<std::size_t>::max();
 
 /// Computes Fused QKV Projections for Full Attention layers in a single kernel
 void LaunchFusedQKVProjections(const void* q_w, core::GgmlType q_type,
@@ -41,7 +49,8 @@ void LaunchAttention(const float* q, const float* k, const float* v,
                      hipStream_t stream = nullptr,
                      float* split_k_scratch = nullptr,
                      bool skip_kv_write = false,
-                     const detail::FlintKernelPolicy* policy = nullptr);
+                     const detail::FlintKernelPolicy* policy = nullptr,
+                     std::size_t layer_base = kUniformKvBase);
 
 /// Runs consecutive verification queries with scalar decode arithmetic.
 /// The selected KV cache must already contain all rows. Each row sees only
@@ -57,7 +66,8 @@ void LaunchCausalDecodeAttention(
     std::uint32_t max_context, std::uint32_t num_heads,
     std::uint32_t num_kv_heads, std::uint32_t head_dim,
     hipStream_t stream = nullptr, std::span<float> split_k_scratch = {},
-    const detail::FlintKernelPolicy* policy = nullptr);
+    const detail::FlintKernelPolicy* policy = nullptr,
+    std::size_t layer_base = kUniformKvBase);
 
 /// Computes Grouped-Query Softmax Attention reading position from device memory
 void LaunchAttention(const float* q, const float* k, const float* v,
@@ -67,7 +77,8 @@ void LaunchAttention(const float* q, const float* k, const float* v,
                      std::uint32_t max_context, std::uint32_t num_heads,
                      std::uint32_t num_kv_heads, std::uint32_t head_dim,
                      hipStream_t stream = nullptr, bool skip_kv_write = false,
-                     const detail::FlintKernelPolicy* policy = nullptr);
+                     const detail::FlintKernelPolicy* policy = nullptr,
+                     std::size_t layer_base = kUniformKvBase);
 
 /// Fuses per-head Q/K RMSNorm, RoPE, and the KV-cache write for a single decode
 /// token into one launch (opt-c010-qk-rope-kv). Writes the normed+roped Q into
@@ -102,7 +113,8 @@ void LaunchBatchedAttention(const float* q, const float* k, const float* v,
                             hipStream_t stream = nullptr,
                             bool skip_kv_write = false,
                             void* out_context_bf16 = nullptr,
-                            const detail::FlintKernelPolicy* policy = nullptr);
+                            const detail::FlintKernelPolicy* policy = nullptr,
+                            std::size_t layer_base = kUniformKvBase);
 
 /// W3 sub-stage profile: reset (and arm/disable) the per-stage cycle
 /// accumulators inside BatchedAttentionKernel, or read them back. The
@@ -147,7 +159,8 @@ bool LaunchFlintWmmaAttention(
     const float* q, const float* k_cache, const float* v_cache,
     float* out_context, std::uint32_t layer_idx, std::uint32_t start_pos,
     std::size_t batch_size, std::uint32_t max_context, hipStream_t stream,
-    const detail::FlintKernelPolicy* policy);
+    const detail::FlintKernelPolicy* policy,
+    std::size_t layer_base = kUniformKvBase);
 
 /// The batched-path KV write kernel, exposed for callers whose attention
 /// reads the cache directly (the flint WMMA route) and therefore must
@@ -159,7 +172,8 @@ void LaunchBatchedKvWrite(const float* k, const float* v,
                           std::uint32_t layer_idx, std::uint32_t start_pos,
                           std::size_t batch_size, std::uint32_t max_context,
                           std::uint32_t num_kv_heads, std::uint32_t head_dim,
-                          hipStream_t stream);
+                          hipStream_t stream, std::size_t layer_base = kUniformKvBase,
+                          std::uint32_t window = 0);
 
 /// Batched fuse of per-head Q/K RMSNorm, RoPE, and the KV-cache write across B
 /// tokens into one launch (opt-c010-qk-rope-kv). Writes the normed+roped Q into

@@ -43,6 +43,8 @@
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/detail/flint_keycount.hpp"
+#include "src/models/qwen/hip/detail/flint_kv.hpp"
+#include "src/models/qwen/hip/ops/attention.hpp"
 
 namespace gufo::hip {
 
@@ -158,8 +160,9 @@ __device__ __forceinline__ uint4 FPack8Lo(const float* p) {
 __global__ void __launch_bounds__(256, 2) FlintWmmaCausalAttention(
     const float* __restrict__ q, const float* __restrict__ k_cache,
     const float* __restrict__ v_cache, float* __restrict__ out_context,
-    std::uint32_t layer_idx, std::uint32_t start_pos, std::size_t batch_size,
-    std::uint32_t max_context, detail::FlintKernelPolicy policy) {
+    std::uint32_t layer_idx, std::size_t layer_base, std::uint32_t start_pos,
+    std::size_t batch_size, std::uint32_t max_context,
+    detail::FlintKernelPolicy policy) {
   const std::uint32_t tid = threadIdx.x;
   const std::uint32_t lane = tid & 31u;
   const std::uint32_t wave = tid >> 5u;
@@ -260,16 +263,20 @@ __global__ void __launch_bounds__(256, 2) FlintWmmaCausalAttention(
   // Flint's fp32 KV plane is head-major: [layer][kv_head][pos][dim] —
   // positions are contiguous within a (layer, kv_head) plane.
   constexpr std::size_t kv_stride = kFHeadDim;
+  const std::uint32_t kv_rows =
+      policy.kv_rows != 0
+          ? (policy.kv_rows < max_context ? policy.kv_rows : max_context)
+          : max_context;
   const std::size_t head_offset =
-      (static_cast<std::size_t>(layer_idx) * kFKvHeads + kv_head) *
-      static_cast<std::size_t>(max_context) * kFHeadDim;
+      layer_base + static_cast<std::size_t>(kv_head) * kv_rows * kFHeadDim;
   const auto* v_base = v_cache + head_offset + v_slice;
   const auto* k_base = k_cache + head_offset;
 
   const auto load_v = [&](std::uint32_t key_start, uint4* dst) {
     const std::uint32_t key_position = key_start + v_key;
     const auto* src =
-        v_base + (static_cast<std::size_t>(key_position) * kv_stride);
+        v_base + (detail::FlintKvRow(key_position, policy.kv_rows, max_context) *
+                  kv_stride);
     const bool live = key_position < context_end;
 #pragma unroll
     for (std::uint32_t j = 0; j < kVRegs; ++j) {
@@ -284,15 +291,12 @@ __global__ void __launch_bounds__(256, 2) FlintWmmaCausalAttention(
       const std::uint32_t key_position = key_start + (idx / (kFHeadDim / 8));
       const std::uint32_t d8 = (idx % (kFHeadDim / 8)) * 8;
       const bool live = key_position < context_end;
-      dst[n] = live ? FPack8(k_base +
-                             (static_cast<std::size_t>(key_position) *
-                              kv_stride) +
-                             d8)
+      const std::size_t row_off =
+          detail::FlintKvRow(key_position, policy.kv_rows, max_context) *
+          kv_stride;
+      dst[n] = live ? FPack8(k_base + row_off + d8)
                     : make_uint4(0u, 0u, 0u, 0u);
-      dst_lo[n] = live ? FPack8Lo(k_base +
-                                  (static_cast<std::size_t>(key_position) *
-                                   kv_stride) +
-                                  d8)
+      dst_lo[n] = live ? FPack8Lo(k_base + row_off + d8)
                        : make_uint4(0u, 0u, 0u, 0u);
     }
   };
@@ -540,7 +544,7 @@ bool LaunchFlintWmmaAttention(
     const float* q, const float* k_cache, const float* v_cache,
     float* out_context, std::uint32_t layer_idx, std::uint32_t start_pos,
     std::size_t batch_size, std::uint32_t max_context, hipStream_t stream,
-    const detail::FlintKernelPolicy* policy) {
+    const detail::FlintKernelPolicy* policy, std::size_t layer_base) {
   if (batch_size == 0 || k_cache == nullptr || v_cache == nullptr) {
     return false;
   }
@@ -550,12 +554,17 @@ bool LaunchFlintWmmaAttention(
   if (static_cast<std::size_t>(start_pos) + batch_size > max_context) {
     return false;
   }
+  const std::size_t base =
+      layer_base == kUniformKvBase
+          ? static_cast<std::size_t>(layer_idx) * kFKvHeads * max_context *
+                kFHeadDim
+          : layer_base;
   detail::EmitAttentionDispatch("flint_prefill_wmma", "");
   const dim3 grid((static_cast<unsigned>(batch_size) + kFQueryRows - 1) /
                       kFQueryRows,
                   kFKvHeads * (kFGqa / kFWmmaHeads));
   FlintWmmaCausalAttention<<<grid, 256, 0, stream>>>(
-      q, k_cache, v_cache, out_context, layer_idx, start_pos, batch_size,
+      q, k_cache, v_cache, out_context, layer_idx, base, start_pos, batch_size,
       max_context, *policy);
   return true;
 }

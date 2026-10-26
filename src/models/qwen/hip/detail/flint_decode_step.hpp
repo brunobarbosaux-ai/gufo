@@ -69,6 +69,14 @@ struct FlintGpuStepBuffers {
   __half* k_cache_f16 = nullptr;
   __half* v_cache_f16 = nullptr;
   std::uint32_t max_context = 0;
+  /// F-I2 ring cache: per-layer element offset of the layer's KV plane (K and
+  /// V share it). Windowed layers hold `min(max_context, sliding_window)`
+  /// rows, global layers `max_context`; the kernels wrap windowed rows at
+  /// `pos % rows`. Host memory owned by the arena; indexed by layer_idx.
+  const std::size_t* kv_layer_base = nullptr;
+  /// F-I2 ring cache: per-layer KV row count (the row modulus), indexed by
+  /// layer_idx. Windowed layers hold fewer rows than max_context.
+  const std::uint32_t* kv_layer_rows = nullptr;
 
   hipStream_t stream = nullptr;
 };

@@ -293,7 +293,8 @@ void ExecuteFlintPrefillChunk(const models::FlintModelWeights& weights,
 
     const detail::FlintKernelPolicy policy{
         static_cast<const float*>(layer.attn_sinks.data),
-        layer.attrs.windowed ? config.sliding_window : 0U};
+        layer.attrs.windowed ? config.sliding_window : 0U,
+        buffers.kv_layer_rows[layer_idx]};
     static const bool attn_scalar = std::getenv("GUFO_FLINT_ATTN_SCALAR") !=
                                     nullptr;
     // Layer-range A/B for divergence bisecting: flash only for layers in
@@ -314,10 +315,13 @@ void ExecuteFlintPrefillChunk(const models::FlintModelWeights& weights,
                            buffers.v_cache, buffers.k_cache_f16,
                            buffers.v_cache_f16, layer_idx, start_pos, n,
                            buffers.max_context, config.num_key_value_heads,
-                           config.head_dim, stream);
+                           config.head_dim, stream,
+                           buffers.kv_layer_base[layer_idx],
+                           buffers.kv_layer_rows[layer_idx]);
       wmma_attention = LaunchFlintWmmaAttention(
           prefill.q, buffers.k_cache, buffers.v_cache, prefill.attn_out,
-          layer_idx, start_pos, n, buffers.max_context, stream, &policy);
+          layer_idx, start_pos, n, buffers.max_context, stream, &policy,
+          buffers.kv_layer_base[layer_idx]);
     }
     if (!wmma_attention) {
       LaunchBatchedAttention(
@@ -326,7 +330,8 @@ void ExecuteFlintPrefillChunk(const models::FlintModelWeights& weights,
           prefill.attn_out, layer_idx, start_pos, n, buffers.max_context,
           config.num_attention_heads, config.num_key_value_heads,
           config.head_dim, stream, /*skip_kv_write=*/false,
-          /*out_context_bf16=*/nullptr, &policy);
+          /*out_context_bf16=*/nullptr, &policy,
+          buffers.kv_layer_base[layer_idx]);
     }
     mark(kAttention);
 

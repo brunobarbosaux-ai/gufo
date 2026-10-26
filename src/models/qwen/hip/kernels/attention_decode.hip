@@ -26,8 +26,9 @@ __global__ void WriteKVCacheKernel(
     const float* __restrict__ k, const float* __restrict__ v,
     float* __restrict__ k_cache, float* __restrict__ v_cache,
     __half* __restrict__ k_cache_f16, __half* __restrict__ v_cache_f16,
-    std::uint32_t layer_idx, std::uint32_t pos, std::uint32_t max_context,
-    std::uint32_t num_kv_heads, std::uint32_t head_dim) {
+    std::size_t layer_base, std::uint32_t rows, std::uint32_t pos,
+    std::uint32_t max_context, std::uint32_t num_kv_heads,
+    std::uint32_t head_dim) {
   const std::uint32_t kv_h = blockIdx.x;
   if (kv_h >= num_kv_heads)
     return;
@@ -35,11 +36,8 @@ __global__ void WriteKVCacheKernel(
   if (tid >= head_dim)
     return;
 
-  const std::size_t kv_offset =
-      (((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) *
-            max_context +
-        pos) *
-       head_dim);
+  const std::size_t kv_offset = FlintKvOffset<float>(
+      layer_base, kv_h, pos, rows, max_context, num_kv_heads, head_dim);
   const float key = k[static_cast<std::size_t>(kv_h) * head_dim + tid];
   const float val = v[static_cast<std::size_t>(kv_h) * head_dim + tid];
   if (k_cache != nullptr) {
@@ -50,11 +48,8 @@ __global__ void WriteKVCacheKernel(
   }
 
   if (k_cache_f16 != nullptr || v_cache_f16 != nullptr) {
-    const std::size_t kv_width =
-        static_cast<std::size_t>(num_kv_heads) * head_dim;
-    const std::size_t f16_offset =
-        ((static_cast<std::size_t>(layer_idx) * max_context + pos) * kv_width) +
-        (static_cast<std::size_t>(kv_h) * head_dim) + tid;
+    const std::size_t f16_offset = FlintKvOffset<__half>(
+        layer_base, kv_h, pos, rows, max_context, num_kv_heads, head_dim);
     if (k_cache_f16 != nullptr) {
       k_cache_f16[f16_offset] = __float2half_rn(key);
     }
@@ -77,16 +72,17 @@ template <typename KVT = float>
 __global__ void FlintDecodeOnlineAttentionKernel(
     const float* __restrict__ q, const KVT* __restrict__ k_cache,
     const KVT* __restrict__ v_cache, float* __restrict__ out_context,
-    std::uint32_t layer_idx, std::uint32_t pos, std::uint32_t max_context,
-    std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t head_dim,
+    std::uint32_t layer_idx, std::size_t layer_base, std::uint32_t pos,
+    std::uint32_t max_context, std::uint32_t num_heads,
+    std::uint32_t num_kv_heads, std::uint32_t head_dim,
     detail::FlintKernelPolicy policy);
 
 __global__ void AttentionKernel(
     const float* __restrict__ q, const float* __restrict__ gate,
     const float* __restrict__ k_cache, const float* __restrict__ v_cache,
-    float* __restrict__ out_context, std::uint32_t layer_idx, std::uint32_t pos,
-    std::uint32_t max_context, std::uint32_t num_heads,
-    std::uint32_t num_kv_heads, std::uint32_t head_dim,
+    float* __restrict__ out_context, std::uint32_t layer_idx,
+    std::size_t layer_base, std::uint32_t pos, std::uint32_t max_context,
+    std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t head_dim,
     detail::FlintKernelPolicy policy) {
   const std::uint32_t h = blockIdx.x;
   if (h >= num_heads)
@@ -120,11 +116,9 @@ __global__ void AttentionKernel(
 
   // Step 1: Compute scores for each position p = p_begin..seq_len-1
   for (std::size_t p = p_begin; p < seq_len; ++p) {
-    const std::size_t p_offset =
-        (((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) *
-              max_context +
-          p) *
-         head_dim);
+    const std::size_t p_offset = FlintKvOffset<float>(
+        layer_base, kv_h, p, policy.kv_rows, max_context, num_kv_heads,
+        head_dim);
     const float* k_p = k_cache + p_offset;
 
     float dot = 0.0F;
@@ -193,11 +187,9 @@ __global__ void AttentionKernel(
   if (tid < head_dim) {
     float ctx = 0.0F;
     for (std::size_t p = p_begin; p < seq_len; ++p) {
-      const std::size_t p_offset =
-          (((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) *
-                max_context +
-            p) *
-           head_dim);
+      const std::size_t p_offset = FlintKvOffset<float>(
+          layer_base, kv_h, p, policy.kv_rows, max_context, num_kv_heads,
+          head_dim);
       const float* v_p = v_cache + p_offset;
       ctx += s_scores[p - p_begin] * v_p[tid];
     }
@@ -214,9 +206,9 @@ __global__ void AttentionKernel(
 __global__ void AttentionHalfKernel(
     const float* __restrict__ q, const float* __restrict__ gate,
     const __half* __restrict__ k_cache, const __half* __restrict__ v_cache,
-    float* __restrict__ out_context, std::uint32_t layer_idx, std::uint32_t pos,
-    std::uint32_t max_context, std::uint32_t num_heads,
-    std::uint32_t num_kv_heads, std::uint32_t head_dim,
+    float* __restrict__ out_context, std::uint32_t layer_idx,
+    std::size_t layer_base, std::uint32_t pos, std::uint32_t max_context,
+    std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t head_dim,
     detail::FlintKernelPolicy policy) {
   const std::uint32_t head = blockIdx.x;
   if (head >= num_heads) {
@@ -230,8 +222,6 @@ __global__ void AttentionHalfKernel(
   const float* query = q + (static_cast<std::size_t>(head) * head_dim);
   const float scale = rsqrtf(static_cast<float>(head_dim));
   const std::size_t sequence_length = static_cast<std::size_t>(pos) + 1;
-  const std::size_t kv_width =
-      static_cast<std::size_t>(num_kv_heads) * head_dim;
   const std::size_t p_begin =
       (policy.window != 0 && sequence_length > policy.window)
           ? sequence_length - policy.window
@@ -248,10 +238,9 @@ __global__ void AttentionHalfKernel(
 
   for (std::size_t position = p_begin; position < sequence_length;
        ++position) {
-    const std::size_t cache_offset =
-        ((static_cast<std::size_t>(layer_idx) * max_context + position) *
-         kv_width) +
-        (static_cast<std::size_t>(kv_head) * head_dim);
+    const std::size_t cache_offset = FlintKvOffset<__half>(
+        layer_base, kv_head, position, policy.kv_rows, max_context, num_kv_heads,
+        head_dim);
     const __half* key = k_cache + cache_offset;
     float dot = 0.0F;
     for (std::size_t dim = tid; dim < head_dim; dim += blockDim.x) {
@@ -316,10 +305,9 @@ __global__ void AttentionHalfKernel(
     float context = 0.0F;
     for (std::size_t position = p_begin; position < sequence_length;
          ++position) {
-      const std::size_t cache_offset =
-          ((static_cast<std::size_t>(layer_idx) * max_context + position) *
-           kv_width) +
-          (static_cast<std::size_t>(kv_head) * head_dim);
+      const std::size_t cache_offset = FlintKvOffset<__half>(
+          layer_base, kv_head, position, policy.kv_rows, max_context,
+          num_kv_heads, head_dim);
       context +=
           scores[position - p_begin] * __half2float(v_cache[cache_offset + tid]);
     }
@@ -879,14 +867,21 @@ void LaunchAttention(const float* q, const float* k, const float* v,
                      std::uint32_t num_kv_heads, std::uint32_t head_dim,
                      hipStream_t stream, float* split_k_scratch,
                      bool skip_kv_write,
-                     const detail::FlintKernelPolicy* policy) {
+                     const detail::FlintKernelPolicy* policy,
+                     std::size_t layer_base) {
+  const std::size_t base =
+      layer_base == kUniformKvBase
+          ? static_cast<std::size_t>(layer_idx) * num_kv_heads * max_context *
+                head_dim
+          : layer_base;
+  const std::uint32_t rows = policy != nullptr ? policy->kv_rows : 0U;
   // 1. Write K and V into every non-null selected KV representation across all
   // num_kv_heads. May be skipped when a fused kernel already wrote the cache
   // (opt-c010-qk-rope-kv).
   if (!skip_kv_write) {
     WriteKVCacheKernel<<<num_kv_heads, 256, 0, stream>>>(
         k, v, k_cache, v_cache, static_cast<__half*>(k_cache_f16),
-        static_cast<__half*>(v_cache_f16), layer_idx, pos, max_context,
+        static_cast<__half*>(v_cache_f16), base, rows, pos, max_context,
         num_kv_heads, head_dim);
   }
 
@@ -958,13 +953,13 @@ void LaunchAttention(const float* q, const float* k, const float* v,
         FlintDecodeOnlineAttentionKernel<__half><<<num_heads, 256, 0, stream>>>(
             q, static_cast<const __half*>(k_cache_f16),
             static_cast<const __half*>(v_cache_f16), out_context, layer_idx,
-            pos, max_context, num_heads, num_kv_heads, head_dim, flint);
+            base, pos, max_context, num_heads, num_kv_heads, head_dim, flint);
         return;
       }
       if (k_cache != nullptr && v_cache != nullptr) {
         detail::EmitAttentionDispatch("decode_online_flint", "");
         FlintDecodeOnlineAttentionKernel<<<num_heads, 256, 0, stream>>>(
-            q, k_cache, v_cache, out_context, layer_idx, pos, max_context,
+            q, k_cache, v_cache, out_context, layer_idx, base, pos, max_context,
             num_heads, num_kv_heads, head_dim, flint);
         return;
       }
@@ -977,8 +972,8 @@ void LaunchAttention(const float* q, const float* k, const float* v,
           "decode_split_k_fp32: unsupported_shape; decode_online_fp32: "
           "unsupported_shape");
       AttentionKernel<<<num_heads, 256, shared_scores_bytes, stream>>>(
-          q, gate, k_cache, v_cache, out_context, layer_idx, pos, max_context,
-          num_heads, num_kv_heads, head_dim, flint);
+          q, gate, k_cache, v_cache, out_context, layer_idx, base, pos,
+          max_context, num_heads, num_kv_heads, head_dim, flint);
     } else {
       detail::EmitAttentionDispatch(
           "decode_baseline_fp16",
@@ -986,8 +981,8 @@ void LaunchAttention(const float* q, const float* k, const float* v,
           "unsupported_shape");
       AttentionHalfKernel<<<num_heads, 256, shared_scores_bytes, stream>>>(
           q, gate, static_cast<const __half*>(k_cache_f16),
-          static_cast<const __half*>(v_cache_f16), out_context, layer_idx, pos,
-          max_context, num_heads, num_kv_heads, head_dim, flint);
+          static_cast<const __half*>(v_cache_f16), out_context, layer_idx,
+          base, pos, max_context, num_heads, num_kv_heads, head_dim, flint);
     }
   }
 }
@@ -1004,8 +999,9 @@ template <typename KVT>
 __global__ void FlintDecodeOnlineAttentionKernel(
     const float* __restrict__ q, const KVT* __restrict__ k_cache,
     const KVT* __restrict__ v_cache, float* __restrict__ out_context,
-    std::uint32_t layer_idx, std::uint32_t pos, std::uint32_t max_context,
-    std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t head_dim,
+    std::uint32_t layer_idx, std::size_t layer_base, std::uint32_t pos,
+    std::uint32_t max_context, std::uint32_t num_heads,
+    std::uint32_t num_kv_heads, std::uint32_t head_dim,
     detail::FlintKernelPolicy policy) {
   constexpr std::size_t kTile = 256;
   const std::uint32_t h = blockIdx.x;
@@ -1052,7 +1048,8 @@ __global__ void FlintDecodeOnlineAttentionKernel(
     for (std::size_t i = tid; i < n; i += kTile) {
       const std::size_t p = tile + i;
       const std::size_t p_offset = FlintKvOffset<KVT>(
-          layer_idx, kv_h, p, num_kv_heads, max_context, head_dim);
+          layer_base, kv_h, p, policy.kv_rows, max_context, num_kv_heads,
+          head_dim);
       const KVT* k_p = k_cache + p_offset;
       float dot = 0.0F;
       for (std::size_t d = 0; d < head_dim; ++d) {
@@ -1104,7 +1101,8 @@ __global__ void FlintDecodeOnlineAttentionKernel(
       o *= alpha;
       for (std::size_t i = 0; i < n; ++i) {
         const std::size_t v_offset = FlintKvOffset<KVT>(
-            layer_idx, kv_h, tile + i, num_kv_heads, max_context, head_dim);
+            layer_base, kv_h, tile + i, policy.kv_rows, max_context, num_kv_heads,
+            head_dim);
         o += s_scores[i] * FlintKvLoad(v_cache + v_offset + tid);
       }
     }
@@ -1121,7 +1119,8 @@ void LaunchCausalDecodeAttention(
     std::uint32_t layer_idx, std::uint32_t start_pos, std::size_t batch_size,
     std::uint32_t max_context, std::uint32_t num_heads,
     std::uint32_t num_kv_heads, std::uint32_t head_dim, hipStream_t stream,
-    std::span<float> scratch, const detail::FlintKernelPolicy* policy) {
+    std::span<float> scratch, const detail::FlintKernelPolicy* policy,
+    std::size_t layer_base) {
   const std::size_t row_scratch =
       detail::DecodeAttentionScratchElements(num_heads, head_dim);
   float* const split_k_scratch =
@@ -1184,7 +1183,8 @@ void LaunchCausalDecodeAttention(
         gate == nullptr ? nullptr : gate + row * width, k_cache, v_cache,
         k_cache_f16, v_cache_f16, out_context + row * width, layer_idx,
         start_pos + static_cast<std::uint32_t>(row), max_context, num_heads,
-        num_kv_heads, head_dim, stream, split_k_scratch, true, policy);
+        num_kv_heads, head_dim, stream, split_k_scratch, true, policy,
+        layer_base);
   }
 }
 

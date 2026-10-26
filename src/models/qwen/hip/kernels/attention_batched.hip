@@ -13,6 +13,7 @@
 #include "src/core/hip/hip_utils.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/detail/flint_keycount.hpp"
+#include "src/models/qwen/hip/detail/flint_kv.hpp"
 #include "src/models/qwen/hip/ops/attention.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 
@@ -22,9 +23,9 @@ __global__ void WriteBatchedKVCacheKernel(
     const float* __restrict__ k, const float* __restrict__ v,
     float* __restrict__ k_cache, float* __restrict__ v_cache,
     __half* __restrict__ k_cache_f16, __half* __restrict__ v_cache_f16,
-    std::uint32_t layer_idx, std::uint32_t start_pos, std::size_t batch_size,
-    std::uint32_t max_context, std::uint32_t num_kv_heads,
-    std::uint32_t head_dim) {
+    std::size_t layer_base, std::uint32_t rows, std::uint32_t start_pos,
+    std::size_t batch_size, std::uint32_t max_context,
+    std::uint32_t num_kv_heads, std::uint32_t head_dim) {
   const std::size_t b = blockIdx.y;
   const std::uint32_t kv_head = blockIdx.x;
   if (b >= batch_size || kv_head >= num_kv_heads)
@@ -36,17 +37,10 @@ __global__ void WriteBatchedKVCacheKernel(
       (b * num_kv_heads * head_dim) +
       (static_cast<std::size_t>(kv_head) * head_dim);
 
-  const std::size_t cache_offset =
-      (((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_head) *
-            max_context +
-        pos) *
-       head_dim);
-
-  const std::size_t kv_width =
-      static_cast<std::size_t>(num_kv_heads) * head_dim;
-  const std::size_t f16_cache_offset =
-      ((static_cast<std::size_t>(layer_idx) * max_context + pos) * kv_width) +
-      (static_cast<std::size_t>(kv_head) * head_dim);
+  const std::size_t cache_offset = detail::FlintKvOffset<float>(
+      layer_base, kv_head, pos, rows, max_context, num_kv_heads, head_dim);
+  const std::size_t f16_cache_offset = detail::FlintKvOffset<__half>(
+      layer_base, kv_head, pos, rows, max_context, num_kv_heads, head_dim);
 
   for (std::size_t i = tid; i < head_dim; i += blockDim.x) {
     const float key = k[k_src_offset + i];
@@ -138,8 +132,9 @@ __global__ void BatchedAttentionKernel(
     const __half* __restrict__ k_cache_f16,
     const __half* __restrict__ v_cache_f16, float* __restrict__ out_context,
     hip_bfloat16* __restrict__ out_context_bf16, std::uint32_t layer_idx,
-    std::uint32_t start_pos, std::size_t batch_size, std::uint32_t max_context,
-    std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t head_dim,
+    std::size_t layer_base, std::uint32_t start_pos, std::size_t batch_size,
+    std::uint32_t max_context, std::uint32_t num_heads,
+    std::uint32_t num_kv_heads, std::uint32_t head_dim,
     detail::FlintKernelPolicy policy) {
   const std::uint32_t h = blockIdx.x;
   const std::uint32_t t = blockIdx.y;
@@ -196,14 +191,12 @@ __global__ void BatchedAttentionKernel(
         continue;
       }
       const std::size_t p = p_begin + rel;
-      const std::size_t p_offset =
-          (((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) *
-                max_context +
-            p) *
-           head_dim);
-      const std::size_t p_offset_f16 =
-          ((static_cast<std::size_t>(layer_idx) * max_context + p) * kv_width) +
-          (static_cast<std::size_t>(kv_h) * head_dim);
+      const std::size_t p_offset = detail::FlintKvOffset<float>(
+          layer_base, kv_h, p, policy.kv_rows, max_context, num_kv_heads,
+          head_dim);
+      const std::size_t p_offset_f16 = detail::FlintKvOffset<__half>(
+          layer_base, kv_h, p, policy.kv_rows, max_context, num_kv_heads,
+          head_dim);
       const auto* k_p_vec =
           use_f16_cache ? nullptr
                         : reinterpret_cast<const float4*>(k_cache + p_offset);
@@ -231,14 +224,12 @@ __global__ void BatchedAttentionKernel(
         continue;
       }
       const std::size_t p = p_begin + rel;
-      const std::size_t p_offset =
-          (((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) *
-                max_context +
-            p) *
-           head_dim);
-      const std::size_t p_offset_f16 =
-          ((static_cast<std::size_t>(layer_idx) * max_context + p) * kv_width) +
-          (static_cast<std::size_t>(kv_h) * head_dim);
+      const std::size_t p_offset = detail::FlintKvOffset<float>(
+          layer_base, kv_h, p, policy.kv_rows, max_context, num_kv_heads,
+          head_dim);
+      const std::size_t p_offset_f16 = detail::FlintKvOffset<__half>(
+          layer_base, kv_h, p, policy.kv_rows, max_context, num_kv_heads,
+          head_dim);
       const auto* k_p_vec =
           use_f16_cache ? nullptr
                         : reinterpret_cast<const float4*>(k_cache + p_offset);
@@ -326,15 +317,12 @@ __global__ void BatchedAttentionKernel(
     const std::size_t p_quad_end =
         p_begin + ((seq_len - p_begin) & ~std::size_t(3));
     for (; p < p_quad_end; p += 4) {
-      const std::size_t p_offset =
-          (((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) *
-                max_context +
-            p) *
-           head_dim);
-      const std::size_t p_offset_f16 =
-          ((static_cast<std::size_t>(layer_idx) * max_context + p) *
-           kv_width) +
-          (static_cast<std::size_t>(kv_h) * head_dim);
+      const std::size_t p_offset = detail::FlintKvOffset<float>(
+          layer_base, kv_h, p, policy.kv_rows, max_context, num_kv_heads,
+          head_dim);
+      const std::size_t p_offset_f16 = detail::FlintKvOffset<__half>(
+          layer_base, kv_h, p, policy.kv_rows, max_context, num_kv_heads,
+          head_dim);
       if (use_f16_cache) {
         c0 += s_scores[p - p_begin] *
               __half2float(v_cache_f16[p_offset_f16 + tid]);
@@ -353,16 +341,13 @@ __global__ void BatchedAttentionKernel(
     }
     float ctx = (c0 + c1) + (c2 + c3);
     for (; p < seq_len; ++p) {
-      const std::size_t p_offset =
-          (((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) *
-                max_context +
-            p) *
-           head_dim);
+      const std::size_t p_offset = detail::FlintKvOffset<float>(
+          layer_base, kv_h, p, policy.kv_rows, max_context, num_kv_heads,
+          head_dim);
       if (use_f16_cache) {
-        const std::size_t p_offset_f16 =
-            ((static_cast<std::size_t>(layer_idx) * max_context + p) *
-             kv_width) +
-            (static_cast<std::size_t>(kv_h) * head_dim);
+        const std::size_t p_offset_f16 = detail::FlintKvOffset<__half>(
+            layer_base, kv_h, p, policy.kv_rows, max_context, num_kv_heads,
+            head_dim);
         ctx +=
             s_scores[p - p_begin] * __half2float(v_cache_f16[p_offset_f16 + tid]);
       } else {
@@ -400,11 +385,17 @@ void LaunchBatchedKvWrite(const float* k, const float* v, float* k_cache,
                           std::uint32_t start_pos, std::size_t batch_size,
                           std::uint32_t max_context,
                           std::uint32_t num_kv_heads, std::uint32_t head_dim,
-                          hipStream_t stream) {
+                          hipStream_t stream, std::size_t layer_base,
+                          std::uint32_t rows) {
+  const std::size_t base =
+      layer_base == kUniformKvBase
+          ? static_cast<std::size_t>(layer_idx) * num_kv_heads * max_context *
+                head_dim
+          : layer_base;
   const dim3 kv_grid(num_kv_heads, static_cast<unsigned int>(batch_size));
   WriteBatchedKVCacheKernel<<<kv_grid, 256, 0, stream>>>(
       k, v, k_cache, v_cache, static_cast<__half*>(k_cache_f16),
-      static_cast<__half*>(v_cache_f16), layer_idx, start_pos, batch_size,
+      static_cast<__half*>(v_cache_f16), base, rows, start_pos, batch_size,
       max_context, num_kv_heads, head_dim);
 }
 
@@ -416,10 +407,16 @@ void LaunchBatchedAttention(const float* q, const float* k, const float* v,     
                             std::uint32_t num_kv_heads, std::uint32_t head_dim,
                             hipStream_t stream, bool skip_kv_write,
                             void* out_context_bf16,
-                            const detail::FlintKernelPolicy* policy) {
+                            const detail::FlintKernelPolicy* policy,
+                            std::size_t layer_base) {
   const detail::FlintKernelPolicy kNoPolicy{nullptr, 0};
   const detail::FlintKernelPolicy flint =
       policy != nullptr ? *policy : kNoPolicy;
+  const std::size_t base =
+      layer_base == kUniformKvBase
+          ? static_cast<std::size_t>(layer_idx) * num_kv_heads * max_context *
+                head_dim
+          : layer_base;
   const std::size_t max_seq_len =
       static_cast<std::size_t>(start_pos) + batch_size;
   // The window bounds the visible score row, so a windowed policy always
@@ -438,8 +435,8 @@ void LaunchBatchedAttention(const float* q, const float* k, const float* v,     
   if (!skip_kv_write) {
     WriteBatchedKVCacheKernel<<<kv_grid, 256, 0, stream>>>(
         k, v, k_cache, v_cache, static_cast<__half*>(k_cache_f16),
-        static_cast<__half*>(v_cache_f16), layer_idx, start_pos, batch_size,
-        max_context, num_kv_heads, head_dim);
+        static_cast<__half*>(v_cache_f16), base, flint.kv_rows, start_pos,
+        batch_size, max_context, num_kv_heads, head_dim);
   }
 
   if (online) {
@@ -448,7 +445,8 @@ void LaunchBatchedAttention(const float* q, const float* k, const float* v,     
     LaunchCausalDecodeAttention(q, gate, k_cache, v_cache, k_cache_f16,
                                 v_cache_f16, out_context, layer_idx, start_pos,
                                 batch_size, max_context, num_heads,
-                                num_kv_heads, head_dim, stream, {}, policy);
+                                num_kv_heads, head_dim, stream, {}, policy,
+                                base);
     if (out_context_bf16 != nullptr)
       LaunchFloatToBfloat16(out_context, out_context_bf16,
                             batch_size * num_heads * head_dim, stream);
@@ -459,7 +457,7 @@ void LaunchBatchedAttention(const float* q, const float* k, const float* v,     
   BatchedAttentionKernel<<<attn_grid, 256, shared_scores_bytes, stream>>>(
       q, gate, k_cache, v_cache, static_cast<const __half*>(k_cache_f16),
       static_cast<const __half*>(v_cache_f16), out_context,
-      static_cast<hip_bfloat16*>(out_context_bf16), layer_idx, start_pos,
+      static_cast<hip_bfloat16*>(out_context_bf16), layer_idx, base, start_pos,
       batch_size, max_context, num_heads, num_kv_heads, head_dim, flint);
 }
 
@@ -549,9 +547,12 @@ void LaunchBatchedAttentionGemm(
   }
 
   const dim3 kv_grid(num_kv_heads, static_cast<unsigned int>(batch_size));
+  const std::size_t kv_base =
+      static_cast<std::size_t>(layer_idx) * num_kv_heads * max_context *
+      head_dim;
   WriteBatchedKVCacheKernel<<<kv_grid, 256, 0, stream>>>(
       k, v, k_cache, v_cache, static_cast<__half*>(k_cache_f16),
-      static_cast<__half*>(v_cache_f16), layer_idx, start_pos, batch_size,
+      static_cast<__half*>(v_cache_f16), kv_base, 0U, start_pos, batch_size,
       max_context, num_kv_heads, head_dim);
 
   const float attention_scale = 1.0F / sqrtf(static_cast<float>(head_dim));

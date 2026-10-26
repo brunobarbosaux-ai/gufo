@@ -84,10 +84,42 @@ std::shared_ptr<const FlintGpuModel> FlintGpuModel::CreateFromGguf(
 
 namespace {
 
+[[nodiscard]] std::uint32_t FlintKvLayerRows(
+    const core::ModelConfig& config, std::uint32_t max_context,
+    std::uint32_t layer) noexcept {
+  if (config.IsWindowedLayer(layer) && config.sliding_window != 0) {
+    // F-I2 ring: the row modulus must hold a full prefill chunk plus the
+    // previous window, so the bulk chunk write cannot collide with the keys
+    // the chunk's first query still needs (the write kernel is unordered).
+    const std::size_t ring =
+        static_cast<std::size_t>(config.sliding_window) +
+        kFlintPrefillBatchCapacity;
+    return static_cast<std::uint32_t>(
+        std::min<std::size_t>(max_context, ring));
+  }
+  return max_context;
+}
+
+/// F-I2 ring cache: fills `base` with the per-layer element offset of each
+/// layer's KV plane (K and V share it) and `rows` with the per-layer row
+/// count, and returns the total plane element count. Windowed layers hold
+/// `min(max_context, sliding_window + prefill chunk)` rows, global layers
+/// `max_context`.
 [[nodiscard]] std::size_t FlintArenaPlaneElements(
-    const core::ModelConfig& config, std::uint32_t max_context) noexcept {
-  return static_cast<std::size_t>(config.num_layers) *
-         config.num_key_value_heads * max_context * config.head_dim;
+    const core::ModelConfig& config, std::uint32_t max_context,
+    std::vector<std::size_t>* base, std::vector<std::uint32_t>* rows) {
+  const std::size_t kv_heads = config.num_key_value_heads;
+  const std::size_t head_dim = config.head_dim;
+  std::size_t offset = 0;
+  base->resize(config.num_layers);
+  rows->resize(config.num_layers);
+  for (std::uint32_t l = 0; l < config.num_layers; ++l) {
+    const std::uint32_t r = FlintKvLayerRows(config, max_context, l);
+    (*rows)[l] = r;
+    (*base)[l] = offset;
+    offset += kv_heads * r * head_dim;
+  }
+  return offset;
 }
 
 /// Tiled Q8_1 activation bytes (prefill_quant_gemm's layout: 16-token tiles of
@@ -120,7 +152,8 @@ FlintGpuArena::FlintGpuArena(const core::ModelConfig& config,
       std::max<std::size_t>(config.expert_feed_forward_length,
                             config.expert_shared_feed_forward_length));
   const std::size_t plane =
-      FlintArenaPlaneElements(config, max_context);
+      FlintArenaPlaneElements(config, max_context, &kv_layer_base_,
+                              &kv_layer_rows_);
 
   const std::size_t scratch_floats =
       hidden_size * 5 +  // hidden, normed, attn_proj, expert_out, mlp_out
@@ -194,6 +227,8 @@ FlintGpuArena::FlintGpuArena(const core::ModelConfig& config,
                       gufo::hip::kFlintMoeMaxJobs * sizeof(int)));
   buffers_.moe_partials = alloc(gufo::hip::kFlintMoeMaxJobs * hidden_size);
   buffers_.max_context = max_context;
+  buffers_.kv_layer_base = kv_layer_base_.data();
+  buffers_.kv_layer_rows = kv_layer_rows_.data();
   HIP_CHECK(hipStreamCreate(&buffers_.stream));
 
   // --- chunked-prefill scratch (F-L4) -------------------------------------
@@ -295,8 +330,12 @@ FlintGpuArena::FlintGpuArena(FlintGpuArena&& other) noexcept
     : config_(other.config_),
       max_context_(other.max_context_),
       scratch_bytes_(other.scratch_bytes_),
+      kv_layer_base_(std::move(other.kv_layer_base_)),
+      kv_layer_rows_(std::move(other.kv_layer_rows_)),
       buffers_(other.buffers_),
       prefill_(other.prefill_) {
+  buffers_.kv_layer_base = kv_layer_base_.data();
+  buffers_.kv_layer_rows = kv_layer_rows_.data();
   other.scratch_bytes_ = 0;
   other.buffers_ = {};
   other.prefill_ = {};
@@ -311,7 +350,11 @@ FlintGpuArena& FlintGpuArena::operator=(FlintGpuArena&& other) noexcept {
     config_ = other.config_;
     max_context_ = other.max_context_;
     scratch_bytes_ = other.scratch_bytes_;
+    kv_layer_base_ = std::move(other.kv_layer_base_);
+    kv_layer_rows_ = std::move(other.kv_layer_rows_);
     buffers_ = other.buffers_;
+    buffers_.kv_layer_base = kv_layer_base_.data();
+    buffers_.kv_layer_rows = kv_layer_rows_.data();
     prefill_ = other.prefill_;
     other.scratch_bytes_ = 0;
     other.buffers_ = {};

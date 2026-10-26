@@ -149,14 +149,16 @@ void RunFlintLayer(const models::FlintModelWeights& weights,
   // context at 16128.
   const detail::FlintKernelPolicy policy{
       static_cast<const float*>(layer.attn_sinks.data),
-      layer.attrs.windowed ? config.sliding_window : 0U};
+      layer.attrs.windowed ? config.sliding_window : 0U,
+      b.kv_layer_rows[layer_idx]};
   if (d_control != nullptr) {
     LaunchAttention(b.q, b.k, b.v, /*gate=*/nullptr, b.k_cache, b.v_cache,
                     b.k_cache_f16, b.v_cache_f16,
                     b.attn_out, layer_idx, d_control + 1, b.max_context,
                     config.num_attention_heads, config.num_key_value_heads,
                     config.head_dim, b.stream,
-                    /*skip_kv_write=*/false, &policy);
+                    /*skip_kv_write=*/false, &policy,
+                    b.kv_layer_base[layer_idx]);
   } else {
     LaunchAttention(b.q, b.k, b.v, /*gate=*/nullptr, b.k_cache, b.v_cache,
                     b.k_cache_f16, b.v_cache_f16,
@@ -164,7 +166,7 @@ void RunFlintLayer(const models::FlintModelWeights& weights,
                     config.num_attention_heads, config.num_key_value_heads,
                     config.head_dim, b.stream,
                     /*split_k_scratch=*/nullptr, /*skip_kv_write=*/false,
-                    &policy);
+                    &policy, b.kv_layer_base[layer_idx]);
   }
 
   // 6. O-projection + residual (3.3): the residual-add is the GEMV's
@@ -470,6 +472,13 @@ void ExecuteFlintDecodeStep(const models::FlintModelWeights& weights,
     const std::size_t kv_width =
         static_cast<std::size_t>(config.num_key_value_heads) *
         config.head_dim;
+    // F-I2 ring: layer 0's plane base and row count (windowed layers wrap).
+    const std::size_t layer0_base = b.kv_layer_base[0];
+    const std::uint32_t layer0_rows = b.kv_layer_rows[0];
+    const bool layer0_windowed = layer0_rows != b.max_context;
+    const auto kv_row = [&](std::uint32_t p_abs) {
+      return layer0_windowed ? (p_abs % layer0_rows) : p_abs;
+    };
     std::vector<float> f32_rows(n * kv_width);
     std::vector<std::uint16_t> f16_rows(n * kv_width);
     for (std::uint32_t kv_h = 0; kv_h < config.num_key_value_heads;
@@ -477,13 +486,11 @@ void ExecuteFlintDecodeStep(const models::FlintModelWeights& weights,
       for (std::uint32_t p = 0; p < n; ++p) {
         const std::uint32_t p_abs = lo + p;
         const std::size_t f32_off =
-            ((static_cast<std::size_t>(0) * config.num_key_value_heads +
-              kv_h) *
-                 b.max_context +
-             p_abs) *
-            config.head_dim;
+            layer0_base +
+            (static_cast<std::size_t>(kv_h) * layer0_rows + kv_row(p_abs)) *
+                config.head_dim;
         const std::size_t f16_off =
-            (static_cast<std::size_t>(p_abs) * kv_width) +
+            layer0_base + static_cast<std::size_t>(kv_row(p_abs)) * kv_width +
             static_cast<std::size_t>(kv_h) * config.head_dim;
         HIP_CHECK(hipMemcpy(
             f32_rows.data() + static_cast<std::size_t>(p) * kv_width +
@@ -514,11 +521,9 @@ void ExecuteFlintDecodeStep(const models::FlintModelWeights& weights,
       for (std::uint32_t p = 0; p < n; ++p) {
         const std::uint32_t p_abs = lo + p;
         const std::size_t f32_off =
-            ((static_cast<std::size_t>(0) * config.num_key_value_heads +
-              kv_h) *
-                 b.max_context +
-             p_abs) *
-            config.head_dim;
+            layer0_base +
+            (static_cast<std::size_t>(kv_h) * layer0_rows + kv_row(p_abs)) *
+                config.head_dim;
         HIP_CHECK(hipMemcpy(
             v32_rows.data() + static_cast<std::size_t>(p) * kv_width +
                 static_cast<std::size_t>(kv_h) * config.head_dim,

@@ -89,6 +89,17 @@ class FlintGpuArena {
   [[nodiscard]] std::uint32_t GetMaxContext() const noexcept {
     return max_context_;
   }
+  /// F-I2 ring cache: per-layer KV plane element offsets (K and V share
+  /// them), indexed by layer_idx. Windowed layers hold fewer rows than
+  /// max_context.
+  [[nodiscard]] const std::vector<std::size_t>& GetKvLayerBase() const noexcept {
+    return kv_layer_base_;
+  }
+  /// F-I2 ring cache: per-layer KV row count (the row modulus), indexed by
+  /// layer_idx. Windowed layers hold fewer rows than max_context.
+  [[nodiscard]] const std::vector<std::uint32_t>& GetKvLayerRows() const noexcept {
+    return kv_layer_rows_;
+  }
   /// Device bytes owned by this arena (scratch + KV cache), for the
   /// memory-budget accounting in §9.
   [[nodiscard]] std::size_t GetScratchBytes() const noexcept {
@@ -101,6 +112,8 @@ class FlintGpuArena {
   core::ModelConfig config_;
   std::uint32_t max_context_;
   std::size_t scratch_bytes_{0};
+  std::vector<std::size_t> kv_layer_base_;
+  std::vector<std::uint32_t> kv_layer_rows_;
   FlintGpuStepBuffers buffers_{};
   FlintPrefillBuffers prefill_{};
   FlintDecodeGraphState graph_state_{};
