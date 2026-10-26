@@ -149,6 +149,56 @@ struct QwenToolCallScan {
 /// argument coercion and OpenAI shaping stay with the API surface.
 [[nodiscard]] QwenToolCallScan ScanQwenToolCall(std::string_view text);
 
+/// The literals that frame a native flint tool call. FlintChatTemplate renders
+/// historical calls with these, and ScanFlintToolCall reads the same bytes
+/// back, so the wire format cannot change in one direction only.
+struct FlintToolSyntax {
+  static constexpr std::string_view kCallOpen = "<tool_call>";
+  static constexpr std::string_view kCallClose = "</tool_call>";
+  static constexpr std::string_view kArgKeyOpen = "<arg_key>";
+  static constexpr std::string_view kArgKeyClose = "</arg_key>";
+  static constexpr std::string_view kArgValueOpen = "<arg_value>";
+  static constexpr std::string_view kArgValueClose = "</arg_value>";
+};
+
+/// One flint argument exactly as the model wrote it, before the API surface
+/// decides whether it is a string or JSON. Flint carries no type flag and no
+/// framing newlines: the value is the raw bytes between the delimiters.
+struct FlintToolCallParameter {
+  std::string name;   ///< Spelled between "<arg_key>" and "</arg_key>".
+  std::string value;  ///< Raw bytes between "<arg_value>" and "</arg_value>".
+  /// Bytes of the scanned text consumed through this parameter's closing
+  /// delimiter. Recovery resumes here when the API surface rejects it.
+  std::size_t progress{0};
+};
+
+/// One flint call exactly as written, before schema interpretation.
+struct FlintToolCallSyntax {
+  std::string name;
+  std::vector<FlintToolCallParameter> parameters;
+  /// The parameter whose value ran to the end of the scan without a closing
+  /// delimiter.
+  std::optional<FlintToolCallParameter> unfinished;
+  /// The closing call tag and every parameter delimiter were present.
+  bool complete{false};
+};
+
+/// One scan step over a flint response. The caller keeps quote state and
+/// schema interpretation; this result carries only the dialect bytes.
+struct FlintToolCallScan {
+  bool matched{false};  ///< `text` begins with FlintToolSyntax::kCallOpen.
+  /// Bytes of `text` consumed before scanning resumes when the call is not
+  /// accepted into the API output.
+  std::size_t progress{0};
+  /// Bytes of `text` belonging to a complete envelope.
+  std::size_t end{0};
+  std::optional<FlintToolCallSyntax> call;  ///< Absent when nothing parsed.
+};
+
+/// Scans the flint call beginning at `text[0]`, if any. Schema interpretation,
+/// argument coercion and OpenAI shaping stay with the API surface.
+[[nodiscard]] FlintToolCallScan ScanFlintToolCall(std::string_view text);
+
 enum class QwenReasoningEffort : std::uint8_t {
   kLow,
   kMedium,
@@ -292,7 +342,7 @@ private:
 /// Framing: `<|system|>` / `<|user|>` / `<|assistant|>` / `<|observation|>`,
 /// no ChatML im_start tokens and no injected BOS.
 class FlintChatTemplate {
- public:
+public:
   /// SHA-256 of the flint `tokenizer.chat_template` this renderer reproduces.
   [[nodiscard]] static std::string_view PinnedTemplateSha256() noexcept;
 

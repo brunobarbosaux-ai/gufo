@@ -1,7 +1,5 @@
 #include "src/cli/serve/inference_backend.hpp"
 
-#include "src/core/hip/detail/dispatch_telemetry.hpp"
-
 #include <unistd.h>
 
 #include <algorithm>
@@ -28,9 +26,10 @@
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
-#include "src/core/gguf_identity.hpp"
 #include "src/core/flint_options.hpp"
+#include "src/core/gguf_identity.hpp"
 #include "src/core/gguf_reader.hpp"
+#include "src/core/hip/detail/dispatch_telemetry.hpp"
 #include "src/core/json.hpp"
 #include "src/core/sampling.hpp"
 #include "src/models/qwen/chat_template.hpp"
@@ -2350,8 +2349,8 @@ public:
   [[nodiscard]] hip::FlintDecodeGraphState* graph_state() noexcept {
     return arena_.GetGraphState();
   }
-  [[nodiscard]] const hip::FlintPrefillBuffers& prefill_buffers() const
-      noexcept {
+  [[nodiscard]] const hip::FlintPrefillBuffers& prefill_buffers()
+      const noexcept {
     return prefill_;
   }
   [[nodiscard]] std::size_t position() const noexcept { return position_; }
@@ -2390,6 +2389,9 @@ const FlintTextRunnerState& RequireFlintState(const TextRunnerState& state) {
 
 class FlintTextRunner final : public HipTextModelRunner {
 public:
+  sampling::JsonConstraint::ToolFormat ToolFormat() const override {
+    return sampling::JsonConstraint::ToolFormat::kFlint;
+  }
   FlintTextRunner(std::shared_ptr<const hip::FlintGpuModel> model,
                   std::shared_ptr<const tokenization::QwenTokenizer> tokenizer,
                   std::uint32_t max_context)
@@ -2516,16 +2518,14 @@ public:
     std::size_t batched = 0;
     if (hip::FlintPrefillSupported(model_->GetWeights()) &&
         offset < hip::FlintPrefillPositionCap(max_context_)) {
-      batched = std::min(
-          consumed,
-          hip::FlintPrefillPositionCap(max_context_) -
-              static_cast<std::size_t>(offset));
+      batched = std::min(consumed, hip::FlintPrefillPositionCap(max_context_) -
+                                       static_cast<std::size_t>(offset));
     }
     std::size_t done = 0;
     const auto prefill_t0 = std::chrono::steady_clock::now();
     while (done < batched) {
-      const std::size_t take = std::min(hip::kFlintPrefillBatchCapacity,
-                                        batched - done);
+      const std::size_t take =
+          std::min(hip::kFlintPrefillBatchCapacity, batched - done);
       const bool final_take = last_chunk && done + take == consumed;
       const auto chunk_t0 = std::chrono::steady_clock::now();
       hip::ExecuteFlintPrefillChunk(
@@ -2556,8 +2556,8 @@ public:
       const auto prefill_t1 = std::chrono::steady_clock::now();
       std::clog << "{\"component\":\"gufo.dispatch\",\"event\":"
                    "\"flint_prefill\",\"offset\":"
-                << offset << ",\"batched\":" << batched << ",\"consumed\":"
-                << consumed << ",\"ms\":"
+                << offset << ",\"batched\":" << batched
+                << ",\"consumed\":" << consumed << ",\"ms\":"
                 << std::chrono::duration<double, std::milli>(prefill_t1 -
                                                              prefill_t0)
                        .count()
@@ -2567,10 +2567,10 @@ public:
       // Steps queue on the arena stream: consecutive tokens need no host
       // round-trip, and only the final prompt token needs the logits.
       const bool compute_logits = last_chunk && i + 1 == consumed;
-      hip::ExecuteFlintDecodeStep(
-          model_->GetWeights(), prompt[offset + i],
-          static_cast<std::uint32_t>(offset + i), compute_logits,
-          flint.buffers(), /*timings=*/nullptr, flint.graph_state());
+      hip::ExecuteFlintDecodeStep(model_->GetWeights(), prompt[offset + i],
+                                  static_cast<std::uint32_t>(offset + i),
+                                  compute_logits, flint.buffers(),
+                                  /*timings=*/nullptr, flint.graph_state());
       if (compute_logits) {
         HIP_CHECK(hipStreamSynchronize(flint.buffers().stream));
         HIP_CHECK(hipMemcpy(flint.logits().data(), flint.buffers().logits,

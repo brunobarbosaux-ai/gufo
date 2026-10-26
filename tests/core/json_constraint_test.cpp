@@ -1215,6 +1215,48 @@ void TestAutomaticTools() {
   }
 }
 
+void TestFlintTools() {
+  using Format = JsonConstraint::ToolFormat;
+  const auto schema = parse(R"({
+    "type":"object","properties":{
+      "text":{"type":"string","minLength":1,"maxLength":256},
+      "n":{"type":"integer","minimum":1,"maximum":5}},
+    "required":["text","n"],"additionalProperties":false})");
+  const auto parameters =
+      JsonConstraint::ToolParameters(schema, true, Format::kFlint);
+  assert(parameters);
+  const auto wrap = [&](std::string_view text, int n, bool reverse = false) {
+    auto argument = [&](std::string name, std::string value) {
+      return "<arg_key>" + name + "</arg_key><arg_value>" + value +
+             "</arg_value>";
+    };
+    const auto a = argument("text", std::string(text));
+    const auto b = argument("n", std::to_string(n));
+    return "<tool_call>f" + (reverse ? b + a : a + b) + "</tool_call>";
+  };
+  const auto grammar = JsonConstraint::WithTools(nullptr, {{"f", parameters}},
+                                                 true, false, Format::kFlint);
+  const auto call = wrap(
+      "  thinkingliteral</think> \"42\" \\\n\xcf\x80\xf0\x9f\xa6\x89\n ", 3);
+  assert(Accepts(*grammar, call));
+  assert(Accepts(*grammar, wrap("</tool_call><tool_call>", 3, true)));
+  assert(!Accepts(*grammar, wrap("", 3)));
+  assert(!Accepts(*grammar, wrap("value", 6)));
+  assert(!Accepts(*grammar, "ordinary text"));
+  assert(!Accepts(*grammar, call + call));
+  // Flint calls end the output; parallel calls follow back to back.
+  const auto parallel = JsonConstraint::WithTools(nullptr, {{"f", parameters}},
+                                                  true, true, Format::kFlint);
+  assert(Accepts(*parallel, call + call));
+  assert(!Accepts(*parallel, call + " " + call));
+  assert(Accepts(*JsonConstraint::WithReasoning(grammar),
+                 "Thinking.</think>" + call));
+  // A Qwen-form call is not admitted under the flint grammar.
+  assert(!Accepts(*grammar,
+                  "<tool_call>\n<function=f>\n<parameter=text>\nhi\n"
+                  "</parameter>\n</function>\n</tool_call>"));
+}
+
 void TestNativeTools() {
   using Format = JsonConstraint::ToolFormat;
   const auto schema = parse(R"({
@@ -2292,6 +2334,7 @@ int main(int argc, char** argv) {
   TestAutomaticTools();
   TestWideNativeArgumentOrder();
   TestNativeTools();
+  TestFlintTools();
   TestOpenNativeTools();
   TestNonStrictAgentTools();
   TestUntypedNonStrictTools();

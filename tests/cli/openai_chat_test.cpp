@@ -622,6 +622,75 @@ void TestToolCallsAreStructured() {
          "Required tool choice reaches the model backend");
 }
 
+void TestFlintToolCalls() {
+  const char* tools = R"([{"type":"function","function":{
+      "name":"f","parameters":{"type":"object","properties":{
+        "text":{"type":"string"},"count":{"type":"integer"},
+        "flag":{"type":"boolean"},"tags":{"type":"array"},
+        "filter":{"type":"object"}}}}}])";
+  struct Case {
+    const char* raw;
+    std::size_t calls;
+    const char* arguments;
+  };
+  const Case cases[] = {
+      // Basic call: a string stays raw, an integer is JSON.
+      {"<tool_call>f<arg_key>text</arg_key><arg_value>42</arg_value>"
+       "<arg_key>count</arg_key><arg_value>42</arg_value></tool_call>",
+       1, R"({"text":"42","count":42})"},
+      // Nested object and unicode survive byte-for-byte.
+      {"<tool_call>f<arg_key>filter</arg_key>"
+       "<arg_value>{\"k\": [1, 2, {\"deep\": \"\xe5\x90\x8d\xe5\x89\x8d\"}]}"
+       "</arg_value><arg_key>text</arg_key><arg_value>\xf0\x9f\x9a\x80</"
+       "arg_value>"
+       "</tool_call>",
+       1,
+       "{\"filter\":{\"k\":[1,2,{\"deep\":\"\xe5\x90\x8d\xe5\x89\x8d\"}]},"
+       "\"text\":\"\xf0\x9f\x9a\x80\"}"},
+      // Empty argument list.
+      {"<tool_call>f</tool_call>", 1, "{}"},
+      // An unterminated value is not a complete call.
+      {"<tool_call>f<arg_key>text</arg_key><arg_value>partial", 0, ""},
+      // A call whose name is not declared is dropped.
+      {"<tool_call>g<arg_key>text</arg_key><arg_value>x</arg_value>"
+       "</tool_call>",
+       0, ""},
+      // Two sequential calls in one output.
+      {"<tool_call>f<arg_key>text</arg_key><arg_value>a</arg_value></tool_call>"
+       "<tool_call>f<arg_key>text</arg_key><arg_value>b</arg_value></"
+       "tool_call>",
+       2, R"({"text":"a"})"},
+  };
+  for (const auto& item : cases) {
+    FakeBackend backend;
+    backend.tool_format = gufo::sampling::JsonConstraint::ToolFormat::kFlint;
+    backend.pieces = {item.raw};
+    auto body = gufo::json::parse(R"({
+      "model":"test-model","messages":[{"role":"user","content":"call f"}],
+      "tool_choice":"auto"})");
+    body["tools"] = gufo::json::parse(tools);
+    const auto response =
+        gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+    Expect(response.status == 200, "Flint tool request is accepted");
+    const auto parsed = gufo::json::parse(response.body);
+    const auto* choices = parsed.find("choices");
+    const auto* message = choices && !choices->items().empty()
+                              ? choices->items().front().find("message")
+                              : nullptr;
+    const auto* calls = message ? message->find("tool_calls") : nullptr;
+    const std::size_t count =
+        calls && calls->is_array() ? calls->items().size() : 0;
+    Expect(count == item.calls, "Flint tool call count");
+    if (item.calls > 0) {
+      const auto* function = calls->items().front().find("function");
+      Expect(function && function->member_str("name") == "f",
+             "Flint tool name is translated");
+      Expect(function->member_str("arguments") == item.arguments,
+             "Flint tool arguments are translated to JSON");
+    }
+  }
+}
+
 void TestToolParameterCompatibility() {
   using gufo::json::Value;
   const std::pair<const char*, const char*> cases[] = {
@@ -5779,7 +5848,7 @@ void TestToolTagBoundaries() {
             continue;
           const auto prefix =
               initial == Initial::kContent ? std::string{}
-              : implicit                   ? std::string("Check tags.\n\n")
+              : implicit ? std::string("Check tags.\n\n")
                          : (initial == Initial::kAuto ? "<think>" : "") +
                                std::string("Check tags.</think>\n");
           const auto raw = prefix + call + "\n" + noop;
@@ -6322,6 +6391,7 @@ int main() {
   TestReasoningAnswerSeparator();
   TestConflictingReasoningControlsAreRejected();
   TestToolCallsAreStructured();
+  TestFlintToolCalls();
   TestToolParameterCompatibility();
   TestInvalidToolsFailBeforeGeneration();
   TestResponsesToolStrictness();

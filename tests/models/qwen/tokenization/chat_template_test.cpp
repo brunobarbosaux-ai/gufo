@@ -1195,6 +1195,88 @@ void TestStableBoundaryPrecedesReplacedFinalUserTurn() {
 
 }  // namespace
 
+void TestScanFlintToolCall() {
+  using gufo::tokenization::FlintToolSyntax;
+  using gufo::tokenization::ScanFlintToolCall;
+
+  // A complete call with two arguments.
+  {
+    const auto scan = ScanFlintToolCall(
+        "<tool_call>get_weather<arg_key>town</arg_key>"
+        "<arg_value>Curitiba</arg_value><arg_key>unit</arg_key>"
+        "<arg_value>c</arg_value></tool_call>");
+    Expect(scan.matched, "flint call matches");
+    Expect(scan.call.has_value(), "flint call parses");
+    Expect(scan.call->name == "get_weather", "flint call name");
+    Expect(scan.call->parameters.size() == 2, "flint call parameter count");
+    Expect(scan.call->parameters[0].name == "town" &&
+               scan.call->parameters[0].value == "Curitiba",
+           "flint first parameter");
+    Expect(scan.call->parameters[1].name == "unit" &&
+               scan.call->parameters[1].value == "c",
+           "flint second parameter");
+    Expect(scan.call->complete, "flint call complete");
+    Expect(scan.end == std::string_view(
+                           "<tool_call>get_weather<arg_key>town</arg_key>"
+                           "<arg_value>Curitiba</arg_value><arg_key>unit"
+                           "</arg_key><arg_value>c</arg_value></tool_call>")
+                           .size(),
+           "flint call end");
+  }
+
+  // Empty argument list.
+  {
+    const auto scan = ScanFlintToolCall("<tool_call>ping</tool_call>");
+    Expect(scan.matched && scan.call.has_value(), "flint empty call parses");
+    Expect(scan.call->name == "ping", "flint empty call name");
+    Expect(scan.call->parameters.empty(), "flint empty call has no args");
+    Expect(scan.call->complete, "flint empty call complete");
+  }
+
+  // Raw JSON and unicode values survive byte-for-byte.
+  {
+    const auto scan = ScanFlintToolCall(
+        "<tool_call>run_query<arg_key>filter</arg_key>"
+        "<arg_value>{\"k\": [1, 2, {\"deep\": \"\xe5\x90\x8d\xe5\x89\x8d\"}]}"
+        "</arg_value><arg_key>tag</arg_key><arg_value>\xf0\x9f\x9a\x80</"
+        "arg_value>"
+        "</tool_call>");
+    Expect(scan.call.has_value(), "flint unicode call parses");
+    Expect(scan.call->parameters[0].value ==
+               "{\"k\": [1, 2, {\"deep\": \"\xe5\x90\x8d\xe5\x89\x8d\"}]}",
+           "flint JSON value preserved");
+    Expect(scan.call->parameters[1].value == "\xf0\x9f\x9a\x80",
+           "flint unicode value preserved");
+  }
+
+  // An unterminated value is held back, not exposed as argument data.
+  {
+    const auto scan = ScanFlintToolCall(
+        "<tool_call>f<arg_key>text</arg_key><arg_value>partial");
+    Expect(scan.matched && scan.call.has_value(), "flint partial parses");
+    Expect(!scan.call->complete, "flint partial is incomplete");
+    Expect(scan.call->unfinished.has_value(), "flint partial has unfinished");
+    Expect(scan.call->unfinished->name == "text" &&
+               scan.call->unfinished->value == "partial",
+           "flint partial value");
+  }
+
+  // A name-only call with no closing tag is not a complete call.
+  {
+    const auto scan = ScanFlintToolCall("<tool_call>f");
+    Expect(scan.matched, "flint name-only matches");
+    Expect(!scan.call.has_value(), "flint name-only has no call");
+  }
+
+  // A non-flint opener does not match.
+  {
+    const auto scan = ScanFlintToolCall("<tool_call>\n<function=f>");
+    Expect(scan.matched, "flint shares the qwen opener");
+    Expect(!scan.call.has_value(),
+           "flint needs an argument or closing tag to name a call");
+  }
+}
+
 int main() {
   std::cout << "Running QwenChatTemplate unit tests...\n";
   TestBasicChatRendering();
@@ -1217,6 +1299,7 @@ int main() {
   TestToolReplayPreservesGeneratedPrefix();
   TestEmptyReasoningReplayChangesThinkingSuffixTokens();
   TestStableBoundaryPrecedesReplacedFinalUserTurn();
+  TestScanFlintToolCall();
   std::cout << "All QwenChatTemplate tests passed successfully!\n";
   return 0;
 }

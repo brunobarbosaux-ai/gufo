@@ -529,6 +529,78 @@ QwenToolCallScan ScanQwenToolCall(std::string_view text) {
   return result;
 }
 
+FlintToolCallScan ScanFlintToolCall(std::string_view text) {
+  FlintToolCallScan result;
+  if (!text.starts_with(FlintToolSyntax::kCallOpen))
+    return result;
+  result.matched = true;
+  const std::size_t begin = FlintToolSyntax::kCallOpen.size();
+  result.progress = begin;
+  result.end = begin;
+
+  FlintToolCallSyntax call;
+  std::string_view body = text.substr(begin);
+  // The name is the raw text before the first argument or the closing tag.
+  const auto name_end = body.find(FlintToolSyntax::kArgKeyOpen);
+  const auto close_end = body.find(FlintToolSyntax::kCallClose);
+  const auto name_stop = name_end == std::string_view::npos
+                             ? close_end
+                             : (close_end == std::string_view::npos
+                                    ? name_end
+                                    : std::min(name_end, close_end));
+  if (name_stop == std::string_view::npos)
+    return result;
+  call.name = std::string(TrimAscii(body.substr(0, name_stop)));
+  if (call.name.empty())
+    return result;
+  body.remove_prefix(name_stop);
+
+  bool valid = true;
+  while (body.starts_with(FlintToolSyntax::kArgKeyOpen)) {
+    body.remove_prefix(FlintToolSyntax::kArgKeyOpen.size());
+    const auto key_end = body.find(FlintToolSyntax::kArgKeyClose);
+    if (key_end == std::string_view::npos) {
+      valid = false;
+      break;
+    }
+    const std::string spelled(body.substr(0, key_end));
+    body.remove_prefix(key_end + FlintToolSyntax::kArgKeyClose.size());
+    if (!body.starts_with(FlintToolSyntax::kArgValueOpen)) {
+      valid = false;
+      break;
+    }
+    body.remove_prefix(FlintToolSyntax::kArgValueOpen.size());
+    const auto value_end = body.find(FlintToolSyntax::kArgValueClose);
+    if (value_end == std::string_view::npos) {
+      // An unterminated value holds back a possible partial closing delimiter
+      // so a streamed chunk boundary cannot expose it as argument data.
+      if (!spelled.empty()) {
+        call.unfinished =
+            FlintToolCallParameter{.name = spelled,
+                                   .value = std::string(BeforePartialDelimiter(
+                                       body, FlintToolSyntax::kArgValueClose)),
+                                   .progress = result.progress};
+      }
+      valid = false;
+      break;
+    }
+    call.parameters.push_back(
+        FlintToolCallParameter{.name = spelled,
+                               .value = std::string(body.substr(0, value_end)),
+                               .progress = result.progress});
+    body.remove_prefix(value_end + FlintToolSyntax::kArgValueClose.size());
+    result.progress = static_cast<std::size_t>(body.data() - text.data());
+    result.end = result.progress;
+  }
+  if (valid && body.starts_with(FlintToolSyntax::kCallClose)) {
+    result.progress += FlintToolSyntax::kCallClose.size();
+    result.end = result.progress;
+    call.complete = true;
+  }
+  result.call = std::move(call);
+  return result;
+}
+
 std::unique_ptr<QwenChatTemplate> QwenChatTemplate::CreateFromGguf(
     const core::GgufReader& reader, std::string* error_msg) {
   auto template_str = reader.GetMetadataString("tokenizer.chat_template");
@@ -959,8 +1031,9 @@ std::string EscapeFlintText(std::string_view text) {
   erase_all(&out, "</think>");
 
   constexpr std::string_view kMarkers[] = {
-      "<|begin_of_text|>", "<|end_of_text|>", "<|system|>", "<|developer|>",
-      "<|user|>",          "<|assistant|>",   "<|observation|>",
+      "<|begin_of_text|>", "<|end_of_text|>", "<|system|>",
+      "<|developer|>",     "<|user|>",        "<|assistant|>",
+      "<|observation|>",
   };
   for (const std::string_view marker : kMarkers) {
     std::string escaped;

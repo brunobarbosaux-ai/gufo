@@ -202,6 +202,27 @@ public:
   }
 
 private:
+  // Flint and Qwen both carry untyped, raw-text parameters; only the
+  // delimiters differ. DeepSeek carries a typed attribute instead.
+  static bool RawTextParameters(JsonConstraint::ToolFormat format) {
+    return format == JsonConstraint::ToolFormat::kQwen ||
+           format == JsonConstraint::ToolFormat::kFlint;
+  }
+
+  // The literal framing one native parameter: the opener written before the
+  // value and the closer written after it.
+  static std::pair<std::string, std::string> ParameterFraming(
+      JsonConstraint::ToolFormat format, std::string_view name) {
+    using Format = JsonConstraint::ToolFormat;
+    if (format == Format::kQwen)
+      return {"<parameter=" + std::string(name) + ">\n", "\n</parameter>\n"};
+    if (format == Format::kFlint)
+      return {"<arg_key>" + std::string(name) + "</arg_key><arg_value>",
+              "</arg_value>"};
+    return {"<｜DSML｜parameter name=\"" + std::string(name) + "\" string=\"",
+            "</｜DSML｜parameter>"};
+  }
+
   std::shared_ptr<const JsonConstraint> Finish() {
     // Native parameters need the same productivity check as JSON. Otherwise
     // an impossible required field can admit its tag and then dead-end.
@@ -308,10 +329,11 @@ public:
     const bool open = !strict_ && !ClosedProperties(*root, best_effort) &&
                       (root->contains("additionalProperties") ||
                        (best_effort && AdmitsExtraProperties(*root)));
-    // Qwen has no type flag for wildcard parameters. Unknown names are text
-    // in its parser: emitting native tags would turn 1/true/null/[]/{} into
-    // strings. Preserve JSON types instead of guessing from their spelling.
-    if (open && format == Format::kQwen)
+    // Qwen and flint have no type flag for wildcard parameters. Unknown names
+    // are text in their parsers: emitting native tags would turn
+    // 1/true/null/[]/{} into strings. Preserve JSON types instead of guessing
+    // from their spelling.
+    if (open && RawTextParameters(format))
       return {};
     if (const auto* extra = root->find("additionalProperties");
         extra && !extra->is_bool() &&
@@ -332,14 +354,13 @@ public:
       if (name.empty() || name.find_first_of("<>\"=\r\n") != std::string::npos)
         return {};
       // The loose route handles literal names outside this simple subset.
-      if (format == Format::kQwen &&
+      if (RawTextParameters(format) &&
           (std::string_view(" \t\f\v").find(name.front()) !=
                std::string_view::npos ||
            std::string_view(" \t\f\v").find(name.back()) !=
                std::string_view::npos))
         return {};
-      const std::string close =
-          format == Format::kQwen ? "\n</parameter>\n" : "</｜DSML｜parameter>";
+      const std::string close = ParameterFraming(format, name).second;
       const auto* schema = NativeSchema(original);
       const auto* type = schema ? schema->find("type") : nullptr;
       if (!type || !type->is_string() || schema->contains("anyOf")) {
@@ -357,7 +378,7 @@ public:
           return {};
         const bool text = types[kStringType];
         std::uint32_t typed = 0;
-        if (!text || format != Format::kQwen) {
+        if (!text || !RawTextParameters(format)) {
           bool supported = true;
           try {
             auto probe = JsonConstraintCompiler(schema_, strict_, true);
@@ -371,9 +392,9 @@ public:
         const auto raw = Optional(
             Lexeme(JsonSchemaLexeme::RawString(json::Value::object(), close)));
         std::uint32_t value;
-        if (format == Format::kQwen) {
-          value =
-              Seq({Literal("<parameter=" + name + ">\n"), text ? raw : typed});
+        if (RawTextParameters(format)) {
+          value = Seq({Literal(ParameterFraming(format, name).first),
+                       text ? raw : typed});
         } else {
           const auto open =
               "<｜DSML｜parameter name=\"" + name + "\" string=\"";
@@ -387,7 +408,7 @@ public:
         members.emplace_back(
             name,
             Seq({value,
-                 Literal(format == Format::kQwen ? close : close + "\n")}));
+                 Literal(RawTextParameters(format) ? close : close + "\n")}));
         continue;
       }
       const bool string = type->str() == "string";
@@ -436,14 +457,14 @@ public:
       } else {
         value = Visit(original, 1);
       }
-      const auto open = format == Format::kQwen
-                            ? "<parameter=" + name + ">\n"
-                            : "<｜DSML｜parameter name=\"" + name +
-                                  "\" string=\"" + (string ? "true" : "false") +
-                                  "\">";
-      members.emplace_back(
-          name, Seq({Literal(open), value,
-                     Literal(format == Format::kQwen ? close : close + "\n")}));
+      const auto framing = ParameterFraming(format, name);
+      const auto open = RawTextParameters(format)
+                            ? framing.first
+                            : framing.first + (string ? "true\">" : "false\">");
+      members.emplace_back(name, Seq({Literal(open), value,
+                                      Literal(RawTextParameters(format)
+                                                  ? framing.second
+                                                  : framing.second + "\n")}));
     }
     const auto body = Arguments(members, required);
     grammar_->root_ =
@@ -462,9 +483,11 @@ public:
       JsonConstraint::ToolFormat format) {
     using Format = JsonConstraint::ToolFormat;
     ignore_unknown_keys_ = true;
-    const bool qwen = format == Format::kQwen;
-    const std::string close =
-        qwen ? "\n</parameter>\n" : "</｜DSML｜parameter>";
+    const bool raw_text = RawTextParameters(format);
+    const std::string close = format == Format::kQwen ? "\n</parameter>\n"
+                              : format == Format::kFlint
+                                  ? "</arg_value>"
+                                  : "</｜DSML｜parameter>";
     // A root reference is followed as ToolParameters does; other roots that
     // are not objects declare no parameters, as in llama.cpp.
     const auto* root = &schema_;
@@ -496,8 +519,8 @@ public:
       // A name holding the tag's own delimiter cannot be read back. Other
       // names, including surrounding spaces, are written literally as llama.cpp
       // does; the parser matches declared names exactly.
-      if (name.empty() ||
-          name.find_first_of(qwen ? ">\r\n" : "\"\r\n") != std::string::npos) {
+      if (name.empty() || name.find_first_of(raw_text ? ">\r\n" : "\"\r\n") !=
+                              std::string::npos) {
         required.erase(name);
         continue;
       }
@@ -506,7 +529,7 @@ public:
         types.set();
       const bool text = types[kStringType];
       std::uint32_t typed = 0;
-      if (!text || !qwen) {
+      if (!text || !raw_text) {
         // Probe separately, including productivity: an unsatisfiable value
         // is guidance here and must not make the whole tool uncallable.
         bool supported = true;
@@ -557,9 +580,9 @@ public:
         }
       }
       std::uint32_t value;
-      if (qwen) {
-        value =
-            Seq({Literal("<parameter=" + name + ">\n"), text ? raw : typed});
+      if (raw_text) {
+        value = Seq({Literal(ParameterFraming(format, name).first),
+                     text ? raw : typed});
       } else {
         const auto open = "<｜DSML｜parameter name=\"" + name + "\" string=\"";
         Sequence choices;
@@ -569,8 +592,8 @@ public:
           choices.push_back(Seq({Literal(open + "false\">"), typed}));
         value = Alt(choices);
       }
-      members.emplace_back(name,
-                           Seq({value, Literal(qwen ? close : close + "\n")}));
+      members.emplace_back(
+          name, Seq({value, Literal(raw_text ? close : close + "\n")}));
     }
     grammar_->root_ = Arguments(members, required);
     return Finish();
@@ -625,7 +648,7 @@ private:
   std::uint32_t OpenToolParameter(JsonConstraint::ToolFormat format,
                                   const json::Value& properties) {
     using Format = JsonConstraint::ToolFormat;
-    const bool qwen = format == Format::kQwen;
+    const bool raw_text = RawTextParameters(format);
     // Dynamic names must survive the native parser's trimming and cannot
     // contain tag/attribute delimiters. Values retain literal UTF-8 text.
     auto name_schema = json::parse(
@@ -644,18 +667,34 @@ private:
       name_schema["pattern"] =
           excluded + name_schema.find("pattern")->str().substr(1);
     }
-    const auto name =
-        Lexeme(JsonSchemaLexeme::RawString(name_schema, qwen ? ">" : "\""));
-    const std::string close =
-        qwen ? "\n</parameter>\n" : "</｜DSML｜parameter>";
+    const auto name = Lexeme(JsonSchemaLexeme::RawString(
+        name_schema, format == Format::kQwen    ? ">"
+                     : format == Format::kFlint ? "<"
+                                                : "\""));
+    const std::string close = format == Format::kQwen ? "\n</parameter>\n"
+                              : format == Format::kFlint
+                                  ? "</arg_value>"
+                                  : "</｜DSML｜parameter>";
     const auto raw = Optional(
         Lexeme(JsonSchemaLexeme::RawString(json::Value::object(), close)));
-    const auto value = qwen ? Seq({Literal(">\n"), raw})
-                            : Alt({Seq({Literal("\" string=\"true\">"), raw}),
-                                   Seq({Literal("\" string=\"false\">"),
-                                        GenericValue(kMaxDepth)})});
-    return Seq({Literal(qwen ? "<parameter=" : "<｜DSML｜parameter name=\""),
-                name, value, Literal(qwen ? close : close + "\n")});
+    if (format == Format::kFlint) {
+      // Flint names are framed by their own closing tag, not a delimiter
+      // byte, so the dynamic name is a raw string up to "</arg_key>".
+      const auto flint_name =
+          Lexeme(JsonSchemaLexeme::RawString(name_schema, "</arg_key>"));
+      return Seq({Literal("<arg_key>"), flint_name,
+                  Literal("</arg_key><arg_value>"), raw,
+                  Literal("</arg_value>")});
+    }
+    const auto value = format == Format::kQwen
+                           ? Seq({Literal(">\n"), raw})
+                           : Alt({Seq({Literal("\" string=\"true\">"), raw}),
+                                  Seq({Literal("\" string=\"false\">"),
+                                       GenericValue(kMaxDepth)})});
+    return Seq({Literal(format == Format::kQwen ? "<parameter="
+                                                : "<｜DSML｜parameter name=\""),
+                name, value,
+                Literal(format == Format::kQwen ? close : close + "\n")});
   }
 
   // JSON value kinds a parameter admits, as llama.cpp common/json-schema.cpp
@@ -1875,7 +1914,16 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::OpenToolParameters(
     return JsonConstraintCompiler(schema, false)
         .OpenToolParameters(ToolFormat::kDeepSeek);
   }();
-  return format == ToolFormat::kQwen ? qwen : deepseek;
+  static const auto flint = [] {
+    const auto schema = json::Value::object();
+    return JsonConstraintCompiler(schema, false)
+        .OpenToolParameters(ToolFormat::kFlint);
+  }();
+  if (format == ToolFormat::kQwen)
+    return qwen;
+  if (format == ToolFormat::kFlint)
+    return flint;
+  return deepseek;
 }
 
 std::shared_ptr<const JsonConstraint> JsonConstraint::WithReasoning(
@@ -1997,11 +2045,13 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::WithTools(
     return id;
   };
   const bool deepseek = format == ToolFormat::kDeepSeek;
+  const bool flint = format == ToolFormat::kFlint;
   const std::string_view marker =
       deepseek ? "<｜DSML｜tool_calls>" : "<tool_call>";
   const auto end = literal(format == ToolFormat::kJson ? "}</tool_call>"
                            : deepseek                  ? "</｜DSML｜invoke>"
-                                      : "</function>\n</tool_call>");
+                           : flint ? "</tool_call>"
+                                   : "</function>\n</tool_call>");
   const auto calls = static_cast<std::uint32_t>(grammar->rules_.size());
   grammar->rules_.push_back({});
   // In tool-only mode ordinary text remains unconstrained until a canonical
@@ -2043,13 +2093,18 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::WithTools(
   // each other, and no text may follow them. Text after a call is where
   // echoed framing used to leak into content (#383, #438).
   const bool qwen = format == ToolFormat::kQwen;
-  const bool ends_output = deepseek || qwen || !plain_answer;
+  const bool ends_output = deepseek || qwen || flint || !plain_answer;
   auto after = ends_output ? static_cast<std::uint32_t>(grammar->rules_.size())
                : parallel  ? prose
                            : text(UINT32_MAX);
   if (ends_output) {
     grammar->rules_.push_back({{}});
-    if (qwen) {
+    if (flint) {
+      // Flint writes calls back to back with no separator, so a call ends
+      // the output or is followed directly by another call.
+      if (parallel)
+        grammar->rules_[after].push_back({literal(marker), calls});
+    } else if (qwen) {
       // llama.cpp SPACE_RULE: empty, one space, or 1–2 newlines followed
       // by up to 20 spaces/tabs (common/json-schema-to-grammar.cpp).
       const auto space = static_cast<std::uint32_t>(grammar->rules_.size());
@@ -2095,6 +2150,7 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::WithTools(
   if (format != ToolFormat::kJson) {
     grammar->reasoning_tool_prefix_ =
         deepseek ? "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\""
+        : flint  ? "<tool_call>"
                  : "<tool_call>\n<function=";
     grammar->reasoning_tool_root_ = grammar->rules_.size();
     grammar->rules_.push_back({});
@@ -2104,12 +2160,15 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::WithTools(
         format == ToolFormat::kJson
             ? "{\"name\":" + json::Value(name).dump() + ",\"arguments\":"
         : deepseek ? "\n<｜DSML｜invoke name=\"" + name + "\">\n"
+        : flint    ? name
                    : "\n<function=" + name + ">\n");
     if (const auto found = imported.find(arguments.get());
         found != imported.end()) {
       grammar->rules_[calls].push_back({begin, found->second, end, after});
       if (format != ToolFormat::kJson) {
-        const auto named = literal(name + (deepseek ? "\">\n" : ">\n"));
+        const auto named = literal(deepseek ? name + "\">\n"
+                                   : flint  ? name
+                                            : name + ">\n");
         grammar->rules_[grammar->reasoning_tool_root_].push_back(
             {named, found->second, end, after});
       }
@@ -2149,7 +2208,9 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::WithTools(
     imported.emplace(arguments.get(), root);
     grammar->rules_[calls].push_back({begin, root, end, after});
     if (format != ToolFormat::kJson) {
-      const auto named = literal(name + (deepseek ? "\">\n" : ">\n"));
+      const auto named = literal(deepseek ? name + "\">\n"
+                                 : flint  ? name
+                                          : name + ">\n");
       grammar->rules_[grammar->reasoning_tool_root_].push_back(
           {named, root, end, after});
     }
@@ -2157,6 +2218,8 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::WithTools(
   if (plain_answer && !required)
     alternatives.push_back({prose});
   else if (format == ToolFormat::kJson)
+    alternatives.push_back({literal(marker), calls});
+  else if (flint)
     alternatives.push_back({literal(marker), calls});
   else {
     std::bitset<256> whitespace;
