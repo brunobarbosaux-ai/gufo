@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <span>
 #include <string>
@@ -1478,6 +1479,59 @@ void RunKeyCountProof(const gufo::hip::FlintGpuModel& model) {
 
 }  // namespace
 
+namespace {
+
+/// Dominant weight quantisation of the artifact: the GGML type that owns the
+/// most bytes among quantised tensors. Float tensors (norms, biases, router
+/// scalars) are skipped so a few F32 tensors cannot mask the body of the model.
+gufo::core::GgmlType DominantWeightType(const gufo::core::GgufReader& reader) {
+  std::map<gufo::core::GgmlType, std::size_t> bytes_by_type;
+  for (const auto& t : reader.GetTensors()) {
+    switch (t.type) {
+      case gufo::core::GgmlType::kF32:
+      case gufo::core::GgmlType::kF16:
+      case gufo::core::GgmlType::kBF16:
+      case gufo::core::GgmlType::kI32:
+        continue;
+      default:
+        bytes_by_type[t.type] += t.size_bytes;
+    }
+  }
+  gufo::core::GgmlType best = gufo::core::GgmlType::kF16;
+  std::size_t best_bytes = 0;
+  for (const auto& [type, bytes] : bytes_by_type) {
+    if (bytes > best_bytes) {
+      best = type;
+      best_bytes = bytes;
+    }
+  }
+  return best;
+}
+
+/// Quant-aware fp32-path |dlogp| gate. Low-bit quants (IQ2/IQ3/IQ4/Q2-Q4
+/// families) have near-tie routing and argmax forks that legitimately move
+/// dlogp by O(0.1-1) while cos stays >= 0.999, so they get a loose bound.
+/// Q5 and up keep the tight bound. Float weights keep the tight bound too.
+double Fp32LogpGate(gufo::core::GgmlType weight_type) {
+  using T = gufo::core::GgmlType;
+  switch (weight_type) {
+    case T::kIQ2_XXS:
+    case T::kIQ3_S:
+    case T::kIQ4_NL:
+    case T::kIQ4_XS:
+    case T::kQ2_K:
+    case T::kQ3_K:
+    case T::kQ4_0:
+    case T::kQ4_1:
+    case T::kQ4_K:
+      return 0.5;
+    default:
+      return 5e-3;
+  }
+}
+
+}  // namespace
+
 int main(int argc, char** argv) {
   if (argc > 1 && std::string_view(argv[1]) == "synthq8") {
     SynthQ8SwiGLUCheck();
@@ -1515,6 +1569,7 @@ int main(int argc, char** argv) {
   std::string error;
   auto reader = gufo::core::GgufReader::OpenFile(env, &error);
   Expect(reader != nullptr, "open GGUF: " + error);
+  const gufo::core::GgmlType weight_type = DominantWeightType(*reader);
 
   // CPU reference weights: host pointers straight from the reader mapping.
   // The reader must outlive both weight sets.
@@ -1667,7 +1722,8 @@ int main(int argc, char** argv) {
       // path keeps the original gates.
       const bool f16_kv = kv.StoresF16();
       const double cos_gate = f16_kv ? 0.995 : 0.999;
-      const double logp_gate = f16_kv ? 10.0 : 5e-3;
+      const double logp_gate =
+          f16_kv ? 10.0 : Fp32LogpGate(weight_type);
       Expect(parity.cosine >= cos_gate,
              "cosine at step " + std::to_string(step) + " = " +
                  std::to_string(parity.cosine));
