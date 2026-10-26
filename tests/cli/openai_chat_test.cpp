@@ -2123,6 +2123,56 @@ void TestStreamingPromptOpenedReasoning() {
          "Reasoning is never exposed as visible content");
 }
 
+void TestFlintReasoningStreaming() {
+  // F-L6: the flint dialect's think markers must never leak as visible
+  // content, however the stream chunks split them. Every byte boundary is
+  // exercised, including a split inside "<think>" and inside "</think>".
+  const std::string raw =
+      "<think>Check the file, then answer.</think>\n\nThe file is fine.";
+  for (const bool split : {false, true}) {
+    FakeBackend backend;
+    backend.initial_output_state_override =
+        FakeBackend::InitialOutputState::kAuto;
+    if (split) {
+      for (const char byte : raw)
+        backend.pieces.emplace_back(1, byte);
+    } else {
+      backend.pieces = {raw};
+    }
+    auto body = gufo::json::parse(R"({
+      "model":"test-model","messages":[{"role":"user","content":"check"}],
+      "stream":true})");
+    const auto response =
+        gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+    Expect(response.status == 200, "Flint reasoning stream is accepted");
+    std::string output;
+    std::string reasoning;
+    std::string content;
+    response.streaming_body([&](std::string_view part) {
+      output.append(part);
+      if (part == "data: [DONE]\n\n")
+        return true;
+      const auto event = gufo::json::parse(part.substr(6));
+      for (const auto& choice : event.find("choices")->items()) {
+        if (const auto* delta = choice.find("delta")) {
+          reasoning += delta->member_str("reasoning_content");
+          content += delta->member_str("content");
+        }
+      }
+      return true;
+    });
+    // Byte-split pieces emit one delta per byte: judge the channels on
+    // their accumulated text, not on contiguous SSE bytes.
+    Expect(reasoning == "Check the file, then answer.",
+           "Flint reasoning reaches reasoning_content");
+    Expect(content == "The file is fine.",
+           "Flint answer reaches content after the think end");
+    Expect(output.find("<think>") == std::string::npos &&
+               output.find("</think>") == std::string::npos,
+           "Flint reasoning is never exposed as visible content");
+  }
+}
+
 void TestInitialOutputPhases() {
   using gufo::json::Value;
   struct Case {
@@ -6387,6 +6437,7 @@ int main() {
   TestPiReasoningControlsAndOutputFraming();
   TestPiNativeDeepSeekThinkingObject();
   TestStreamingPromptOpenedReasoning();
+  TestFlintReasoningStreaming();
   TestInitialOutputPhases();
   TestReasoningAnswerSeparator();
   TestConflictingReasoningControlsAreRejected();
