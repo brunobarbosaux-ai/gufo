@@ -543,6 +543,27 @@ if (BUILD_TESTING)
   set_tests_properties(text_model_runner_test PROPERTIES
     LABELS "cpu;server;runner;cache;state;lifecycle")
 
+  if (ENGINE_ENABLE_HIP)
+    # Compiles the serve backend directly (its FlintTextRunner lives in an
+    # anonymous namespace), so the link mirrors the gufo target minus main.cpp.
+    add_executable(flint_runner_snapshot_test
+      tests/cli/flint_runner_snapshot_test.cpp
+      src/cli/serve/inference_backend.cpp
+      src/cli/serve/continuation_cache.cpp
+      src/cli/serve/continuation_disk_store.cpp
+      src/cli/serve/component_text_cache.cpp
+      src/cli/serve/text_model_runner.cpp
+      src/cli/serve/text_generation_scheduler.cpp
+      src/eval/http_client.cpp)
+    target_link_libraries(flint_runner_snapshot_test PRIVATE
+      gufo_cache gufo_diagnostics gufo_core gufo_llm_cli gufo_http CURL::libcurl
+      gufo_cache_hip gufo_deepseek_v4_flash)
+    add_test(NAME flint_runner_snapshot_test COMMAND flint_runner_snapshot_test)
+    set_tests_properties(flint_runner_snapshot_test PROPERTIES
+      LABELS "hip;gpu;server;flint;snapshot"
+      SKIP_RETURN_CODE 77)
+  endif()
+
   add_executable(continuation_disk_store_test
     tests/cli/continuation_disk_store_test.cpp
     src/cli/serve/continuation_disk_store.cpp
