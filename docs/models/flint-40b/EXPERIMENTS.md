@@ -20,8 +20,17 @@ changes are in [BENCHMARKS.md](BENCHMARKS.md) (kernel-change history).
 | UD-Q6_K_XL vs IQ4_XS artifact (ceilings §7, F-J4) | IQ4_XS served default; Q6_K_XL kept as gate-calibration artifact | Prefill scales with bytes: msg 533.7 vs 695.9, doc 1165.4 vs 1439.7, long 1038.8 vs 1216.2 t/s (Q6 vs IQ4). Decode nearly invariant (36.7 vs 38.8, 19.7 vs 20.6, 10.6 vs 10.9). Decode is structurally bound, not weight-bandwidth bound. |
 | Fused vs unfused NoPE (1.8 / F-D3) | Not separately benchmarked | NoPE on the 14 global layers is driven by `rope_pattern`; correctness is covered by `qwen_flint_attention_test` and `qwen_flint_weights_test` (CPU). No speed A/B recorded. |
 | Full-KV vs ring cache (5.2/5.3) | Ring for windowed layers; full-KV kept for global layers | fp32 full at 128k ≈ 48.7 GB with IQ4_XS (over the 45 GiB budget). fp32 ring at 262k ≈ 37.5 GB (fits). Ring makes 262k claimable. |
+| Ring row modulus: divide vs mask (F-I2/F-J4, `4e7dfc25`) | Adopted: ring rows rounded up to a power of two, wrap with `position & (rows-1)` | The 1537-row ring put a runtime modulo in every key access of the 35 windowed-layer loops: decode 37.3/19.1/9.8 vs 38.3/20.0/10.4 pre-ring. Rounding to 2048 rows and masking restored 38.7/20.6/10.9 (Phase-3 record) and lifted prefill (doc 1653→1717, long 1345→1394 t/s). Costs +73 MiB fp32 windowed planes at 32k. |
 | Tile shapes at head_dim 128 (2.3) | Retired; current 16×16×16 tiles kept | Audit not executed because prefill reached the stretch floor (doc 1450 vs 1500 target, llama.cpp parity). Revisit only if prefill regresses. |
 | Decode floors 60/55/42 t/s (§9) | Revised to 38/20/10 t/s (user decision, 2026-10-25) | Measured sustained: 38.8 / 20.6 / 10.9. Byte-centric levers were measured out (f16 KV negative, decode quant-invariant). |
+
+## Measurement preconditions
+
+The Phase-3 record and the 2026-10-27 re-record were both taken with the iGPU
+DPM level locked to `high` (EC power mode `performance`). With DPM left at
+`auto`, the same pre-ring binary measures ~1.0 t/s lower on every cell
+(37.8/19.4/10.1 vs 38.3/20.0/10.4 at commit `f674e8fb`) and the floor is not
+reachable. Confirm both settings before quoting or comparing any F-J4 number.
 
 ## Not recorded
 

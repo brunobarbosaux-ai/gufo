@@ -29,6 +29,32 @@ Marginal prefill (long vs msg): ~817.4 t/s. Doc prefill is at llama.cpp
 parity on the IQ4_XS artifact (1439.7 vs 1444.4 measured on Q6_K); long
 prefill clears the ≥1200 floor.
 
+## F-J4 re-record after the ring fix — IQ4_XS
+
+2026-10-27, `feat/flint-ar` `4e7dfc25`, means of 3 after a warm-up, iGPU
+DPM locked to `high` (EC power mode `performance`). Same artifact, `-c 32768`.
+
+| Cell | Prompt tok | Prefill t/s | Decode t/s |
+| --- | ---: | ---: | ---: |
+| msg | 184 | 750.4 | **38.7** |
+| doc | 6652 | 1717.0 | **20.6** |
+| long | 23586 | 1394.0 | **10.9** |
+
+Clears the revised §9 floor (38/20/10) and returns to the Phase-3 record
+(38.8/20.6/10.9). Two independent gaps had to close:
+
+- **Environmental (~1.0 t/s).** The pre-ring layout measured 37.8/19.4/10.1
+  with the iGPU DPM level stuck at `auto`. Locking
+  `power_dpm_force_performance_level=high` (EC power mode `performance`) took
+  the same binary to 38.3/20.0/10.4. The Phase-3 record was measured with
+  this setting active; it is now part of the reproduce recipe.
+- **Ring (~0.7 t/s).** F-I2 allocated windowed layers
+  `min(max_context, 513 + 1024) = 1537` rows, so every key access in the 35
+  windowed-layer attention loops paid a runtime modulo. Rounding the ring up
+  to a power of two (2048) and wrapping with a mask restored the loss;
+  prefill also improved (doc 1653→1717, long 1345→1394). See the kernel
+  history row below.
+
 ## F-J4 serve cells — UD-Q6_K_XL (`flint-UD-Q6_K_XL.gguf`)
 
 2026-10-25, same binary, means of 2 (apples-to-apples against the llama.cpp
@@ -66,6 +92,7 @@ Flash attention made attention cost linear (143→39 ms @512, 450→85 ms
 | **Deterministic fused-MoE accumulation (3.6)** | `9215b85b` | replaced per-row `atomicAdd` (wave-order float adds = run-to-run noise that flipped fragile argmax ties) with disjoint per-job partials + fixed-order reduce; serve wander/G8 flakiness eliminated in both KV modes |
 | Global-layer routing (3.7) | `b3d39a38` | doc decode at `-c 8192`: 8.2→**20.7 t/s** (2.5×); spans >4096 always take the online-tile kernel |
 | Residual-epilogue fusion (3.3) | `65fc4f08` | o-proj/dense-down/MoE-reduce store `residual + A·x` directly (~94 launches/step fewer); numerically transparent, perf neutral (recorded) |
+| Ring rows rounded to a power of two (F-I2/F-J4) | `4e7dfc25` | windowed ring 1537→2048 rows and `position & (rows-1)` instead of `position % rows`: decode 37.3/19.1/9.8 → **38.7/20.6/10.9**, prefill doc +3.9% / long +3.6%; +73 MiB fp32 windowed planes at 32k |
 | f16 KV cache (opt-in, `GUFO_FLINT_KV_F16=1`) | `4c17326d` | machinery + gates green, but A/B **negative for decode** (doc −10%, long −15%): decode is not KV-byte-bound. Stays opt-in; valid for per-session KV-arena halving |
 | Flash-decode variants | — | all five rejected (recorded); fixed-LDS ladder remains for spans ≤4096 |
 
