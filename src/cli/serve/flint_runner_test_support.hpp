@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "src/cli/serve/text_model_runner.hpp"
+#include "src/models/qwen/hip/flint_gpu_model.hpp"
 
 namespace gufo::hip {
 class FlintGpuModel;
@@ -28,6 +29,9 @@ std::shared_ptr<TextModelRunner> MakeFlintTextRunnerForTest(
 /// Test-only: copy of the frontier logits of a flint state, or empty when the
 /// state has no frontier.
 std::vector<float> FlintFrontierLogitsForTest(const TextRunnerState& state);
+
+/// Test-only: the KV window class (F-I2 ring geometry) of a flint state.
+hip::FlintKvWindowClass FlintWindowClassForTest(const TextRunnerState& state);
 #endif
 
 }  // namespace gufo::server

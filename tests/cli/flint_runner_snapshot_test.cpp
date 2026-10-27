@@ -20,6 +20,7 @@
 namespace {
 
 using gufo::server::FlintFrontierLogitsForTest;
+using gufo::server::FlintWindowClassForTest;
 using gufo::server::MakeFlintTextRunnerForTest;
 using gufo::server::TextModelRunner;
 using gufo::server::TextRunnerSnapshot;
@@ -64,6 +65,14 @@ int main() {
   Expect(tokenizer_owned != nullptr, "create tokenizer: " + error);
   std::shared_ptr<const gufo::tokenization::QwenTokenizer> tokenizer =
       std::move(tokenizer_owned);
+
+  // F-I5: the four flint EOG terminators must be in the stop set. The
+  // non-conformant IQ4_XS omits tokenizer.ggml.eog_token_ids, so this also
+  // exercises the tokenizer's EOG-fallback derivation.
+  for (const std::uint32_t eog : {150001U, 150003U, 150005U, 150018U}) {
+    Expect(tokenizer->IsStopToken(eog),
+           "flint EOG id " + std::to_string(eog) + " must be a stop token");
+  }
 
   auto model = gufo::hip::FlintGpuModel::CreateFromGguf(
       std::shared_ptr<const gufo::core::GgufReader>(std::move(reader)), &error);
@@ -120,6 +129,35 @@ int main() {
   Expect(BitExact(FlintFrontierLogitsForTest(*state), logits2),
          "replayed step 2 logits must be bit-exact after restore");
 
+  // F-I5 (5.5): the persistent (disk) round trip. Serialize the snapshot to
+  // bytes, restore it into a fresh state as a restart would, and verify the
+  // frontier logits, the window class and the position survive.
+  const auto window_class = FlintWindowClassForTest(*state);
+  const std::size_t payload_bytes =
+      runner->PersistentSnapshotPayloadBytes(*snap);
+  Expect(payload_bytes > 0, "persistent payload must be non-empty");
+  std::vector<std::uint8_t> payload(payload_bytes);
+  Expect(runner->SerializePersistentSnapshot(*snap, payload) == payload_bytes,
+         "serialize must fill the exact payload size");
+
+  auto restored = runner->CreateState();
+  runner->RestorePersistentSnapshot(*restored, payload);
+  Expect(runner->CheckpointPosition(*restored) == pos0,
+         "persistent restore must land on the snapshot position");
+  Expect(BitExact(FlintFrontierLogitsForTest(*restored), logits0),
+         "persistent restore must reproduce the frontier logits");
+  Expect(FlintWindowClassForTest(*restored) == window_class,
+         "persistent restore must preserve the KV window class");
+
+  // Replaying the same two tokens must reproduce the same logits, which can
+  // only hold if the serialized KV planes were restored.
+  runner->Advance(*restored, t1);
+  Expect(BitExact(FlintFrontierLogitsForTest(*restored), logits1),
+         "persistent replay step 1 logits must be bit-exact");
+  runner->Advance(*restored, t2);
+  Expect(BitExact(FlintFrontierLogitsForTest(*restored), logits2),
+         "persistent replay step 2 logits must be bit-exact");
+
   // Negative: a state with a different max_context has another window class.
   const std::shared_ptr<TextModelRunner> other_runner =
       MakeFlintTextRunnerForTest(model, tokenizer, 1024);
@@ -136,6 +174,7 @@ int main() {
 
   std::cout << "flint snapshot hooks: prompt=16 pos0=" << pos0
             << " payload_bytes=" << snap->PayloadBytes()
+            << " persistent_bytes=" << payload_bytes
             << " frontier_logits=" << logits0.size() << " PASS\n";
   return 0;
 }

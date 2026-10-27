@@ -2396,6 +2396,57 @@ public:
   }
 };
 
+// Persistent (disk) layout for a flint snapshot (F-I5, 5.5). The in-memory
+// snapshot keeps host vectors; the disk payload is a fixed header followed by
+// the frontier logits and the two fp32 KV planes, so a restart rebuilds a
+// FlintTextRunnerSnapshot and reuses RestoreOrFork's validation.
+constexpr std::uint32_t kFlintPersistentMagic = 0x464C4E54U;  // "FLNT"
+constexpr std::uint32_t kFlintPersistentVersion = 1;
+
+struct FlintPersistentHeader {
+  std::uint32_t magic;
+  std::uint32_t version;
+  std::uint32_t sliding_window;
+  std::uint32_t num_layers;
+  std::uint32_t max_context;
+  std::uint32_t reserved;
+  std::uint64_t rows_checksum;
+  std::uint64_t position;
+  std::uint64_t frontier_count;
+  std::uint64_t plane_elements;
+};
+static_assert(sizeof(FlintPersistentHeader) == 56,
+              "flint persistent header must be 56 bytes");
+
+// Content identity that keys persistent flint continuations. Covers the
+// artifact, the KV layout (window class) and the served context, so a
+// restart with a different artifact or geometry rejects the cached payload.
+std::vector<std::uint8_t> FlintCompatibilityIdentity(
+    std::string_view artifact_fingerprint, std::uint32_t max_context,
+    const core::ModelConfig& config) {
+  if (!IsSha256Hex(artifact_fingerprint)) {
+    throw std::invalid_argument(
+        "flint disk cache requires an artifact fingerprint");
+  }
+  std::ostringstream identity;
+  identity << "schema=gufo-text-continuation-v2\n"
+           << "model_kind=flint\n"
+           << "artifact_id=" << core::kGgufIdentityScheme << ':'
+           << artifact_fingerprint << '\n'
+           << "tokenizer=embedded-in-artifact\n"
+           << "chat_template=flint-compiled-v1\n"
+           << "state_abi=" << kFlintStateAbi << '\n'
+           << "payload_layout=flint-kv-plane-v1\n"
+           << "kv_storage=fp32\n"
+           << "sliding_window=" << config.sliding_window << '\n'
+           << "num_layers=" << config.num_layers << '\n'
+           << "context_tokens=" << max_context << '\n'
+           << "position_policy=absolute-v1\n"
+           << "adapters=none\n";
+  const std::string canonical = identity.str();
+  return {canonical.begin(), canonical.end()};
+}
+
 FlintTextRunnerState& RequireFlintState(TextRunnerState& state) {
   auto* flint = dynamic_cast<FlintTextRunnerState*>(&state);
   if (flint == nullptr) {
@@ -2419,13 +2470,21 @@ public:
   }
   FlintTextRunner(std::shared_ptr<const hip::FlintGpuModel> model,
                   std::shared_ptr<const tokenization::QwenTokenizer> tokenizer,
-                  std::uint32_t max_context)
+                  std::uint32_t max_context,
+                  std::string artifact_fingerprint = {})
       : model_(std::move(model)),
         tokenizer_(std::move(tokenizer)),
         max_context_(max_context) {
     if (model_ == nullptr || tokenizer_ == nullptr) {
       throw std::invalid_argument(
           "the flint runner requires a model and a tokenizer");
+    }
+    if (!artifact_fingerprint.empty()) {
+      persistence_ = TextRunnerPersistenceDescriptor{
+          .compatibility_identity = FlintCompatibilityIdentity(
+              artifact_fingerprint, max_context_, model_->GetConfig()),
+          .payload_version = kFlintPersistentVersion,
+      };
     }
   }
 
@@ -2447,7 +2506,7 @@ public:
                 .partial_prefill_retention = false,
                 .prefill_rollback = false,
             },
-        .persistence = std::nullopt,
+        .persistence = persistence_,
     };
   }
 
@@ -2728,7 +2787,123 @@ public:
     }
   }
 
+  [[nodiscard]] std::size_t PersistentSnapshotPayloadBytes(
+      const TextRunnerSnapshot& snapshot) const override {
+    const auto* typed = dynamic_cast<const FlintTextRunnerSnapshot*>(&snapshot);
+    if (typed == nullptr) {
+      throw std::invalid_argument(
+          "flint persistent snapshot requires a flint snapshot");
+    }
+    return sizeof(FlintPersistentHeader) +
+           (typed->frontier_logits.size() + typed->k_plane.size() +
+            typed->v_plane.size()) *
+               sizeof(float);
+  }
+
+  [[nodiscard]] std::size_t SerializePersistentSnapshot(
+      const TextRunnerSnapshot& snapshot,
+      std::span<std::uint8_t> destination) const override {
+    const auto* typed = dynamic_cast<const FlintTextRunnerSnapshot*>(&snapshot);
+    if (typed == nullptr) {
+      throw std::invalid_argument(
+          "flint persistent snapshot requires a flint snapshot");
+    }
+    if (destination.size() != PersistentSnapshotPayloadBytes(snapshot)) {
+      throw std::invalid_argument(
+          "flint persistent snapshot destination size mismatch");
+    }
+    const FlintPersistentHeader header = FlintPersistentHeaderFor(*typed);
+    std::memcpy(destination.data(), &header, sizeof(header));
+    std::size_t offset = sizeof(header);
+    const auto write = [&](const std::vector<float>& plane) {
+      std::memcpy(destination.data() + offset, plane.data(),
+                  plane.size() * sizeof(float));
+      offset += plane.size() * sizeof(float);
+    };
+    write(typed->frontier_logits);
+    write(typed->k_plane);
+    write(typed->v_plane);
+    return offset;
+  }
+
+  void StreamPersistentSnapshot(const TextRunnerSnapshot& snapshot,
+                                const SnapshotSink& sink) const override {
+    const auto* typed = dynamic_cast<const FlintTextRunnerSnapshot*>(&snapshot);
+    if (typed == nullptr) {
+      throw std::invalid_argument(
+          "flint persistent snapshot requires a flint snapshot");
+    }
+    // The snapshot already holds the planes in host memory, so stream them
+    // directly instead of allocating a second full-size payload.
+    const FlintPersistentHeader header = FlintPersistentHeaderFor(*typed);
+    sink({reinterpret_cast<const std::uint8_t*>(&header), sizeof(header)});
+    const auto emit = [&](const std::vector<float>& plane) {
+      sink({reinterpret_cast<const std::uint8_t*>(plane.data()),
+            plane.size() * sizeof(float)});
+    };
+    emit(typed->frontier_logits);
+    emit(typed->k_plane);
+    emit(typed->v_plane);
+  }
+
+  void RestorePersistentSnapshot(
+      TextRunnerState& state,
+      std::span<const std::uint8_t> payload) const override {
+    if (payload.size() < sizeof(FlintPersistentHeader)) {
+      throw std::invalid_argument("flint persistent snapshot is truncated");
+    }
+    FlintPersistentHeader header{};
+    std::memcpy(&header, payload.data(), sizeof(header));
+    if (header.magic != kFlintPersistentMagic ||
+        header.version != kFlintPersistentVersion) {
+      throw std::invalid_argument(
+          "flint persistent snapshot has an unknown format");
+    }
+    const std::size_t expected =
+        sizeof(header) +
+        (header.frontier_count + 2 * header.plane_elements) * sizeof(float);
+    if (payload.size() != expected) {
+      throw std::invalid_argument(
+          "flint persistent snapshot payload size mismatch");
+    }
+    auto snapshot = std::make_unique<FlintTextRunnerSnapshot>();
+    snapshot->window_class = hip::FlintKvWindowClass{
+        .sliding_window = header.sliding_window,
+        .num_layers = header.num_layers,
+        .max_context = header.max_context,
+        .rows_checksum = header.rows_checksum,
+    };
+    snapshot->position = static_cast<std::size_t>(header.position);
+    snapshot->frontier_logits.resize(header.frontier_count);
+    snapshot->k_plane.resize(header.plane_elements);
+    snapshot->v_plane.resize(header.plane_elements);
+    std::size_t offset = sizeof(header);
+    const auto read = [&](std::vector<float>& plane) {
+      std::memcpy(plane.data(), payload.data() + offset,
+                  plane.size() * sizeof(float));
+      offset += plane.size() * sizeof(float);
+    };
+    read(snapshot->frontier_logits);
+    read(snapshot->k_plane);
+    read(snapshot->v_plane);
+    RestoreOrFork(state, *snapshot);
+  }
+
 private:
+  static FlintPersistentHeader FlintPersistentHeaderFor(
+      const FlintTextRunnerSnapshot& snapshot) {
+    FlintPersistentHeader header{};
+    header.magic = kFlintPersistentMagic;
+    header.version = kFlintPersistentVersion;
+    header.sliding_window = snapshot.window_class.sliding_window;
+    header.num_layers = snapshot.window_class.num_layers;
+    header.max_context = snapshot.window_class.max_context;
+    header.rows_checksum = snapshot.window_class.rows_checksum;
+    header.position = snapshot.position;
+    header.frontier_count = snapshot.frontier_logits.size();
+    header.plane_elements = snapshot.k_plane.size();
+    return header;
+  }
   // The fp32 planes are the only KV state a snapshot carries. The f16 twins
   // are opt-in and not captured, so refuse rather than restore a partial KV.
   static void RequireFlintSnapshotLayout(const FlintTextRunnerState& flint) {
@@ -2743,6 +2918,7 @@ private:
   std::shared_ptr<const hip::FlintGpuModel> model_;
   std::shared_ptr<const tokenization::QwenTokenizer> tokenizer_;
   std::uint32_t max_context_;
+  std::optional<TextRunnerPersistenceDescriptor> persistence_;
 };
 
 class QwenFlashNextTextRunnerState final : public TextRunnerState {
@@ -3344,6 +3520,10 @@ std::vector<float> FlintFrontierLogitsForTest(const TextRunnerState& state) {
   }
   return flint.logits();
 }
+
+hip::FlintKvWindowClass FlintWindowClassForTest(const TextRunnerState& state) {
+  return RequireFlintState(state).arena().WindowClass();
+}
 #endif
 
 struct InferenceBackend::Impl {
@@ -3594,6 +3774,13 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     auto flint_model = hip::FlintGpuModel::CreateFromGguf(reader, &flint_err);
     if (flint_model == nullptr) {
       SetError(error, "Failed to create flint GPU model: " + flint_err);
+      return false;
+    }
+    if (DiskCacheEnabled(resolved_disk_cache_config) &&
+        resolved_disk_cache_config.model_artifact_fingerprint.empty() &&
+        !FingerprintArtifact(
+            "flint", *reader,
+            &resolved_disk_cache_config.model_artifact_fingerprint, error)) {
       return false;
     }
     return load(std::move(flint_model), std::move(flint_tokenizer), error,
@@ -3905,8 +4092,10 @@ bool InferenceBackend::load(
     SetError(error, "flint does not support speculative decoding");
     return false;
   }
-  if (DiskCacheEnabled(disk_cache_config)) {
-    SetError(error, "the flint runner does not support the disk cache yet");
+  if (DiskCacheEnabled(disk_cache_config) &&
+      (!IsSha256Hex(disk_cache_config.model_artifact_fingerprint) ||
+       disk_cache_config.capacity_bytes == 0)) {
+    SetError(error, "flint persistent disk cache configuration is invalid");
     return false;
   }
 
@@ -3915,11 +4104,21 @@ bool InferenceBackend::load(
     new_state->sampling_defaults.model = sampling::TextModelPreset::kFlint;
     new_state->sampling_defaults.supplied = {};
     auto runner = std::make_shared<FlintTextRunner>(
-        std::move(model), std::move(tokenizer), max_context);
+        std::move(model), std::move(tokenizer), max_context,
+        disk_cache_config.model_artifact_fingerprint);
     new_state->model_id = runner->Descriptor().model_id;
     new_state->max_context = max_context;
+    std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
+    if (DiskCacheEnabled(disk_cache_config)) {
+      runner_disk_cache = TextRunnerDiskCacheOptions{
+          .directory = std::move(disk_cache_config.directory),
+          .capacity_bytes = disk_cache_config.capacity_bytes,
+          .staging_capacity_bytes = disk_cache_config.staging_capacity_bytes,
+      };
+    }
     auto runner_pool = std::make_shared<TextRunnerPool>(
-        std::move(runner), session_count, std::nullopt, ram_cache_config);
+        std::move(runner), session_count, std::move(runner_disk_cache),
+        ram_cache_config);
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
         std::move(runner_pool), prefill_policy, scheduler_policy);
     {
