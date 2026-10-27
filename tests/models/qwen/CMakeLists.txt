@@ -28,6 +28,16 @@ add_qwen_cpu_test(qwen_flint_attention_test
   tests/models/qwen/cpu/flint_attention_test.cpp
   "cpu;models;qwen;flint;attention")
 
+# F-K1 (6.1) flint_layer_probe: the per-layer diagnostic doubles as a
+# real-artifact CPU regression (finite norms, live MoE branch, window/rope
+# pattern vs config). Env-gated: skips (77) without GUFO_FLINT_GGUF.
+add_executable(flint_layer_probe ${PROJECT_SOURCE_DIR}/tools/flint/flint_debug_layer.cpp)
+target_link_libraries(flint_layer_probe PRIVATE gufo_core)
+add_test(NAME flint_layer_probe COMMAND flint_layer_probe)
+set_tests_properties(flint_layer_probe PROPERTIES
+  LABELS "cpu;models;qwen;flint;probe;real"
+  SKIP_RETURN_CODE 77)
+
 add_qwen_cpu_test(qwen_cpu_oracles_test
   tests/models/qwen/cpu/oracles_test.cpp
   "cpu;models;qwen;oracles")

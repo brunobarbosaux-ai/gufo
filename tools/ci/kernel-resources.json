@@ -1,6 +1,6 @@
 {
  "schema": "gufo.kernel-resources.v1",
- "note": "Made from the release binary of gufo-runtime:latest (b722a61, Nix, ROCm 7.2.3, AMD clang 22). The kernels in this file use scratch by design. Make the file again only after you decide that a new allowance is correct: python3 tools/ci/check-kernel-resources.py result/bin/gufo --write-baseline tools/ci/kernel-resources.json --note TEXT",
+ "note": "Regenerated for F-K1 6.1: adds Flint MoE kernels (8 B scratch, spill-free) and rekeys Q8KBlockGEMVKernel to current signatures at the same 8 B allowance.",
  "default_max_scratch": 0,
  "allow": {
   "_ZL18quantize_mmq_nvfp4PKfPKiPvlllllll": {
@@ -432,10 +432,16 @@
   "_ZL9mul_mat_qIL9ggml_type8ELi8ELb1ELb1ELb0EEvPKcPKiS4_S4_PfS5_15HIP_vector_typeIjLj3EEiiiiiS7_S7_iiiS7_S7_iiiS7_S2_lPKfS9_S5_P6__halff": {
    "max_scratch": 24
   },
-  "_ZN4gufo3hip18Q8KBlockGEMVKernelILj4EEEvPKvNS_4core8GgmlTypeEPKfPfmm": {
+  "_ZN4gufo3hip12_GLOBAL__N_123FlintFusedMoEDownKernelEPKvS3_NS_4core8GgmlTypeES5_PKfPfS7_immmmPKi": {
    "max_scratch": 8
   },
-  "_ZN4gufo3hip24Q8KBlockGEMVKernel_2RowsILj4ELNS_4core8GgmlTypeE0EEEvPKvS3_PKfPfmm": {
+  "_ZN4gufo3hip12_GLOBAL__N_125FlintFusedMoESwiGLUKernelEPKvS3_S3_S3_NS_4core8GgmlTypeES5_S5_S5_PKfPfS7_immmmmPKi": {
+   "max_scratch": 8
+  },
+  "_ZN4gufo3hip18Q8KBlockGEMVKernelILj4EEEvPKvNS_4core8GgmlTypeEPKfPfmmS7_": {
+   "max_scratch": 8
+  },
+  "_ZN4gufo3hip24Q8KBlockGEMVKernel_2RowsILj4ELNS_4core8GgmlTypeE0EEEvPKvS3_PKfPfmmS7_": {
    "max_scratch": 8
   },
   "_ZN4gufo3hip25FusedQKVProjectionsKernelEPKvNS_4core8GgmlTypeES2_S4_S2_S4_PKfPfS7_S7_mmm": {

@@ -620,21 +620,27 @@ int RunCase(std::size_t n, std::size_t used, std::size_t experts,
   std::vector<float> h_mlp(n * hidden);
   HIP_CHECK(hipMemcpy(h_mlp.data(), d_mlp, n * hidden * sizeof(float),
                       hipMemcpyDeviceToHost));
+  // Normalise by the sum of the summed terms' magnitudes, as the down check
+  // does: the routed down rows cancel by orders of magnitude on synthetic
+  // data (|terms| ~3e8 summing to ~1e4), so an fp32 error relative to |acc|
+  // is meaningless. A structural bug still gives an O(1) error here.
   double worst_mlp = 0.0;
   for (std::size_t t = 0; t < n; ++t) {
     for (std::size_t r = 0; r < hidden; ++r) {
       double acc = h_shared[t * hidden + r];
+      double mag = std::fabs(acc);
       for (std::size_t j = 0; j < used; ++j) {
         const int s = token_slots[t * used + j];
-        acc += h_down_out[static_cast<std::size_t>(s) * hidden + r];
+        const double v = h_down_out[static_cast<std::size_t>(s) * hidden + r];
+        acc += v;
+        mag += std::fabs(v);
       }
-      const double e =
-          std::fabs(acc - h_mlp[t * hidden + r]) / (1.0 + std::fabs(acc));
+      const double e = std::fabs(acc - h_mlp[t * hidden + r]) / (1.0 + mag);
       worst_mlp = std::fmax(worst_mlp, e);
     }
   }
   std::cout << "  mlp: max_rel=" << worst_mlp << "\n";
-  Expect(worst_mlp < 1e-3, "combine must sum the down rows in selection order");
+  Expect(worst_mlp < 1e-5, "combine must sum the down rows in selection order");
 
   for (std::size_t i = 0; i < h_mlp.size(); ++i) {
     if (!std::isfinite(h_mlp[i])) {
@@ -777,11 +783,34 @@ void RunRouterCase(std::size_t n_tokens, std::size_t experts,
   hipFree(d_split);
 }
 
+/// F-E4/F-E5 (1.7): the grouped WMMA route against the dequantized CPU
+/// reference at rows 1/7/100/512. Rows below one 16-token tile (1, 7)
+/// exercise the padded-bucket path; 100 is multi-tile; 512 is the
+/// chunk-prefill width. RunCase checks every slot, tile and bucket invariant
+/// and the gate/up/down/combine values. No expert-bias tensor is involved:
+/// the reference is gate/up/down matmuls only, and the grouped kernels take
+/// no bias argument.
+void RunRowsGridCase(std::size_t rows, GgmlType gate_up_type,
+                     GgmlType down_type, std::uint32_t seed) {
+  std::cout << "rows grid: rows=" << rows
+            << " gate/up=" << gufo::core::ToString(gate_up_type)
+            << " down=" << gufo::core::ToString(down_type) << "\n";
+  RunCase(rows, 6, 16, 512, 256, gate_up_type, down_type, seed);
+}
+
 int main() {
   int device_count = 0;
   if (hipGetDeviceCount(&device_count) != hipSuccess || device_count == 0) {
     std::cout << "no HIP device: skipping\n";
     return 77;
+  }
+  // F-E4/F-E5 (1.7) rows grid: rows 1/7/100/512 on both artifact routes.
+  for (const std::size_t rows :
+       {std::size_t{1}, std::size_t{7}, std::size_t{100}, std::size_t{512}}) {
+    RunRowsGridCase(rows, GgmlType::kQ6_K, GgmlType::kQ8_0,
+                    0x6E1D0U + static_cast<std::uint32_t>(rows));
+    RunRowsGridCase(rows, GgmlType::kIQ4_XS, GgmlType::kIQ4_XS,
+                    0x4E1D0U + static_cast<std::uint32_t>(rows));
   }
   // Small case: tiny buckets (empty, partial, and multi-row) at 16-tile
   // granularity. Q6_K gate/up + Q8_0 down is the UD-Q6_K_XL production route.

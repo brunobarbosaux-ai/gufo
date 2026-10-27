@@ -6,6 +6,7 @@
 // pinned flint GGUF; it mmaps the header only, so it costs no copies.
 
 #include "src/models/qwen/flint_forward.hpp"
+#include "src/models/qwen/forward.hpp"
 #include "src/models/qwen/state.hpp"
 
 #include <cmath>
@@ -13,6 +14,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <map>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -146,6 +149,8 @@ struct FlintFixtureOptions {
   std::string omit_tensor;  // exact tensor name to drop (negative tests)
   gufo::core::GgmlType router_type = gufo::core::GgmlType::kBF16;
   std::vector<std::uint8_t> rope_pattern = {0, 1, 1};  // layer 0 NoPE (F-D3)
+  float expert_weights_scale = 1.0F;  // flint.expert_weights_scale
+  bool expert_weights_norm = true;    // flint.expert_weights_norm
 };
 
 constexpr std::uint64_t kHidden = 64;
@@ -184,8 +189,8 @@ std::vector<std::uint8_t> BuildFlintFixture(const FlintFixtureOptions& opt = {})
   b.AddMetadataUint32("flint.expert_shared_count", 1);
   b.AddMetadataUint32("flint.expert_shared_feed_forward_length", kSharedFf);
   b.AddMetadataUint32("flint.expert_gating_func", 2);
-  b.AddMetadataFloat32("flint.expert_weights_scale", 1.0F);
-  b.AddMetadataBool("flint.expert_weights_norm", true);
+  b.AddMetadataFloat32("flint.expert_weights_scale", opt.expert_weights_scale);
+  b.AddMetadataBool("flint.expert_weights_norm", opt.expert_weights_norm);
   b.AddMetadataUint32("flint.leading_dense_block_count", kLeadingDense);
   b.AddMetadataUint32("flint.attention.sliding_window", 8);
   b.AddMetadataUint8Array("flint.attention.sliding_window_pattern",
@@ -559,25 +564,158 @@ void TestRealArtifactInventory() {
   }
   Expect(global_layers == 14, "14 global layers of 49");
 
-  // The UD quantizer mixes Q6_K and Q8_0 gate/up experts across layers;
-  // both must be accepted by the projection role (F-C3 coverage proof).
-  int q6k_layers = 0, q8_layers = 0;
+  // Artifact-keyed (F-C3 coverage proof): each quantizer mixes expert types
+  // differently, so the expectation is the set of types each artifact may
+  // carry, not a count pinned to one file. Counts are printed for the record.
+  //   UD-Q6_K_XL:  gate/up Q6_K (46) + Q8_0 (1);  down Q8_0 / Q6_K.
+  //   IQ4_XS:      gate/up IQ4_XS (45), blk.2 gate IQ4_XS / up Q5_K,
+  //                blk.48 gate Q5_K / up Q5_K, down IQ4_XS / Q6_K.
+  // The router is an unquantized F32 or BF16 tensor depending on the
+  // artifact (the loader rejects quantized routers, F-C2).
+  const std::set<gufo::core::GgmlType> accepted_gate_up = {
+      gufo::core::GgmlType::kQ6_K, gufo::core::GgmlType::kQ8_0,
+      gufo::core::GgmlType::kIQ4_XS, gufo::core::GgmlType::kQ5_K};
+  const std::set<gufo::core::GgmlType> accepted_down = {
+      gufo::core::GgmlType::kQ8_0, gufo::core::GgmlType::kQ6_K,
+      gufo::core::GgmlType::kIQ4_XS, gufo::core::GgmlType::kQ5_K};
+  const std::set<gufo::core::GgmlType> accepted_router = {
+      gufo::core::GgmlType::kF32, gufo::core::GgmlType::kBF16,
+      gufo::core::GgmlType::kF16};
+  std::map<std::string, int> gate_up_mix;
+  std::map<std::string, int> router_mix;
+  int moe_layers = 0;
   for (const auto& l : weights->layers) {
     if (l.attrs.dense_ffn) continue;
-    Expect(l.ffn_gate_inp.type == gufo::core::GgmlType::kBF16,
-           "router BF16 on every MoE layer");
+    ++moe_layers;
+    Expect(accepted_router.count(l.ffn_gate_inp.type) == 1,
+           "router is an unquantized F32/BF16/F16 tensor on every MoE layer");
     Expect(l.attn_sinks.num_elements == 32, "sinks [32]");
-    if (l.ffn_gate_exps.type == gufo::core::GgmlType::kQ6_K) {
-      ++q6k_layers;
-    } else if (l.ffn_gate_exps.type == gufo::core::GgmlType::kQ8_0) {
-      ++q8_layers;
-    } else {
-      Expect(false, "unexpected gate_exps type");
-    }
+    Expect(accepted_gate_up.count(l.ffn_gate_exps.type) == 1,
+           "gate_exps type in the accepted set");
+    Expect(accepted_gate_up.count(l.ffn_up_exps.type) == 1,
+           "up_exps type in the accepted set");
+    Expect(accepted_down.count(l.ffn_down_exps.type) == 1,
+           "down_exps type in the accepted set");
+    ++gate_up_mix[std::string(gufo::core::ToString(l.ffn_gate_exps.type)) +
+                  "/" + std::string(gufo::core::ToString(l.ffn_up_exps.type))];
+    ++router_mix[std::string(gufo::core::ToString(l.ffn_gate_inp.type))];
   }
-  Expect(q6k_layers == 46 && q8_layers == 1,
-         "mixed Q6_K/Q8_0 expert coverage (46+1)");
-  std::cout << "TestRealArtifactInventory ok (46 Q6_K + 1 Q8_0 MoE layers)\n";
+  Expect(moe_layers > 0, "artifact has MoE layers");
+  std::cout << "TestRealArtifactInventory ok (" << moe_layers
+            << " MoE layers; router:";
+  for (const auto& [type, n] : router_mix)
+    std::cout << " " << type << "x" << n;
+  std::cout << "; gate/up:";
+  for (const auto& [mix, n] : gate_up_mix)
+    std::cout << " " << mix << "x" << n;
+  std::cout << ")\n";
+}
+
+// F-E2 (1.6): expert weight-norm and flint.expert_weights_scale apply to the
+// routed experts only. Two fixtures identical except the scale (1.0 vs a
+// non-1.0 value) run the same MoE layer on the same hidden state. The routed
+// contribution (mlp_out minus the ungated shared expert) must scale by
+// exactly the ratio; the shared expert must not move. Covered with norm on
+// and off, so the scale is proven to compose with renormalisation.
+void TestExpertWeightScaleRoutedOnly() {
+  constexpr std::uint32_t kMoeLayer = 1;
+  constexpr float kScale = 2.5F;
+  for (const bool norm : {true, false}) {
+    const auto bytes_unit = BuildFlintFixture(
+        {.expert_weights_scale = 1.0F, .expert_weights_norm = norm});
+    const auto bytes_scaled = BuildFlintFixture(
+        {.expert_weights_scale = kScale, .expert_weights_norm = norm});
+    std::unique_ptr<gufo::core::GgufReader> reader_unit;
+    std::unique_ptr<gufo::core::GgufReader> reader_scaled;
+    std::string err;
+    auto* r_unit = OpenFixture(bytes_unit, reader_unit, err);
+    Expect(r_unit != nullptr, "unit-scale fixture opens");
+    auto* r_scaled = OpenFixture(bytes_scaled, reader_scaled, err);
+    Expect(r_scaled != nullptr, "scaled fixture opens");
+
+    std::string load_err;
+    const auto w_unit =
+        gufo::models::FlintModelWeights::LoadFromGguf(*r_unit, &load_err);
+    Expect(w_unit.has_value(), "unit-scale loads: " + load_err);
+    const auto w_scaled =
+        gufo::models::FlintModelWeights::LoadFromGguf(*r_scaled, &load_err);
+    Expect(w_scaled.has_value(), "scaled loads: " + load_err);
+    Expect(w_unit->config.expert_weights_scale == 1.0F, "unit scale parsed");
+    Expect(w_scaled->config.expert_weights_scale == kScale,
+           "non-1.0 scale parsed from flint.expert_weights_scale");
+    Expect(w_scaled->config.expert_weights_norm == norm, "norm flag parsed");
+
+    // Identical, non-degenerate hidden input for every run. The fixture's
+    // 0xAB-filled embedding decodes to ~1e-12, which is below the float
+    // resolution of the residual stream and would measure rounding, not the
+    // scale. The MoE branch RMS-normalises its input, so a unit-magnitude
+    // signal exercises the routed sum directly.
+    std::vector<float> x_unit(kHidden);
+    for (std::size_t h = 0; h < kHidden; ++h) {
+      x_unit[h] = std::sin(0.37F * static_cast<float>(h + 1)) +
+                  0.25F * std::cos(1.3F * static_cast<float>(h));
+    }
+
+    // Both fixtures share every tensor byte and the attention path, so the
+    // post-attention hidden state entering the MoE is identical. The layer
+    // output is hidden + attn + routed + shared; the shared expert and the
+    // residual cancel in the difference, leaving the routed sum alone.
+    // Captures the MoE branch output (mlp_out = routed sum + ungated shared
+    // expert), read before the residual add so the routed term is not lost
+    // to float rounding against the residual stream.
+    const auto run_layer = [&](const gufo::models::FlintModelWeights& weights,
+                               std::vector<float>& out) {
+      gufo::models::QwenKvCache kv(kLayers, kKvHeads, 1024, kHeadDim);
+      gufo::models::FlintScratchArena arena(weights.config);
+      std::copy(x_unit.begin(), x_unit.end(), arena.hidden.begin());
+      gufo::models::FlintForwardLayer(arena.hidden, weights.layers[kMoeLayer],
+                                      weights.config, kv, kMoeLayer, 0, arena);
+      out.assign(arena.mlp_out.begin(), arena.mlp_out.end());
+    };
+    std::vector<float> out_unit, out_scaled;
+    run_layer(*w_unit, out_unit);
+    run_layer(*w_scaled, out_scaled);
+
+    // Scale 0 zeroes the routed sum but keeps the residual, attention and the
+    // ungated shared expert (weight 1.0). So out(0) is the base shared by
+    // every scale, and out(s) - out(0) is exactly the routed contribution at
+    // scale s. Linearity: out(kScale) - out(0) == kScale * (out(1) - out(0)).
+    const auto w_zero = BuildFlintFixture(
+        {.expert_weights_scale = 0.0F, .expert_weights_norm = norm});
+    std::unique_ptr<gufo::core::GgufReader> reader_zero;
+    auto* r_zero = OpenFixture(w_zero, reader_zero, err);
+    Expect(r_zero != nullptr, "zero-scale fixture opens");
+    const auto zero_weights =
+        gufo::models::FlintModelWeights::LoadFromGguf(*r_zero, &load_err);
+    Expect(zero_weights.has_value(), "zero-scale loads: " + load_err);
+    std::vector<float> out_zero;
+    run_layer(*zero_weights, out_zero);
+
+    // out(scale) = base + scale * routed, where base = out(0). Linearity in
+    // the scale: out(kScale) - out(0) == kScale * (out(1) - out(0)).
+    double worst = 0.0;
+    double routed_max = 0.0;
+    for (std::size_t h = 0; h < kHidden; ++h) {
+      const double routed_unit =
+          static_cast<double>(out_unit[h]) - static_cast<double>(out_zero[h]);
+      const double routed_scaled =
+          static_cast<double>(out_scaled[h]) - static_cast<double>(out_zero[h]);
+      routed_max = std::fmax(routed_max, std::fabs(routed_unit));
+      worst = std::fmax(worst, std::fabs(routed_scaled - kScale * routed_unit));
+    }
+    std::cout << "  scale norm=" << norm << " routed max|.|=" << routed_max
+              << " worst |out(" << kScale << ")-out(0) - " << kScale
+              << "*(out(1)-out(0))|=" << worst << "\n";
+    // The fixture's 0xAB-filled experts yield a routed sum near float
+    // denormal scale, so the gate is "nonzero" (a dropped scale would give
+    // exactly zero or an identical run), and linearity is judged relative to
+    // the routed magnitude.
+    Expect(routed_max > 0.0,
+           "routed contribution is nonzero (scale path is live)");
+    Expect(worst <= 1e-3 * routed_max + 1e-30,
+           "routed contribution scales linearly with expert_weights_scale");
+  }
+  std::cout << "TestExpertWeightScaleRoutedOnly ok\n";
 }
 
 // F-B3/F-B4: the option gate rejects every drafting/vision flag, naming it.
@@ -625,6 +763,7 @@ int main() {
   TestFlintOptionGate();
   TestForwardModelSmoke();
   TestNopeHonoredInForward();
+  TestExpertWeightScaleRoutedOnly();
   TestRealArtifactInventory();
   std::cout << "flint_weights_test: all tests passed\n";
   return 0;
