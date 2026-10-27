@@ -8,13 +8,14 @@ request state, captured decode graphs).
 
 ## Status
 
-Experimental. Phases 0–5 complete: serve-path gates G3–G9 and F-I4 green,
+Experimental. Phases 0–6 complete: serve-path gates G3–G9 and F-I4 green,
 tool calls and reasoning streaming landed, ring cache with snapshot/fork/restore
-and disk persistence in place. The served context cap is layout-dependent:
-262144 with the ring (windowed layers), 32768 for full-KV. Remaining before a
-production claim: deployment (llama-swap profile, litellm alias, G10 floor
-check, G11 end-to-end acceptance). Quality: [QUALITY.md](QUALITY.md).
-Rejected alternatives: [EXPERIMENTS.md](EXPERIMENTS.md). Plan and progress log:
+and disk persistence in place, and the deployment gates passed (G10 floor check
+38.7 / 20.6 / 10.9 t/s; G11 end-to-end coding). The served context cap is
+layout-dependent: 262144 with the ring (windowed layers), 32768 for full-KV.
+Quality: [QUALITY.md](QUALITY.md). Rejected alternatives:
+[EXPERIMENTS.md](EXPERIMENTS.md). Upstream readiness:
+[UPSTREAM-PR.md](UPSTREAM-PR.md). Plan and progress log:
 `Kazoku-system-prompts/infra/strix-halo/flint-optimization-plan.md`.
 
 ## Artifacts
@@ -32,8 +33,8 @@ Weights are not redistributable from this repo; download separately.
 gufo serve llm -m <flint>.gguf -p 8006 -c 32768 --served-model-name t-flint-40b
 ```
 
-- Chat template: `FlintChatTemplate` (flint markup; tool-call rendering is
-  Phase-4 work — the template renders but F-L5 parsing is not landed).
+- Chat template: `FlintChatTemplate` (flint markup; tool-call parsing/emission
+  landed in F-L5/F-G3, reasoning streaming in F-L6).
 - Sampling defaults: Flint preset pins T 1.0 / p 0.95 / k 20
   (`src/core/text_sampling_defaults.hpp`); explicit request overrides win.
 - Context: `-c` is capped by layout — 262144 with the ring, 32768 full-KV; KV is fp32 by default

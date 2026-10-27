@@ -46,8 +46,8 @@ do not establish upstream or original-checkpoint parity.
 - **f16 KV** is opt-in. Its gates hold within the documented envelope
   (cos ≥ 0.995, token sequence holds), but it is not the default.
 - **Weights not redistributable.** Gates are reproducible only with the
-  artifacts in hand; the IQ4_XS file is not present on the current box, so its
-  sha256 is recorded from the source docs (see reproducibility below).
+  artifacts in hand; both artifact hashes are verified locally (see
+  reproducibility below).
 
 ## Reproducibility
 
@@ -58,10 +58,10 @@ Per headline number. Build rev is the commit at which the number was measured.
 | Hardware | AMD Strix Halo `gfx1151`, 124 GB unified memory |
 | ROCm | 7.2.1 |
 | Kernel | 7.0.0-34-generic |
-| Gufo build rev (F-J4 headline cells) | `65fc4f08` (`feat/flint-ar`) |
-| Gufo build rev (gate landings) | G7 `ae7db7f2`, G9 `80011962`, F-I4 `5e69ba99`, F-L5/F-G3 `83a9982c` (`feat/flint-ar`); docs-branch head `cd433365` |
+| Gufo build rev (F-J4 headline cells) | `4e7dfc25` (`feat/flint-ar`); the original Phase-3 record was `65fc4f08` |
+| Gufo build rev (gate landings) | G7 `ae7db7f2`, G9 `80011962`, F-I4 `5e69ba99`, F-L5/F-G3 `83a9982c`, ring fix `4e7dfc25` (`feat/flint-ar`); docs-branch head `cd433365` |
 | Oracle | llama.cpp b11804 (ROCm, `-ngl 99`, `-c 32768`) |
-| IQ4_XS artifact | `RecursiveSI_flint-IQ4_XS.gguf` (bartowski), sha256 `4f1fd7e09c225a4eecd257df99d0ba5ce1657add86ec608c8bc554151660fb2b` (from source docs; file not present on the current box) |
+| IQ4_XS artifact | `RecursiveSI_flint-IQ4_XS.gguf` (bartowski), sha256 `4f1fd7e09c225a4eecd257df99d0ba5ce1657add86ec608c8bc554151660fb2b` (verified locally, 2026-10-27) |
 | UD-Q6_K_XL artifact | `flint-UD-Q6_K_XL.gguf`, sha256 `086231093581c67f8bf2964f8b49198889c4f0775b39857ba63b4c37041279c2` (verified locally) |
 | Firmware | Performance mode, pre-bench soak; `-c` pinned to 32768 |
 
@@ -73,21 +73,23 @@ gufo serve llm -m RecursiveSI_flint-IQ4_XS.gguf -p 8006 -c 32768 \
 ```
 
 Gate commands are listed in [BENCHMARKS.md](BENCHMARKS.md#reproduce). Headline
-cells (IQ4_XS, 2026-10-25, means of 3, `build 65fc4f08`):
+cells (IQ4_XS, re-recorded 2026-10-27 on `4e7dfc25`, means of 3, iGPU DPM=high):
 
 | Cell | Prefill t/s | Decode t/s |
 | --- | ---: | ---: |
-| msg (184 tok) | 695.9 | 38.8 |
-| doc (6652 tok) | 1439.7 | 20.6 |
-| long (23586 tok) | 1216.2 | 10.9 |
+| msg (184 tok) | 750.4 | 38.7 |
+| doc (6652 tok) | 1717.0 | 20.6 |
+| long (23586 tok) | 1394.0 | 10.9 |
 
 Decode floors were revised to 38 / 20 / 10 t/s on 2026-10-25 (see the plan's
-§9 note). The G10 deployment floor check (6.7) and G11 end-to-end acceptance
-(6.8) are not yet run.
+§9 note). The G10 deployment floor check (6.7) passed against that table
+(38.7 / 20.6 / 10.9); G11 end-to-end coding acceptance (6.8) passed as well
+(25.2k context, 2 tool round-trips, streaming, greedy + sampled).
 
 ## Scope
 
-Not yet qualified: the G10 floor check and G11 end-to-end coding acceptance
-(deployment gates 6.7/6.8), the clean logprobs verdict for the cjk fork, and
-the llama-swap deployment profile (6.5). Matched llama.cpp anchors on IQ4_XS are
-pending; the current anchors were measured on UD-Q6_K_XL.
+Qualified: G10 and G11 (deployment gates 6.7/6.8) on the reference box. Not yet
+qualified: the clean logprobs verdict for the cjk fork, and matched llama.cpp
+anchors on IQ4_XS (the current anchors were measured on UD-Q6_K_XL). The
+llama-swap/litellm deployment is live but internal — not part of this
+repository. Upstream readiness: [UPSTREAM-PR.md](UPSTREAM-PR.md).

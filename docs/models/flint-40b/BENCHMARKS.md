@@ -3,11 +3,13 @@
 AMD Strix Halo `gfx1151` (124 GB unified memory), ROCm 7.2.1. Flint 40B is the
 256-expert top-6 attention-only model (49 layers, hidden 2048, 32 query heads
 over 4 KV heads at head_dim 128, sliding window 513, 14 global/NoPE layers).
-Status: **serve path complete through Phase 3** — graph-captured decode,
-deterministic fused-MoE, online-tile attention routing, epilogue-fused
-residuals. Optimization plan and progress log:
+Status: **serve path and deployment complete (Phases 0–6)** — graph-captured
+decode, deterministic fused-MoE, online-tile attention routing, epilogue-fused
+residuals, ring KV, and the G10/G11 deployment gates. Optimization plan and
+progress log:
 `Kazoku-system-prompts/infra/strix-halo/flint-optimization-plan.md` (the
-companion requirements and ceilings docs live beside it).
+companion requirements and ceilings docs live beside it). Upstream readiness:
+[UPSTREAM-PR.md](UPSTREAM-PR.md).
 
 All serve tables: greedy (T=0), HTTP chat completions, `-c 32768`, firmware
 Performance mode, `fj4_bench.py` protocol (edge/Tctl/power sampled per run;
