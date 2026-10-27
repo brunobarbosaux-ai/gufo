@@ -23,15 +23,17 @@ __device__ __forceinline__ float FlintKvLoad(const KVT* __restrict__ ptr) {
   }
 }
 
-/// Ring row for a KV position: windowed layers wrap at `min(max_context,
-/// window)` rows, global layers index the position directly.
+/// Ring row for a KV position. `rows` is the per-layer plane row count:
+/// 0 = legacy/uniform plane and `rows == max_context` = a global layer, both
+/// index the position directly; a windowed ring is allocated at a power of
+/// two, so the wrap is a mask rather than a divide (the F-J4 decode
+/// regression was a runtime modulo per key access).
 __device__ __forceinline__ std::size_t FlintKvRow(
-    std::size_t position, std::uint32_t window, std::uint32_t max_context) {
-  if (window == 0) {
+    std::size_t position, std::uint32_t rows, std::uint32_t max_context) {
+  if (rows == 0 || rows == max_context) {
     return position;
   }
-  const std::uint32_t rows = window < max_context ? window : max_context;
-  return position % rows;
+  return position & (static_cast<std::size_t>(rows) - 1U);
 }
 
 /// Flint KV-cache addressing per plane: fp32 is head-major
@@ -41,24 +43,23 @@ __device__ __forceinline__ std::size_t FlintKvRow(
 /// already write for the f16 planes and the qwen batched/half kernels already
 /// read.
 ///
-/// F-I2 ring cache: `window` is 0 for a global layer (row = position, rows =
-/// max_context) and the sliding window (513) for a windowed layer, whose KV is
-/// a ring of `min(max_context, window)` rows per sequence (row = position %
-/// rows). `layer_base` is the element offset of this layer's plane; K and V
-/// planes share the same per-layer base and row count, so one value serves
-/// both.
+/// F-I2 ring cache: `rows` is the per-layer plane row count (0 = legacy /
+/// uniform plane; `max_context` = global layer; a power of two < max_context
+/// = windowed ring). `layer_base` is the element offset of this layer's
+/// plane; K and V planes share the same per-layer base and row count, so one
+/// value serves both.
 template <typename KVT>
 __device__ __forceinline__ std::size_t FlintKvOffset(
     std::size_t layer_base, std::uint32_t kv_h, std::size_t position,
-    std::uint32_t window, std::uint32_t max_context,
+    std::uint32_t rows, std::uint32_t max_context,
     std::uint32_t num_kv_heads, std::uint32_t head_dim) {
-  const std::uint32_t rows =
-      window != 0 ? (window < max_context ? window : max_context)
-                  : max_context;
-  const std::size_t row = window != 0 ? (position % rows) : position;
+  const std::size_t stride_rows =
+      (rows == 0) ? static_cast<std::size_t>(max_context)
+                  : static_cast<std::size_t>(rows);
+  const std::size_t row = FlintKvRow(position, rows, max_context);
   if constexpr (std::is_same_v<KVT, float>) {
     return layer_base +
-           (static_cast<std::size_t>(kv_h) * rows + row) * head_dim;
+           (static_cast<std::size_t>(kv_h) * stride_rows + row) * head_dim;
   } else {
     return layer_base +
            row * (static_cast<std::size_t>(num_kv_heads) * head_dim) +

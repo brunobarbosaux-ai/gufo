@@ -94,8 +94,22 @@ namespace {
     const std::size_t ring =
         static_cast<std::size_t>(config.sliding_window) +
         kFlintPrefillBatchCapacity;
-    return static_cast<std::uint32_t>(
-        std::min<std::size_t>(max_context, ring));
+    const std::size_t capped = std::min<std::size_t>(max_context, ring);
+    if (capped >= max_context) {
+      // The ring covers the whole context: no wrap, index directly.
+      return max_context;
+    }
+    // Round the ring up to a power of two so the kernels wrap with a mask
+    // instead of a runtime divide (the F-J4 decode regression: a modulo per
+    // key access in the windowed-layer attention loops).
+    std::size_t pow2 = 1;
+    while (pow2 < capped) {
+      pow2 <<= 1;
+    }
+    if (pow2 >= max_context) {
+      return max_context;
+    }
+    return static_cast<std::uint32_t>(pow2);
   }
   return max_context;
 }
