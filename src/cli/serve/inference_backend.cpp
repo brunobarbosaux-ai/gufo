@@ -3328,6 +3328,24 @@ private:
 
 }  // namespace
 
+#if defined(ENGINE_ENABLE_HIP)
+std::shared_ptr<TextModelRunner> MakeFlintTextRunnerForTest(
+    std::shared_ptr<const hip::FlintGpuModel> model,
+    std::shared_ptr<const tokenization::QwenTokenizer> tokenizer,
+    std::uint32_t max_context) {
+  return std::make_shared<FlintTextRunner>(std::move(model), std::move(tokenizer),
+                                           max_context);
+}
+
+std::vector<float> FlintFrontierLogitsForTest(const TextRunnerState& state) {
+  const auto& flint = RequireFlintState(state);
+  if (!flint.has_frontier_logits()) {
+    return {};
+  }
+  return flint.logits();
+}
+#endif
+
 struct InferenceBackend::Impl {
 #if defined(ENGINE_ENABLE_HIP)
   struct State {
