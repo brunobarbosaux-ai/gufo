@@ -1166,12 +1166,21 @@ void RunChunkParity(const gufo::hip::FlintGpuModel& model,
   }
 
   // Token-by-token reference over the same positions.
+  // GUFO_FLINT_DECODE_SYNC=N: sync every N decode steps. Queue-accumulation
+  // discriminator for the G6 graph-replay hang (0/unset = no sync, the
+  // production behaviour).
+  const char* sync_env = std::getenv("GUFO_FLINT_DECODE_SYNC");
+  const std::size_t sync_every =
+      sync_env != nullptr ? static_cast<std::size_t>(std::atoi(sync_env)) : 0;
   for (std::size_t i = 0; i < n; ++i) {
     gufo::hip::ExecuteFlintDecodeStep(model.GetWeights(), tokens[i],
                                       static_cast<std::uint32_t>(i),
                                       /*compute_logits=*/i + 1 == n, buffers,
                                       /*timings=*/nullptr,
                                       arena.GetGraphState());
+    if (sync_every != 0 && (i + 1) % sync_every == 0) {
+      HIP_CHECK(hipStreamSynchronize(buffers.stream));
+    }
   }
   HIP_CHECK(hipStreamSynchronize(buffers.stream));
   HIP_CHECK(hipMemcpy(token_logits.data(), buffers.logits,
