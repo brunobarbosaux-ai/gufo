@@ -430,6 +430,50 @@ void TestFlintTokenizerSpecialAndStops() {
          "user-defined marker is emitted as one token");
 }
 
+void TestFlintTokenizerEogFallback() {
+  // F-F4 fallback: some flint quants (e.g. RecursiveSI_flint-IQ4_XS.gguf)
+  // omit tokenizer.ggml.eog_token_ids. The pinned template still ends turns
+  // on the four role markers, so the tokenizer must derive them from the
+  // special-token table instead of falling back to eos alone.
+  const std::vector<std::string> vocab = {
+      "a",                // 0
+      "b",                // 1
+      "<|end_of_text|>",  // 2
+      "<|user|>",         // 3
+      "<|developer|>",    // 4
+      "<|observation|>",  // 5
+      "<arg_key>",        // 6
+      "</arg_key>",       // 7
+      "<tool_call>",      // 8
+      "</tool_call>",     // 9
+  };
+  const std::vector<std::int32_t> types = {1, 1, 3, 3, 3, 3, 4, 4, 4, 4};
+
+  GgufTokenizerBuilder builder;
+  builder.AddMetadataString("tokenizer.ggml.model", "gpt2");
+  builder.AddMetadataString("tokenizer.ggml.pre", "flint");
+  builder.AddMetadataUint32("tokenizer.ggml.eos_token_id", 2U);
+  builder.AddMetadataUint32("tokenizer.ggml.bos_token_id", 2U);
+  builder.AddMetadataStringArray("tokenizer.ggml.tokens", vocab);
+  builder.AddMetadataStringArray("tokenizer.ggml.merges", {});
+  builder.AddMetadataInt32Array("tokenizer.ggml.token_type", types);
+  // Deliberately no tokenizer.ggml.eog_token_ids.
+
+  auto binary = builder.Build();
+  std::string err;
+  auto reader =
+      gufo::core::GgufReader::OpenMemory(binary.data(), binary.size(), &err);
+  Expect(reader != nullptr, "flint fallback reader open succeeds: " + err);
+  auto tok = gufo::tokenization::QwenTokenizer::CreateFromGguf(*reader, &err);
+  Expect(tok != nullptr, "flint fallback tokenizer created: " + err);
+
+  Expect(tok->IsStopToken(2) && tok->IsStopToken(3) && tok->IsStopToken(4) &&
+             tok->IsStopToken(5),
+         "missing eog_token_ids derives all four flint terminators");
+  Expect(!tok->IsStopToken(0) && !tok->IsStopToken(6),
+         "fallback does not stop on ordinary or tool-marker ids");
+}
+
 void TestFlintPreTokenizerRules() {
   // F-F1: numbers split into groups of three and a contraction stays inside
   // its word. Both are observable through merges that only fire within a
@@ -505,6 +549,7 @@ int main() {
   TestEmptyAndSpecialEdgeCases();
   TestCorpusConformance();
   TestFlintTokenizerSpecialAndStops();
+  TestFlintTokenizerEogFallback();
   TestFlintPreTokenizerRules();
   std::cout << "All QwenTokenizer tests passed successfully!\n";
   return 0;

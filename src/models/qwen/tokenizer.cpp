@@ -630,6 +630,20 @@ std::unique_ptr<QwenTokenizer> QwenTokenizer::CreateFromGguf(
         tokenizer->stop_token_ids_.push_back(static_cast<TokenId>(id));
       }
     }
+    // Some flint quants drop eog_token_ids. The template is pinned, so the
+    // four terminators are fixed: derive them from the special-token table
+    // rather than falling back to eos alone, which would run past the
+    // <|user|> turn boundary.
+    if (tokenizer->stop_token_ids_.empty()) {
+      for (const auto* marker :
+           {"<|end_of_text|>", "<|user|>", "<|observation|>",
+            "<|developer|>"}) {
+        if (auto it = special_tokens.find(std::string(marker));
+            it != special_tokens.end()) {
+          tokenizer->stop_token_ids_.push_back(it->second);
+        }
+      }
+    }
   }
 
   return tokenizer;

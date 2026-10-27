@@ -689,6 +689,50 @@ void TestFlintToolCalls() {
              "Flint tool arguments are translated to JSON");
     }
   }
+
+  // F-L5 streaming: a flint call split across pieces must expose an
+  // open-quote partial so the accumulator accepts the final delta. The
+  // closed-quote form of an empty value (`{"text":""`) is not a prefix of
+  // the final arguments and used to abort the stream.
+  {
+    FakeBackend backend;
+    backend.tool_format = gufo::sampling::JsonConstraint::ToolFormat::kFlint;
+    backend.pieces = {"<tool_call>f<arg_key>text</arg_key><arg_value>",
+                      "partial", "</arg_value></tool_call>"};
+    auto body = gufo::json::parse(R"({
+      "model":"test-model","messages":[{"role":"user","content":"call f"}],
+      "tool_choice":"auto","stream":true})");
+    body["tools"] = gufo::json::parse(tools);
+    const auto response =
+        gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+    Expect(response.status == 200 && response.streaming_body,
+           "Flint streamed tool request is accepted");
+    std::string arguments;
+    std::string finish;
+    response.streaming_body([&](std::string_view chunk) {
+      if (chunk == "data: [DONE]\n\n")
+        return true;
+      const auto event = gufo::json::parse(chunk.substr(6));
+      for (const auto& choice : event.find("choices")->items()) {
+        if (const auto* delta = choice.find("delta")) {
+          if (const auto* calls = delta->find("tool_calls")) {
+            for (const auto& call : calls->items()) {
+              if (const auto* function = call.find("function"))
+                arguments += function->member_str("arguments");
+            }
+          }
+        }
+        if (const auto* reason = choice.find("finish_reason");
+            reason && reason->is_string())
+          finish = reason->get_str();
+      }
+      return true;
+    });
+    Expect(arguments == R"({"text":"partial"})",
+           "Flint streamed arguments accumulate to the final JSON");
+    Expect(finish == "tool_calls",
+           "Flint streamed call finishes with tool_calls");
+  }
 }
 
 void TestToolParameterCompatibility() {

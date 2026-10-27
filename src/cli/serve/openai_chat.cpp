@@ -1755,7 +1755,13 @@ void ParseFlintCalls(
           std::ranges::none_of(call.arguments, [&](const auto& existing) {
             return existing.name == argument.name;
           })) {
-        call.arguments.push_back(std::move(argument));
+        // A string value must expose an open-quote prefix: the closed-quote
+        // form of an empty value (`{"town":""`) is not a prefix of the final
+        // arguments, which makes the streaming accumulator reject the call.
+        if (argument.is_string)
+          PartialStringArgument(call, argument.name, argument.value);
+        else
+          call.arguments.push_back(std::move(argument));
       }
     }
     if (complete && !tools.empty() &&
