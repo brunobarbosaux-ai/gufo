@@ -28,6 +28,7 @@ Usage:
   serve_gates.py g5 --engine serve  --out /tmp/g5-serve.json
   python3 .../stageg/dist.py g5-serve.json g5-oracle.json
   serve_gates.py g8 --engine serve --sessions 8 [--gate]   # 1..8 sessions
+  serve_gates.py fi4 --engine serve [--peers 4] [--max-tokens 384]  # F-I4
 """
 
 import argparse
@@ -55,6 +56,19 @@ G4_MAX_RANK = 3
 G4_TOP_K = 20  # oracle top-k captured per token (must match the arm capture)
 _THINK_OPEN = chr(60) + "think" + chr(62)
 _THINK_CLOSE = chr(60) + "/think" + chr(62)
+# F-I4 scratch isolation: the target prompt is deterministic and long enough
+# to interleave with peers; the peers are different-domain prompts so their
+# expert routing differs from the target's.
+FI4_TARGET = "Count from one to twenty as digits, comma separated."
+FI4_PEERS = (
+    ("printing", "Write a short paragraph about the history of the printing press."),
+    ("binary-search", "Explain how a binary search works, step by step."),
+    ("planets", "List the planets in order from the sun, one per line."),
+    ("translate", "Translate 'good morning' into French, Spanish, and German."),
+    ("recipe", "Give a short recipe for a simple tomato soup."),
+    ("history", "Summarize the causes of the fall of the Roman Empire."),
+    ("code", "Write a Python function that reverses a singly linked list."),
+)
 
 
 def post(url, payload, timeout=600):
@@ -470,6 +484,73 @@ def cmd_g8(args):
     return 0
 
 
+def _fi4_generate(cfg, prompt, max_tokens, seed):
+    return engine_generate(
+        cfg, [{"role": "user", "content": prompt}], max_tokens=max_tokens,
+        temperature=0.0, top_p=1.0, top_k=0, seed=seed, full=True)
+
+
+def cmd_fi4(args):
+    """F-I4 scratch isolation: a peer session's expert routing must not
+    perturb the target session's logits. The target is first proven
+    deterministic alone, then re-run concurrently with `--peers`
+    different-domain prompts; the full greedy stream must be identical."""
+    cfg = engine_config(args.engine)
+    if args.base_url:
+        cfg["base"] = args.base_url
+    if args.model:
+        cfg["model"] = args.model
+
+    alone_a = _fi4_generate(cfg, FI4_TARGET, args.max_tokens, 777)
+    alone_b = _fi4_generate(cfg, FI4_TARGET, args.max_tokens, 777)
+    if alone_a != alone_b:
+        print("F-I4 VERDICT: FAIL (target is not deterministic alone — "
+              "cannot judge isolation)")
+        return 1
+    print(f"  target alone: {len(alone_a)} chars, deterministic")
+
+    peers = FI4_PEERS[:args.peers]
+    barrier = threading.Barrier(len(peers) + 1)
+    results = {}
+    errors = []
+
+    def worker(label, prompt):
+        try:
+            barrier.wait(timeout=120)
+            results[label] = _fi4_generate(cfg, prompt, args.max_tokens, 777)
+        except Exception as exc:  # noqa: BLE001 — gate reports everything
+            errors.append(f"{label}: {exc}")
+
+    threads = [threading.Thread(target=worker, args=("target", FI4_TARGET))]
+    for label, prompt in peers:
+        threads.append(threading.Thread(target=worker, args=(label, prompt)))
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    if errors:
+        print(f"F-I4 VERDICT: FAIL (errors: {errors})")
+        return 1
+
+    concurrent = results["target"]
+    ok = concurrent == alone_a
+    print(f"  target concurrent with {len(peers)} peers: "
+          f"{'IDENTICAL' if ok else 'PERTURBED'} ({len(concurrent)} chars)")
+    if not ok:
+        common = 0
+        for x, y in zip(alone_a, concurrent):
+            if x != y:
+                break
+            common += 1
+        print(f"    diverges at char {common}:\n"
+              f"      alone      : {alone_a[common:common + 60]!r}\n"
+              f"      concurrent : {concurrent[common:common + 60]!r}")
+    print("F-I4 VERDICT:",
+          "PASS (peer routing does not perturb the target session)"
+          if ok else "FAIL")
+    return 0 if ok else 1
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -508,6 +589,16 @@ def main():
     p.add_argument("--gate", action="store_true",
                    help="exit non-zero on any mismatch (default: report)")
 
+    p = sub.add_parser("fi4")
+    p.add_argument("--engine", choices=("oracle", "serve"), default="serve")
+    p.add_argument("--base-url", default=None,
+                   help="override the engine base URL (default: the "
+                        "llama-swap test gateway)")
+    p.add_argument("--model", default=None,
+                   help="override the served model id")
+    p.add_argument("--max-tokens", type=int, default=384)
+    p.add_argument("--peers", type=int, default=4)
+
     p = sub.add_parser("g5-verdict")
     p.add_argument("left")
     p.add_argument("right")
@@ -523,6 +614,8 @@ def main():
         raise SystemExit(cmd_g5_verdict(args))
     elif args.cmd == "g8":
         raise SystemExit(cmd_g8(args))
+    elif args.cmd == "fi4":
+        raise SystemExit(cmd_fi4(args))
 
 
 if __name__ == "__main__":
