@@ -20,7 +20,14 @@ fi
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 cp "$BIN" "$STAGE/gufo"
-printf 'FROM %s\nCOPY gufo /usr/local/bin/gufo\n' "$BASE" > "$STAGE/Dockerfile"
+# The host-built binary links libicu74; the ROCm base ships libicu78 only
+# (it is not an ABI-compatible fallback). Bake the three shared objects in so
+# the image is self-contained and needs no bind-mount overlay.
+ICU_SRC=/usr/lib/x86_64-linux-gnu
+for lib in libicuuc.so.74 libicui18n.so.74 libicudata.so.74; do
+  cp "$ICU_SRC/$lib" "$STAGE/$lib"
+done
+printf 'FROM %s\nCOPY libicuuc.so.74 libicui18n.so.74 libicudata.so.74 /usr/lib/x86_64-linux-gnu/\nCOPY gufo /usr/local/bin/gufo\n' "$BASE" > "$STAGE/Dockerfile"
 
 docker build -q -t "$TAG" "$STAGE"
 echo "built $TAG from $BIN"
