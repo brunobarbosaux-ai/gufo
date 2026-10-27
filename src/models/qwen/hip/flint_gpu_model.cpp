@@ -122,6 +122,27 @@ namespace {
   return offset;
 }
 
+/// FNV-1a over each layer's (windowed flag, row modulus). Captures the ring
+/// pattern and the row math in one value.
+[[nodiscard]] std::uint64_t FlintKvRowsChecksum(
+    const core::ModelConfig& config,
+    const std::vector<std::uint32_t>& rows) noexcept {
+  constexpr std::uint64_t kOffset = 14695981039346656037ULL;
+  constexpr std::uint64_t kPrime = 1099511628211ULL;
+  std::uint64_t h = kOffset;
+  auto mix = [&h](std::uint64_t v) {
+    for (int i = 0; i < 8; ++i) {
+      h ^= (v >> (8 * i)) & 0xffU;
+      h *= kPrime;
+    }
+  };
+  for (std::uint32_t l = 0; l < config.num_layers; ++l) {
+    mix(config.IsWindowedLayer(l) ? 1U : 0U);
+    mix(rows[l]);
+  }
+  return h;
+}
+
 /// Tiled Q8_1 activation bytes (prefill_quant_gemm's layout: 16-token tiles of
 /// 576-byte K blocks with the fp32 scales inline) PLUS the fp32 activation-sum
 /// sidecar the quantizer writes behind the tiled payload. Mirrored here
@@ -138,6 +159,15 @@ namespace {
 }
 
 }  // namespace
+
+FlintKvWindowClass FlintGpuArena::WindowClass() const noexcept {
+  return FlintKvWindowClass{
+      .sliding_window = config_.sliding_window,
+      .num_layers = config_.num_layers,
+      .max_context = max_context_,
+      .rows_checksum = FlintKvRowsChecksum(config_, kv_layer_rows_),
+  };
+}
 
 FlintGpuArena::FlintGpuArena(const core::ModelConfig& config,
                              std::uint32_t max_context)

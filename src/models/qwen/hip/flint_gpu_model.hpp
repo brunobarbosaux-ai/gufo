@@ -58,6 +58,21 @@ class FlintGpuModel {
   std::vector<QwenGpuWeightRegion> weight_regions_;
 };
 
+/// Identity of the flint KV geometry (F-I2 ring cache). Two arenas with equal
+/// classes lay out their KV planes identically, so a snapshot taken under one
+/// class can be restored under the other. `rows_checksum` is an FNV-1a hash
+/// over every layer's (windowed flag, row modulus), so it covers the full
+/// sliding-window pattern at any layer count, not just the first 64 layers.
+struct FlintKvWindowClass {
+  std::uint32_t sliding_window{0};
+  std::uint32_t num_layers{0};
+  std::uint32_t max_context{0};
+  std::uint64_t rows_checksum{0};
+
+  friend bool operator==(const FlintKvWindowClass&,
+                         const FlintKvWindowClass&) = default;
+};
+
 /// Preallocated per-session GPU scratch for flint decode steps: one
 /// FlintGpuStepBuffers set sized from the config plus the fp32 KV cache for
 /// `max_context` positions (qwen layout), and one stream. The KV cache is
@@ -104,6 +119,15 @@ class FlintGpuArena {
   /// memory-budget accounting in §9.
   [[nodiscard]] std::size_t GetScratchBytes() const noexcept {
     return scratch_bytes_;
+  }
+  /// KV geometry identity of this arena (F-I2 ring cache), for snapshot
+  /// compatibility checks.
+  [[nodiscard]] FlintKvWindowClass WindowClass() const noexcept;
+  /// True when a snapshot taken under `other` can be restored into this
+  /// arena. Rejects any KV geometry mismatch (5.3c restore gate).
+  [[nodiscard]] bool CompatibleWith(
+      const FlintKvWindowClass& other) const noexcept {
+    return WindowClass() == other;
   }
 
  private:

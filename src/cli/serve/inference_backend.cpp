@@ -2321,7 +2321,7 @@ std::vector<std::int32_t> QwenFlashNextEngineTokens(
 // position and only ever read at [0, pos], so an exact-prefix reuse state can
 // continue without a reset (the arena has no reset to call).
 
-constexpr std::string_view kFlintStateAbi = "flint-kv-f32-v1";
+constexpr std::string_view kFlintStateAbi = "flint-kv-f32-v2";
 
 class FlintTextRunnerState final : public TextRunnerState {
 public:
