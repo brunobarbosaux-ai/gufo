@@ -121,6 +121,10 @@ def main():
                         help="Omit reasoning_content from replayed assistants like OpenAI clients")
     parser.add_argument("--prefix-repetitions", type=int, default=32,
                         help="Length of the synthetic shared system prefix")
+    parser.add_argument("--max-tokens", type=int, default=256,
+                        help="Interrupt budget for the initial stream. Reasoning "
+                             "models emit a thinking block before content, so they "
+                             "need headroom past the default.")
     parser.add_argument("--case", action="append", choices=CASES,
                         help="Run only this case (repeatable for focused checks)")
     args = parser.parse_args()
@@ -211,7 +215,7 @@ def main():
                                 "function": {"name": "…", "arguments": "{}"}}]},
                             {"role": "tool", "tool_call_id": "legacy-call",
                              "content": "Unknown tool; no action taken. Continue the user's request."}])
-                body = {"model": args.model, "messages": messages, "max_tokens": 256,
+                body = {"model": args.model, "messages": messages, "max_tokens": args.max_tokens,
                         "temperature": 0.8 if sampled else 0, "seed": 1234,
                         "top_k": 20, "top_p": 0.95,
                         "chat_template_kwargs": {"enable_thinking": thinking,

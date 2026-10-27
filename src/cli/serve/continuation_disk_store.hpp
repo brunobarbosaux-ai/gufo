@@ -192,6 +192,10 @@ public:
       const TextModelRunner& runner, std::span<const TextRunnerToken> tokens,
       std::span<const std::uint8_t> input_identity = {});
 
+  /// Records the min_step skip that WithinCheckpointStep predicts, so a caller
+  /// that avoids the capture still logs the skip the write path would emit.
+  void RecordMinStepSkip(std::size_t token_count);
+
   [[nodiscard]] std::size_t entry_count() const noexcept;
   [[nodiscard]] std::size_t retained_bytes() const noexcept;
   [[nodiscard]] std::size_t capacity_bytes() const noexcept;

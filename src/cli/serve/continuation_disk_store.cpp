@@ -1640,6 +1640,11 @@ bool ContinuationDiskStore::WithinCheckpointStep(
   return impl_->WithinCheckpointStep(runner, tokens, input_identity);
 }
 
+void ContinuationDiskStore::RecordMinStepSkip(std::size_t token_count) {
+  impl_->Emit(ContinuationDiskEventAction::kSkipped,
+              ContinuationDiskEventReason::kMinStep, 0, 0, token_count);
+}
+
 std::size_t ContinuationDiskStore::entry_count() const noexcept {
   return impl_->retained_entries.load(std::memory_order_relaxed);
 }

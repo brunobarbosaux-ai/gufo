@@ -18,9 +18,12 @@ MIN_STEP = 2048
 SHORT_NOTE = "Routine archive note: there are no new instructions.\n"
 
 
-def chat(url, model, messages):
+def chat(url, model, messages, max_tokens=8):
     import continuation  # The runner's log check needs no HTTP client stack.
-    body = {"model": model, "messages": messages, "max_tokens": 8,
+    # Snapshot the list: grow() appends the assistant to the caller's list after
+    # the call, and a shared reference would retroactively rewrite every stored
+    # request (including the one restore() replays).
+    body = {"model": model, "messages": list(messages), "max_tokens": max_tokens,
             "temperature": 0, "seed": 31, "stream": False,
             "chat_template_kwargs": {"enable_thinking": False}}
     result = continuation.call(url, body)
@@ -35,10 +38,11 @@ def chat(url, model, messages):
     return body, result, {**provenance, "total": total, "cached": cached, "prefill": prefill,
                           "disk": usage["gufo"]["cache_disk_hit"],
                           "text": message["content"].strip(),
+                          "reasoning": message.get("reasoning_content") or "",
                           "sha256": continuation.digest(result)}
 
 
-def grow(url, model):
+def grow(url, model, max_tokens):
     # A unique head keeps earlier cache cases from sharing this prefix.
     messages = [{"role": "system", "content": "cache_disk_spacing\n" +
                  "Follow the final user instruction.\n" +
@@ -47,20 +51,26 @@ def grow(url, model):
     for turn, notes in enumerate((16, 24, 24, 24, 24, 240, 24)):
         messages.append({"role": "user", "content": f"Turn {turn}.\n" + SHORT_NOTE * notes +
                          "Reply with only BETA."})
-        body, _, measured = chat(url, model, messages)
+        body, _, measured = chat(url, model, messages, max_tokens)
         assert measured["text"] == "BETA", measured
         if turns:
             previous = turns[-1]["measured"]["total"]
             # Short turns must keep reusing RAM even when disk skips them.
             assert measured["cached"] >= previous - 16, (turn, measured, previous)
         turns.append({"request": body, "measured": measured})
-        messages.append({"role": "assistant", "content": measured["text"]})
+        assistant = {"role": "assistant", "content": measured["text"]}
+        if measured["reasoning"]:
+            # Flint always thinks and the model card requires preserving
+            # reasoning_content in history, or the next turn cannot reuse the
+            # prefix and the disk checkpoint spacing check sees a large gap.
+            assistant["reasoning_content"] = measured["reasoning"]
+        messages.append(assistant)
     return turns
 
 
-def restore(url, model, turns):
+def restore(url, model, turns, max_tokens):
     last = turns[-1]
-    _, _, replayed = chat(url, model, last["request"]["messages"])
+    _, _, replayed = chat(url, model, last["request"]["messages"], max_tokens)
     assert replayed["disk"] and replayed["cached"] > 0, replayed
     assert replayed["sha256"] == last["measured"]["sha256"], (replayed, last["measured"])
     # Skipped checkpoints are re-prefilled. The gap is bounded by the step,
@@ -70,7 +80,7 @@ def restore(url, model, turns):
     # long-turn checkpoint less than one step past the first one.
     branch = turns[3]["request"]["messages"][:7] + [{"role": "user", "content":
                                                     "Branch.\nReply with only GAMMA."}]
-    _, _, branched = chat(url, model, branch)
+    _, _, branched = chat(url, model, branch, max_tokens)
     assert branched["text"] == "GAMMA", branched
     return {"replayed": replayed, "branched": branched}
 
@@ -154,15 +164,20 @@ def main():
     parser.add_argument("--model", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--restore", type=Path)
+    parser.add_argument("--max-tokens", type=int, default=8,
+                        help="Completion budget per turn. Reasoning models emit a "
+                             "thinking block before content, so they need headroom.")
     args = parser.parse_args()
     import continuation
     continuation.TRACE.path = args.output.with_suffix(".requests.json")
     if args.restore:
         previous = json.loads(args.restore.read_text())[0]
-        report = {"case": "disk-spacing", **restore(args.url, args.model, previous["turns"]),
+        report = {"case": "disk-spacing", **restore(args.url, args.model, previous["turns"],
+                                                    args.max_tokens),
                   "exact": True}
     else:
-        report = {"case": "disk-spacing", "turns": grow(args.url, args.model), "exact": True}
+        report = {"case": "disk-spacing",
+                  "turns": grow(args.url, args.model, args.max_tokens), "exact": True}
     args.output.write_text(json.dumps([report], indent=2) + "\n")
 
 
