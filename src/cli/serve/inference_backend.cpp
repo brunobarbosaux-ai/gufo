@@ -4074,13 +4074,15 @@ bool InferenceBackend::load(
     return false;
   }
   const auto native_context = model->GetConfig().context_length;
+  const std::uint32_t served_cap =
+      core::FlintServedContextCap(model->GetConfig().sliding_window);
   if (max_context == 0) {
-    max_context = std::min(native_context, core::kFlintServedContextCap);
+    max_context = std::min(native_context, core::kFlintDefaultContext);
   }
-  if (max_context < 2 || max_context > core::kFlintServedContextCap) {
+  if (max_context < 2 || max_context > served_cap) {
     SetError(error, "HTTP context exceeds the flint build cap (" +
-                        std::to_string(core::kFlintServedContextCap) +
-                        " tokens; fp32 full-KV cache, F-I1)");
+                        std::to_string(served_cap) +
+                        " tokens; window-aware ring cache, F-I2)");
     return false;
   }
   if (session_count == 0) {

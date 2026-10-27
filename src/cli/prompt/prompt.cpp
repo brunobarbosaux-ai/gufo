@@ -849,7 +849,8 @@ void GenerateFlintGpuResponse(
     std::span<const tokenization::TokenId> prompt_tokens) {
   const auto& config = model.GetConfig();
   const std::uint32_t max_context = std::min<std::uint32_t>(
-      config.context_length, gufo::core::kFlintServedContextCap);
+      config.context_length,
+      gufo::core::FlintServedContextCap(config.sliding_window));
   hip::FlintGpuArena arena(config, max_context);
   const auto buffers = arena.GetBuffers();
   std::vector<float> logits(config.vocab_size);
@@ -1152,7 +1153,7 @@ int RunPrompt(std::span<const char* const> args) {
     if (opt.use_chat_template) {
       tokenization::ChatTemplateOptions template_options;
       template_options.max_output_bytes = tokenization::RenderedPromptBoundBytes(
-          core::kFlintServedContextCap);
+          core::FlintServedContextCap(flint_model->GetConfig().sliding_window));
       const auto rendered = tokenization::FlintChatTemplate::RenderAndTokenize(
           *flint_tokenizer, messages, {}, template_options);
       if (!rendered) {

@@ -6,10 +6,23 @@
 
 namespace gufo::core {
 
-/// Served-context cap for the fp32 full-KV flint cache (F-I1): 32k positions
-/// cost ~6.3 GB per session, so the build serves at most this window until a
-/// window-aware cache exists.
-inline constexpr std::uint32_t kFlintServedContextCap = 32768;
+/// Default served context when the caller does not pin `-c` (F-I1): 32k keeps
+/// the fp32 KV arena inside the 45 GiB budget at the default session count.
+inline constexpr std::uint32_t kFlintDefaultContext = 32768;
+
+/// Served-context caps (F-I1/F-I2). The window-aware ring cache (F-I2) holds
+/// only `sliding_window + prefill chunk` rows for the windowed layers, so the
+/// fp32 KV arena fits 262144 positions inside the 45 GiB budget; a full-KV
+/// layout (no sliding window) stays at 32768.
+inline constexpr std::uint32_t kFlintFullKvContextCap = 32768;
+inline constexpr std::uint32_t kFlintRingContextCap = 262144;
+
+/// Layout-dependent served-context cap: the ring cap when the model has a
+/// sliding window (the ring is active), the full-KV cap otherwise.
+[[nodiscard]] inline constexpr std::uint32_t FlintServedContextCap(
+    std::uint32_t sliding_window) noexcept {
+  return sliding_window != 0 ? kFlintRingContextCap : kFlintFullKvContextCap;
+}
 
 /// Closes every runtime option the flint architecture cannot serve (F-B3,
 /// F-B4): no MTP/nextn, no DFlash2, no DSpark drafting, and no vision
