@@ -115,6 +115,10 @@ class FlintGpuArena {
   [[nodiscard]] const std::vector<std::uint32_t>& GetKvLayerRows() const noexcept {
     return kv_layer_rows_;
   }
+  /// Element count of one fp32 KV plane (K and V are each this many floats).
+  [[nodiscard]] std::size_t GetKvPlaneElements() const noexcept {
+    return kv_plane_elements_;
+  }
   /// Device bytes owned by this arena (scratch + KV cache), for the
   /// memory-budget accounting in §9.
   [[nodiscard]] std::size_t GetScratchBytes() const noexcept {
@@ -138,6 +142,7 @@ class FlintGpuArena {
   std::size_t scratch_bytes_{0};
   std::vector<std::size_t> kv_layer_base_;
   std::vector<std::uint32_t> kv_layer_rows_;
+  std::size_t kv_plane_elements_{0};
   FlintGpuStepBuffers buffers_{};
   FlintPrefillBuffers prefill_{};
   FlintDecodeGraphState graph_state_{};

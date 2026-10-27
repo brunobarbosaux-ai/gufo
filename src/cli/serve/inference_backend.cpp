@@ -2345,6 +2345,9 @@ public:
   [[nodiscard]] hip::FlintGpuStepBuffers buffers() const noexcept {
     return buffers_;
   }
+  [[nodiscard]] const hip::FlintGpuArena& arena() const noexcept {
+    return arena_;
+  }
   /// Capture-once decode graph state owned by the arena (3.1).
   [[nodiscard]] hip::FlintDecodeGraphState* graph_state() noexcept {
     return arena_.GetGraphState();
@@ -2356,6 +2359,9 @@ public:
   [[nodiscard]] std::size_t position() const noexcept { return position_; }
   void set_position(std::size_t position) noexcept { position_ = position; }
   [[nodiscard]] std::vector<float>& logits() noexcept { return logits_; }
+  [[nodiscard]] const std::vector<float>& logits() const noexcept {
+    return logits_;
+  }
   [[nodiscard]] bool has_frontier_logits() const noexcept {
     return has_frontier_logits_;
   }
@@ -2369,6 +2375,25 @@ private:
   std::vector<float> logits_;
   std::size_t position_{0};
   bool has_frontier_logits_{false};
+};
+
+/// Immutable host copy of one flint state at a checkpoint (5.3c): the fp32
+/// KV planes and the frontier logits. The f16 KV twins are not captured (they
+/// are opt-in and the snapshot refuses to run while they are allocated).
+class FlintTextRunnerSnapshot final : public TextRunnerSnapshot {
+public:
+  hip::FlintKvWindowClass window_class;
+  std::size_t position{0};
+  // Empty when the state had no frontier logits (position 0).
+  std::vector<float> frontier_logits;
+  std::vector<float> k_plane;
+  std::vector<float> v_plane;
+
+  [[nodiscard]] std::size_t PayloadBytes() const noexcept override {
+    return (k_plane.size() + v_plane.size() + frontier_logits.size()) *
+               sizeof(float) +
+           sizeof(hip::FlintKvWindowClass) + sizeof(std::size_t);
+  }
 };
 
 FlintTextRunnerState& RequireFlintState(TextRunnerState& state) {
@@ -2412,8 +2437,8 @@ public:
         .capabilities =
             TextRunnerCapabilities{
                 .incremental_prefill = true,
-                .snapshot = false,
-                .fork = false,
+                .snapshot = true,
+                .fork = true,
                 .final_token_advance_required = true,
                 .incremental_text_is_exact = true,
                 .multi_token_decode = false,
@@ -2628,7 +2653,93 @@ public:
     return RequireFlintState(state).position();
   }
 
+  [[nodiscard]] std::size_t SnapshotPayloadBytes(
+      const TextRunnerState& state) const override {
+    const auto& flint = RequireFlintState(state);
+    RequireFlintSnapshotLayout(flint);
+    const std::size_t plane = flint.arena().GetKvPlaneElements();
+    const std::size_t frontier =
+        flint.has_frontier_logits() ? flint.logits().size() : 0;
+    return (2 * plane + frontier) * sizeof(float) +
+           sizeof(hip::FlintKvWindowClass) + sizeof(std::size_t);
+  }
+
+  [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Snapshot(
+      const TextRunnerState& state) const override {
+    const auto& flint = RequireFlintState(state);
+    RequireFlintSnapshotLayout(flint);
+    const std::size_t plane = flint.arena().GetKvPlaneElements();
+    const auto buffers = flint.buffers();
+    auto snapshot = std::make_unique<FlintTextRunnerSnapshot>();
+    snapshot->window_class = flint.arena().WindowClass();
+    snapshot->position = flint.position();
+    snapshot->k_plane.resize(plane);
+    snapshot->v_plane.resize(plane);
+    // The state is frozen during capture, so its own stream is the only
+    // ordering needed; no shared scratch is touched.
+    HIP_CHECK(hipMemcpyAsync(snapshot->k_plane.data(), buffers.k_cache,
+                             plane * sizeof(float), hipMemcpyDeviceToHost,
+                             buffers.stream));
+    HIP_CHECK(hipMemcpyAsync(snapshot->v_plane.data(), buffers.v_cache,
+                             plane * sizeof(float), hipMemcpyDeviceToHost,
+                             buffers.stream));
+    HIP_CHECK(hipStreamSynchronize(buffers.stream));
+    if (flint.has_frontier_logits()) {
+      snapshot->frontier_logits = flint.logits();
+    }
+    return snapshot;
+  }
+
+  void RestoreOrFork(TextRunnerState& state,
+                     const TextRunnerSnapshot& snapshot) const override {
+    auto& flint = RequireFlintState(state);
+    const auto* typed = dynamic_cast<const FlintTextRunnerSnapshot*>(&snapshot);
+    if (typed == nullptr) {
+      throw std::invalid_argument("flint restore requires a flint snapshot");
+    }
+    if (!flint.arena().CompatibleWith(typed->window_class)) {
+      throw std::invalid_argument(
+          "flint snapshot KV geometry does not match the restoring state");
+    }
+    RequireFlintSnapshotLayout(flint);
+    const std::size_t plane = flint.arena().GetKvPlaneElements();
+    if (typed->k_plane.size() != plane || typed->v_plane.size() != plane ||
+        typed->position > max_context_) {
+      throw std::invalid_argument("flint snapshot payload size mismatch");
+    }
+    if (!typed->frontier_logits.empty() &&
+        typed->frontier_logits.size() != flint.logits().size()) {
+      throw std::invalid_argument("flint snapshot logits size mismatch");
+    }
+    const auto buffers = flint.buffers();
+    HIP_CHECK(hipMemcpyAsync(buffers.k_cache, typed->k_plane.data(),
+                             plane * sizeof(float), hipMemcpyHostToDevice,
+                             buffers.stream));
+    HIP_CHECK(hipMemcpyAsync(buffers.v_cache, typed->v_plane.data(),
+                             plane * sizeof(float), hipMemcpyHostToDevice,
+                             buffers.stream));
+    HIP_CHECK(hipStreamSynchronize(buffers.stream));
+    flint.set_position(typed->position);
+    if (typed->frontier_logits.empty()) {
+      flint.clear_frontier();
+    } else {
+      flint.logits() = typed->frontier_logits;
+      flint.mark_frontier();
+    }
+  }
+
 private:
+  // The fp32 planes are the only KV state a snapshot carries. The f16 twins
+  // are opt-in and not captured, so refuse rather than restore a partial KV.
+  static void RequireFlintSnapshotLayout(const FlintTextRunnerState& flint) {
+    if (flint.buffers().k_cache_f16 != nullptr ||
+        flint.buffers().v_cache_f16 != nullptr) {
+      throw std::logic_error(
+          "flint snapshots do not capture the f16 KV twins "
+          "(GUFO_FLINT_KV_F16); disable them to use the RAM cache");
+    }
+  }
+
   std::shared_ptr<const hip::FlintGpuModel> model_;
   std::shared_ptr<const tokenization::QwenTokenizer> tokenizer_;
   std::uint32_t max_context_;

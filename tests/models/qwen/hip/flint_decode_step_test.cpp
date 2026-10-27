@@ -619,6 +619,47 @@ int main(int argc, char** argv) {
                std::to_string(step));
   }
 
+  // Snapshot/restore round trip (5.3c): capture the fp32 KV planes and the
+  // frontier logits after 3 tokens, advance one more step, restore the
+  // snapshot, and require the restored logits to equal the captured ones and
+  // the rerun of the advanced step to reproduce its logits bit for bit.
+  const std::size_t plane_elems = kv_bytes_elems;
+  std::vector<float> snap_k(plane_elems), snap_v(plane_elems);
+  std::vector<float> snap_logits(kVocab, 0.0F);
+  HIP_CHECK(hipMemcpy(snap_k.data(), buffers.k_cache,
+                      plane_elems * sizeof(float), hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(snap_v.data(), buffers.v_cache,
+                      plane_elems * sizeof(float), hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(snap_logits.data(), buffers.logits,
+                      kVocab * sizeof(float), hipMemcpyDeviceToHost));
+  gufo::hip::ExecuteFlintDecodeStep(device_weights, 5, 3,
+                                    /*compute_logits=*/true, buffers);
+  HIP_CHECK(hipDeviceSynchronize());
+  std::vector<float> advanced_logits(kVocab, 0.0F);
+  HIP_CHECK(hipMemcpy(advanced_logits.data(), buffers.logits,
+                      kVocab * sizeof(float), hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(buffers.k_cache, snap_k.data(),
+                      plane_elems * sizeof(float), hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(buffers.v_cache, snap_v.data(),
+                      plane_elems * sizeof(float), hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(buffers.logits, snap_logits.data(),
+                      kVocab * sizeof(float), hipMemcpyHostToDevice));
+  std::vector<float> restored_logits(kVocab, 0.0F);
+  HIP_CHECK(hipMemcpy(restored_logits.data(), buffers.logits,
+                      kVocab * sizeof(float), hipMemcpyDeviceToHost));
+  Expect(restored_logits == snap_logits,
+         "restored frontier logits differ from the snapshot");
+  gufo::hip::ExecuteFlintDecodeStep(device_weights, 5, 3,
+                                    /*compute_logits=*/true, buffers);
+  HIP_CHECK(hipDeviceSynchronize());
+  std::vector<float> rerun_logits(kVocab, 0.0F);
+  HIP_CHECK(hipMemcpy(rerun_logits.data(), buffers.logits,
+                      kVocab * sizeof(float), hipMemcpyDeviceToHost));
+  Expect(rerun_logits == advanced_logits,
+         "rerun after restore does not reproduce the advanced step");
+  std::cout << "snapshot round trip ok (" << plane_elems
+            << " KV elems per plane, bit-exact rerun)\n";
+
   // compute_logits=false must leave the hidden state correct without
   // touching logits: run one more step and confirm it does not crash and
   // logits buffer is untouched (still the previous step's values).

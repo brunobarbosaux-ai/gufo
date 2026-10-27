@@ -184,6 +184,7 @@ FlintGpuArena::FlintGpuArena(const core::ModelConfig& config,
   const std::size_t plane =
       FlintArenaPlaneElements(config, max_context, &kv_layer_base_,
                               &kv_layer_rows_);
+  kv_plane_elements_ = plane;
 
   const std::size_t scratch_floats =
       hidden_size * 5 +  // hidden, normed, attn_proj, expert_out, mlp_out
@@ -362,11 +363,13 @@ FlintGpuArena::FlintGpuArena(FlintGpuArena&& other) noexcept
       scratch_bytes_(other.scratch_bytes_),
       kv_layer_base_(std::move(other.kv_layer_base_)),
       kv_layer_rows_(std::move(other.kv_layer_rows_)),
+      kv_plane_elements_(other.kv_plane_elements_),
       buffers_(other.buffers_),
       prefill_(other.prefill_) {
   buffers_.kv_layer_base = kv_layer_base_.data();
   buffers_.kv_layer_rows = kv_layer_rows_.data();
   other.scratch_bytes_ = 0;
+  other.kv_plane_elements_ = 0;
   other.buffers_ = {};
   other.prefill_ = {};
   // Graph execs are captured on (and reference) this arena's stream and
@@ -382,11 +385,13 @@ FlintGpuArena& FlintGpuArena::operator=(FlintGpuArena&& other) noexcept {
     scratch_bytes_ = other.scratch_bytes_;
     kv_layer_base_ = std::move(other.kv_layer_base_);
     kv_layer_rows_ = std::move(other.kv_layer_rows_);
+    kv_plane_elements_ = other.kv_plane_elements_;
     buffers_ = other.buffers_;
     buffers_.kv_layer_base = kv_layer_base_.data();
     buffers_.kv_layer_rows = kv_layer_rows_.data();
     prefill_ = other.prefill_;
     other.scratch_bytes_ = 0;
+    other.kv_plane_elements_ = 0;
     other.buffers_ = {};
     other.prefill_ = {};
     other.graph_state_.Release();
