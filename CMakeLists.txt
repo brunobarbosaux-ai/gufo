@@ -562,6 +562,24 @@ if (BUILD_TESTING)
     set_tests_properties(flint_runner_snapshot_test PROPERTIES
       LABELS "hip;gpu;server;flint;snapshot"
       SKIP_RETURN_CODE 77)
+
+    # F-I3 (5.4): prefix-reuse parity. Same link set as the snapshot test.
+    add_executable(flint_prefix_reuse_test
+      tests/cli/flint_prefix_reuse_test.cpp
+      src/cli/serve/inference_backend.cpp
+      src/cli/serve/continuation_cache.cpp
+      src/cli/serve/continuation_disk_store.cpp
+      src/cli/serve/component_text_cache.cpp
+      src/cli/serve/text_model_runner.cpp
+      src/cli/serve/text_generation_scheduler.cpp
+      src/eval/http_client.cpp)
+    target_link_libraries(flint_prefix_reuse_test PRIVATE
+      gufo_cache gufo_diagnostics gufo_core gufo_llm_cli gufo_http CURL::libcurl
+      gufo_cache_hip gufo_deepseek_v4_flash)
+    add_test(NAME flint_prefix_reuse_test COMMAND flint_prefix_reuse_test)
+    set_tests_properties(flint_prefix_reuse_test PROPERTIES
+      LABELS "hip;gpu;server;flint;cache;prefix-reuse"
+      SKIP_RETURN_CODE 77)
   endif()
 
   add_executable(continuation_disk_store_test
