@@ -578,6 +578,17 @@ int main(int argc, char** argv) {
   buffers.k_cache = AllocDevice(kv_bytes_elems, allocs);
   buffers.v_cache = AllocDevice(kv_bytes_elems, allocs);
   buffers.max_context = kMaxContext;
+  // F-I2 ring metadata (the arena's FlintArenaPlaneElements). At this context
+  // every layer's ring is max_context rows, so the planes are uniform.
+  std::vector<std::size_t> kv_layer_base(weights.config.num_layers);
+  std::vector<std::uint32_t> kv_layer_rows(weights.config.num_layers,
+                                           kMaxContext);
+  for (std::uint32_t l = 0; l < weights.config.num_layers; ++l) {
+    kv_layer_base[l] = static_cast<std::size_t>(l) * kKvHeads * kMaxContext *
+                       kHeadDim;
+  }
+  buffers.kv_layer_base = kv_layer_base.data();
+  buffers.kv_layer_rows = kv_layer_rows.data();
   HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&buffers.selected),
                       8 * sizeof(std::uint32_t)));
   allocs.push_back(buffers.selected);
