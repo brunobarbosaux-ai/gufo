@@ -8,11 +8,14 @@ request state, captured decode graphs).
 
 ## Status
 
-Experimental, in active optimization. Serve-path correctness gates (G3/G4/
-G5/G6/G8) green; Phase 3 (decode performance) complete. Outstanding before
-production claim: tool calls (F-L5), reasoning streaming (F-L6), window-aware
-ring cache and snapshots (F-I*), deployment packaging (F-K*/F-M*). Plan and
-progress log: `Kazoku-system-prompts/infra/strix-halo/flint-optimization-plan.md`.
+Experimental. Phases 0–5 complete: serve-path gates G3–G9 and F-I4 green,
+tool calls and reasoning streaming landed, ring cache with snapshot/fork/restore
+and disk persistence in place. The served context cap is layout-dependent:
+262144 with the ring (windowed layers), 32768 for full-KV. Remaining before a
+production claim: deployment (llama-swap profile, litellm alias, G10 floor
+check, G11 end-to-end acceptance). Quality: [QUALITY.md](QUALITY.md).
+Rejected alternatives: [EXPERIMENTS.md](EXPERIMENTS.md). Plan and progress log:
+`Kazoku-system-prompts/infra/strix-halo/flint-optimization-plan.md`.
 
 ## Artifacts
 
@@ -33,10 +36,10 @@ gufo serve llm -m <flint>.gguf -p 8006 -c 32768 --served-model-name t-flint-40b
   Phase-4 work — the template renders but F-L5 parsing is not landed).
 - Sampling defaults: Flint preset pins T 1.0 / p 0.95 / k 20
   (`src/core/text_sampling_defaults.hpp`); explicit request overrides win.
-- Context: up to 32768 enforced (`-c`); KV is fp32 by default
+- Context: `-c` is capped by layout — 262144 with the ring, 32768 full-KV; KV is fp32 by default
   (`GUFO_FLINT_KV_F16=1` opts into the f16 twin planes — decode-negative,
   see BENCHMARKS.md).
-- Snapshots/persistence are refused at this stage (Phase 5).
+- Snapshots, forks and disk persistence are supported (Phase 5).
 
 ## Test targets (F-K1 mapping)
 
