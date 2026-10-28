@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <iomanip>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -349,6 +350,91 @@ void RunFlashBench() {
               stream, /*split_k_scratch=*/nullptr, /*skip_kv_write=*/true,
               &policy_w);
         });
+
+  // Cold-cache span sweep of the global-layer decode kernel. Before every
+  // timed launch, a 256 MB memset on the same stream evicts L2/MALL so the
+  // KV read comes from HBM. Timing uses hipEvent pairs recorded immediately
+  // around the attention launch only; the flush is stream-ordered before the
+  // start event, so it is outside the timed interval. Each span gets its own
+  // cache with max_context == span and pos == span - 1, so exactly `span`
+  // keys are read per head. Kernel selection mirrors LaunchAttention's
+  // policy-window-0 branches (<=513 graph, <=4096 graph, else online).
+  constexpr std::size_t kFlushBytes = 256ULL * 1024 * 1024;
+  constexpr int kColdWarm = 3;
+  constexpr int kColdReps = 20;
+  float* d_flush = nullptr;
+  HIP_CHECK(hipMalloc(&d_flush, kFlushBytes));
+  std::vector<hipEvent_t> events(2 * kColdReps);
+  for (auto& event : events) {
+    HIP_CHECK(hipEventCreate(&event));
+  }
+  std::cout << "  cold-cache span sweep (256 MB flush before each launch, "
+            << kColdReps << " reps, kernel timed alone)\n";
+  for (const std::uint32_t span : {512U, 4096U, 8192U, 32768U, 65536U}) {
+    const std::size_t cold_elems =
+        static_cast<std::size_t>(kKvHeads) * span * kHeadDim;
+    float* d_cold_k = nullptr;
+    float* d_cold_v = nullptr;
+    std::uint32_t* d_cold_pos = nullptr;
+    HIP_CHECK(hipMalloc(&d_cold_k, cold_elems * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_cold_v, cold_elems * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_cold_pos, sizeof(std::uint32_t)));
+    HIP_CHECK(hipMemset(d_cold_k, 0x3C, cold_elems * sizeof(float)));
+    HIP_CHECK(hipMemset(d_cold_v, 0x3C, cold_elems * sizeof(float)));
+    const std::uint32_t cold_pos = span - 1;
+    HIP_CHECK(hipMemcpy(d_cold_pos, &cold_pos, sizeof(cold_pos),
+                        hipMemcpyHostToDevice));
+    const char* kernel = span <= 513    ? "graph<513>"
+                         : span <= 4096 ? "graph<4096>"
+                                        : "online";
+    const auto flush = [&] {
+      HIP_CHECK(hipMemsetAsync(d_flush, 0xA5, kFlushBytes, stream));
+    };
+    const auto launch = [&] {
+      gufo::hip::LaunchAttention(
+          d_q, nullptr, nullptr, nullptr, d_cold_k, d_cold_v, nullptr, nullptr,
+          d_out, 0U, d_cold_pos, span, kHeads, kKvHeads, kHeadDim, stream,
+          /*skip_kv_write=*/true, &policy);
+    };
+    for (int i = 0; i < kColdWarm; ++i) {
+      flush();
+      launch();
+    }
+    for (int i = 0; i < kColdReps; ++i) {
+      flush();
+      HIP_CHECK(hipEventRecord(events[2 * i], stream));
+      launch();
+      HIP_CHECK(hipEventRecord(events[2 * i + 1], stream));
+    }
+    HIP_CHECK(hipStreamSynchronize(stream));
+    double total_ms = 0.0;
+    for (int i = 0; i < kColdReps; ++i) {
+      float ms = 0.0F;
+      HIP_CHECK(hipEventElapsedTime(&ms, events[2 * i], events[2 * i + 1]));
+      total_ms += ms;
+    }
+    const double ms_per_layer = total_ms / kColdReps;
+    // unique: K and V read once per KV head. actual: each of the 32 query
+    // heads re-reads its KV head (GQA 8:1), as the per-head kernel does.
+    const double unique_bytes =
+        2.0 * kKvHeads * static_cast<double>(span) * kHeadDim * sizeof(float);
+    const double actual_bytes =
+        2.0 * kHeads * static_cast<double>(span) * kHeadDim * sizeof(float);
+    const double unique_gbps = unique_bytes / (ms_per_layer * 1e-3) / 1e9;
+    const double actual_gbps = actual_bytes / (ms_per_layer * 1e-3) / 1e9;
+    std::cout << std::fixed << std::setprecision(4) << "  span=" << span
+              << " kernel=" << kernel << " ms/layer=" << ms_per_layer
+              << std::setprecision(1) << " unique_GBps=" << unique_gbps
+              << " actual_GBps=" << actual_gbps << std::defaultfloat
+              << std::setprecision(6) << "\n";
+    HIP_CHECK(hipFree(d_cold_k));
+    HIP_CHECK(hipFree(d_cold_v));
+    HIP_CHECK(hipFree(d_cold_pos));
+  }
+  for (auto& event : events) {
+    HIP_CHECK(hipEventDestroy(event));
+  }
+  HIP_CHECK(hipFree(d_flush));
 
   HIP_CHECK(hipFree(d_k));
   HIP_CHECK(hipFree(d_v));
