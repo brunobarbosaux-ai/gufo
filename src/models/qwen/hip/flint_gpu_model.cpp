@@ -201,11 +201,12 @@ FlintGpuArena::FlintGpuArena(const core::ModelConfig& config,
                               &kv_layer_rows_);
   kv_plane_elements_ = plane;
 
-  // Split-KV decode scratch (GUFO_FLINT_ATTN_SPLITKV, default OFF): sized
-  // from max_context so the graph-captured launch never reallocates.
+  // Split-KV decode scratch (GUFO_FLINT_ATTN_SPLITKV, default ON): sized
+  // from max_context so the graph-captured launch never reallocates. Set
+  // GUFO_FLINT_ATTN_SPLITKV=0 to skip the allocation and the route.
   static const bool attn_splitkv_enabled = [] {
     const char* v = std::getenv("GUFO_FLINT_ATTN_SPLITKV");
-    return v != nullptr && v[0] == '1';
+    return v == nullptr || v[0] != '0';
   }();
   const std::size_t splitkv_floats =
       attn_splitkv_enabled

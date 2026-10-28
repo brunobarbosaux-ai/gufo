@@ -151,15 +151,15 @@ void RunFlintLayer(const models::FlintModelWeights& weights,
       static_cast<const float*>(layer.attn_sinks.data),
       layer.attrs.windowed ? config.sliding_window : 0U,
       b.kv_layer_rows[layer_idx]};
-  // Split-KV GQA decode (GUFO_FLINT_ATTN_SPLITKV, default OFF). The gate
+  // Split-KV GQA decode (GUFO_FLINT_ATTN_SPLITKV, default ON). The gate
   // reads only capture-time values (flag, scratch presence, max_context,
   // shape), never pos, so the captured graph routes the same way at every
   // position. The launcher needs the position in device memory, so the
   // split-KV route is graph-mode only; the legacy host-pos path keeps
-  // LaunchAttention.
+  // LaunchAttention. Set GUFO_FLINT_ATTN_SPLITKV=0 to fall back.
   static const bool splitkv_flag = [] {
     const char* v = std::getenv("GUFO_FLINT_ATTN_SPLITKV");
-    return v != nullptr && v[0] == '1';
+    return v == nullptr || v[0] != '0';
   }();
   // Both layer classes route here: the launcher picks the 64-key window chunk
   // for windowed layers (span bounded by the 513 window) and the 256-key
