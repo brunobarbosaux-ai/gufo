@@ -8,6 +8,7 @@
 
 #include "src/core/hip/hip_utils.hpp"
 #include "src/models/qwen/hip/detail/weight_regions.hpp"
+#include "src/models/qwen/hip/ops/attention.hpp"
 #include "src/models/qwen/hip/ops/moe.hpp"
 
 namespace gufo::hip {
@@ -200,6 +201,19 @@ FlintGpuArena::FlintGpuArena(const core::ModelConfig& config,
                               &kv_layer_rows_);
   kv_plane_elements_ = plane;
 
+  // Split-KV decode scratch (GUFO_FLINT_ATTN_SPLITKV, default OFF): sized
+  // from max_context so the graph-captured launch never reallocates.
+  static const bool attn_splitkv_enabled = [] {
+    const char* v = std::getenv("GUFO_FLINT_ATTN_SPLITKV");
+    return v != nullptr && v[0] == '1';
+  }();
+  const std::size_t splitkv_floats =
+      attn_splitkv_enabled
+          ? FlintDecodeSplitKvScratchElements(max_context,
+                                              config.num_attention_heads,
+                                              config.head_dim)
+          : 0;
+
   const std::size_t scratch_floats =
       hidden_size * 5 +  // hidden, normed, attn_proj, expert_out, mlp_out
       attention_size * 2 +  // q, attn_out
@@ -212,7 +226,8 @@ FlintGpuArena::FlintGpuArena(const core::ModelConfig& config,
            config.expert_feed_forward_length +
        config.expert_shared_feed_forward_length) +  // act_moe (F-J1 fused)
       config.vocab_size +  // logits
-      plane * 2;  // k/v cache
+      plane * 2 +  // k/v cache
+      splitkv_floats;  // split-KV attention scratch (flag-gated)
   scratch_bytes_ = scratch_floats * sizeof(float) +
                    8 * sizeof(std::uint32_t);  // selected experts
 
@@ -262,6 +277,9 @@ FlintGpuArena::FlintGpuArena(const core::ModelConfig& config,
                         plane * sizeof(__half)));
     HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&buffers_.v_cache_f16),
                         plane * sizeof(__half)));
+  }
+  if (splitkv_floats != 0) {
+    buffers_.attn_splitkv_scratch = alloc(splitkv_floats);
   }
   buffers_.expert_weights = alloc(8);
   HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&buffers_.selected),

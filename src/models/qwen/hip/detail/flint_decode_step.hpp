@@ -60,6 +60,10 @@ struct FlintGpuStepBuffers {
   /// run-to-run noise that flipped fragile argmax ties).
   float* moe_partials = nullptr;
   float* logits = nullptr;
+  /// Split-KV decode attention scratch (GUFO_FLINT_ATTN_SPLITKV, default off):
+  /// FlintDecodeSplitKvScratchElements(max_context, heads, head_dim) floats.
+  /// Null when the flag is off, which keeps the legacy attention route.
+  float* attn_splitkv_scratch = nullptr;
 
   float* k_cache = nullptr;
   float* v_cache = nullptr;

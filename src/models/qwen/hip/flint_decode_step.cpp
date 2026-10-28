@@ -151,14 +151,42 @@ void RunFlintLayer(const models::FlintModelWeights& weights,
       static_cast<const float*>(layer.attn_sinks.data),
       layer.attrs.windowed ? config.sliding_window : 0U,
       b.kv_layer_rows[layer_idx]};
+  // Split-KV GQA decode (GUFO_FLINT_ATTN_SPLITKV, default OFF). The gate
+  // reads only capture-time values (flag, scratch presence, max_context,
+  // shape), never pos, so the captured graph routes the same way at every
+  // position. The launcher needs the position in device memory, so the
+  // split-KV route is graph-mode only; the legacy host-pos path keeps
+  // LaunchAttention.
+  static const bool splitkv_flag = [] {
+    const char* v = std::getenv("GUFO_FLINT_ATTN_SPLITKV");
+    return v != nullptr && v[0] == '1';
+  }();
+  // Global layers only: windowed layers see a span of sliding_window (513),
+  // where split-KV is slower, so they keep the online-tile route.
+  const bool use_splitkv =
+      splitkv_flag && b.attn_splitkv_scratch != nullptr &&
+      !layer.attrs.windowed && b.max_context > 4096 &&
+      config.num_attention_heads == 8 * config.num_key_value_heads &&
+      config.head_dim == 128;
   if (d_control != nullptr) {
-    LaunchAttention(b.q, b.k, b.v, /*gate=*/nullptr, b.k_cache, b.v_cache,
-                    b.k_cache_f16, b.v_cache_f16,
-                    b.attn_out, layer_idx, d_control + 1, b.max_context,
-                    config.num_attention_heads, config.num_key_value_heads,
-                    config.head_dim, b.stream,
-                    /*skip_kv_write=*/false, &policy,
-                    b.kv_layer_base[layer_idx]);
+    const bool splitkv_done =
+        use_splitkv &&
+        LaunchFlintDecodeSplitKvAttention(
+            b.q, b.k_cache, b.v_cache, b.k_cache_f16, b.v_cache_f16,
+            b.attn_out, layer_idx, b.kv_layer_base[layer_idx], d_control + 1,
+            b.max_context, config.num_attention_heads,
+            config.num_key_value_heads, config.head_dim,
+            b.attn_splitkv_scratch, b.stream, &policy, b.k, b.v,
+            /*skip_kv_write=*/false);
+    if (!splitkv_done) {
+      LaunchAttention(b.q, b.k, b.v, /*gate=*/nullptr, b.k_cache, b.v_cache,
+                      b.k_cache_f16, b.v_cache_f16,
+                      b.attn_out, layer_idx, d_control + 1, b.max_context,
+                      config.num_attention_heads, config.num_key_value_heads,
+                      config.head_dim, b.stream,
+                      /*skip_kv_write=*/false, &policy,
+                      b.kv_layer_base[layer_idx]);
+    }
   } else {
     LaunchAttention(b.q, b.k, b.v, /*gate=*/nullptr, b.k_cache, b.v_cache,
                     b.k_cache_f16, b.v_cache_f16,

@@ -103,8 +103,11 @@ inline constexpr std::uint32_t kFlintSplitKvGroupSize = 8;
 /// `scratch` and are reduced in fixed chunk order (no atomics, deterministic).
 /// The sink joins chunk 0 only. Requires num_heads == 8 * num_kv_heads and
 /// head_dim == 128; prefers the f16 plane when both f16 planes are supplied.
-/// Returns false on unsupported shape, missing cache, or launch failure. Not
-/// yet routed from LaunchAttention.
+/// Unless skip_kv_write is set and `k`/`v` are non-null, the current token's
+/// K/V are written to the cache first (WriteKVCachePtrKernel, same arguments
+/// as LaunchAttention); callers that pass no `k`/`v` never write.
+/// Returns false on unsupported shape, missing cache, or launch failure.
+/// Routed from the flint decode step behind GUFO_FLINT_ATTN_SPLITKV.
 [[nodiscard]] bool LaunchFlintDecodeSplitKvAttention(
     const float* q, float* k_cache, float* v_cache, void* k_cache_f16,
     void* v_cache_f16, float* out_context, std::uint32_t layer_idx,
@@ -112,7 +115,9 @@ inline constexpr std::uint32_t kFlintSplitKvGroupSize = 8;
     std::uint32_t max_context, std::uint32_t num_heads,
     std::uint32_t num_kv_heads, std::uint32_t head_dim, float* scratch,
     hipStream_t stream = nullptr,
-    const detail::FlintKernelPolicy* policy = nullptr);
+    const detail::FlintKernelPolicy* policy = nullptr,
+    const float* k = nullptr, const float* v = nullptr,
+    bool skip_kv_write = false);
 
 /// Fuses per-head Q/K RMSNorm, RoPE, and the KV-cache write for a single decode
 /// token into one launch (opt-c010-qk-rope-kv). Writes the normed+roped Q into

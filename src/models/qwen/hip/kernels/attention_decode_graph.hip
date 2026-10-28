@@ -771,7 +771,8 @@ bool LaunchFlintDecodeSplitKvAttention(
     std::size_t layer_base, const std::uint32_t* d_pos,
     std::uint32_t max_context, std::uint32_t num_heads,
     std::uint32_t num_kv_heads, std::uint32_t head_dim, float* scratch,
-    hipStream_t stream, const detail::FlintKernelPolicy* policy) {
+    hipStream_t stream, const detail::FlintKernelPolicy* policy,
+    const float* k, const float* v, bool skip_kv_write) {
   if (q == nullptr || out_context == nullptr || d_pos == nullptr ||
       scratch == nullptr || max_context == 0 || num_kv_heads == 0 ||
       num_heads != kFlintSplitKvGroupSize * num_kv_heads || head_dim != 128) {
@@ -786,6 +787,14 @@ bool LaunchFlintDecodeSplitKvAttention(
       policy != nullptr ? *policy : detail::FlintKernelPolicy{};
   const std::uint32_t num_chunks =
       (max_context + kFlintSplitKvChunk - 1) / kFlintSplitKvChunk;
+  const std::size_t base = layer_base;
+  const std::uint32_t rows = policy != nullptr ? policy->kv_rows : 0U;
+  if (!skip_kv_write && k != nullptr && v != nullptr) {
+    WriteKVCachePtrKernel<<<num_kv_heads, 256, 0, stream>>>(
+        k, v, k_cache, v_cache, static_cast<__half*>(k_cache_f16),
+        static_cast<__half*>(v_cache_f16), base, rows, d_pos, max_context,
+        num_kv_heads, head_dim);
+  }
   const dim3 grid(num_kv_heads, num_chunks);
   if (use_f16) {
     FlintDecodeSplitKvGqaKernel<__half><<<grid, 256, 0, stream>>>(
