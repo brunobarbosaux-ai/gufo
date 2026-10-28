@@ -47,6 +47,12 @@ constexpr int kFlintRouterTokens = 8;      // tokens per router block
 /// activation tile never straddles two experts (F-L4 grouped WMMA route).
 constexpr int kFlintSlotTile = 16;
 
+/// Tiles processed per grouped-WMMA block (7.5d). Expert buckets are emitted
+/// as runs of 16-slot tiles; a block claims a run of up to this many tiles so
+/// one decoded weight block feeds that many activation tiles, cutting the
+/// per-expert weight re-read (the routed MoE is DRAM-bound at chunk sizes).
+constexpr int kFlintGroupTiles = 2;
+
 // ---------------------------------------------------------------------------
 // Router: logits[N, E] = x[N, H] * W[E, H]^T for the whole chunk.
 // ---------------------------------------------------------------------------
@@ -739,6 +745,7 @@ __launch_bounds__(256, 2) __global__ void FlintMoeGroupedGateUpWmmaKernel(
     std::size_t slab_bytes) {
   constexpr int BM = 128;
   constexpr int BK = 2;
+  constexpr int G = kFlintGroupTiles;
   constexpr int kRowTiles = BM / 16;
   constexpr bool PerHalfScale =
       WType == core::GgmlType::kQ6_K || WType == core::GgmlType::kQ3_K;
@@ -749,6 +756,24 @@ __launch_bounds__(256, 2) __global__ void FlintMoeGroupedGateUpWmmaKernel(
     return;
   }
   const int e = tile_expert[t];
+  // Tiles are expert-sorted. A block claims a group of up to G consecutive
+  // tiles of one expert: the group leader is the tile whose offset within the
+  // expert's run is a multiple of G. One decoded weight block then feeds G
+  // activation tiles, cutting the per-expert weight re-read.
+  int run_start = t;
+  while (run_start > 0 && tile_expert[run_start - 1] == e) {
+    --run_start;
+  }
+  if (((t - run_start) % G) != 0) {
+    return;
+  }
+  int ntiles = 1;
+#pragma unroll
+  for (int j = 1; j < G; ++j) {
+    if (t + j < tile_count[0] && tile_expert[t + j] == e) {
+      ++ntiles;
+    }
+  }
   const std::size_t slot0 = static_cast<std::size_t>(tile_slot0[t]);
   const std::size_t r_block = static_cast<std::size_t>(blockIdx.y) * BM;
 
@@ -769,8 +794,8 @@ __launch_bounds__(256, 2) __global__ void FlintMoeGroupedGateUpWmmaKernel(
   __shared__ int32x4_t s_u[BK][kRowTiles][32];
   __shared__ float s_dwg[BK][kScaleHalves][kRowTiles][16];
   __shared__ float s_dwu[BK][kScaleHalves][kRowTiles][16];
-  __shared__ int32x4_t s_b[BK][1][32];
-  __shared__ float s_dx[BK][1][16];
+  __shared__ int32x4_t s_b[BK][G][32];
+  __shared__ float s_dx[BK][G][16];
 
   // One (row, kb) weight unit per thread: BM * BK == 256 threads.
   const int rr = tid / BK;
@@ -782,23 +807,26 @@ __launch_bounds__(256, 2) __global__ void FlintMoeGroupedGateUpWmmaKernel(
   const std::uint8_t* uline =
       urow + (r_block + static_cast<std::size_t>(rr)) * row_bytes;
 
-  // Wave 0 stages the single token tile (32 lanes cover both k-half runs).
+  // Wave 0 stages the group's token tiles (32 lanes cover both k-half runs).
   const std::int8_t* b_base =
       static_cast<const std::int8_t*>(slot_q8) +
       ((slot0 >> 4) * num_blocks * kQ8ActTileBytes);
 
-  float acc_g[8];
-  float acc_u[8];
+  float acc_g[G][8];
+  float acc_u[G][8];
 #pragma unroll
-  for (int l = 0; l < 8; ++l) {
-    acc_g[l] = 0.0F;
-    acc_u[l] = 0.0F;
+  for (int j = 0; j < G; ++j) {
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+      acc_g[j][l] = 0.0F;
+      acc_u[j][l] = 0.0F;
+    }
   }
 
   int32x4_t r_qg0, r_qg1, r_qu0, r_qu1;
   float r_dwg0, r_dwg1, r_dwu0, r_dwu1;
-  int32x4_t r_b[BK];
-  float r_dx[BK];
+  int32x4_t r_b[G][BK];
+  float r_dx[G][BK];
 
   const auto fetch_stage = [&](int kb0) {
     const int kb = kb0 + kk;
@@ -818,11 +846,18 @@ __launch_bounds__(256, 2) __global__ void FlintMoeGroupedGateUpWmmaKernel(
     if (wave_id == 0) {
 #pragma unroll
       for (int i = 0; i < BK; ++i) {
-        const std::int8_t* tile =
-            b_base + static_cast<std::size_t>(kb0 + i) * kQ8ActTileBytes;
-        r_b[i] = reinterpret_cast<const int32x4_t*>(tile)[lane_id];
-        r_dx[i] =
-            reinterpret_cast<const float*>(tile + kQ8ActScaleOffset)[lane_id & 15];
+#pragma unroll
+        for (int j = 0; j < G; ++j) {
+          if (j >= ntiles) {
+            continue;
+          }
+          const std::int8_t* tile =
+              b_base + ((static_cast<std::size_t>(j) * num_blocks) + kb0 + i) *
+                           kQ8ActTileBytes;
+          r_b[j][i] = reinterpret_cast<const int32x4_t*>(tile)[lane_id];
+          r_dx[j][i] = reinterpret_cast<const float*>(
+              tile + kQ8ActScaleOffset)[lane_id & 15];
+        }
       }
     }
   };
@@ -841,9 +876,15 @@ __launch_bounds__(256, 2) __global__ void FlintMoeGroupedGateUpWmmaKernel(
     if (wave_id == 0) {
 #pragma unroll
       for (int i = 0; i < BK; ++i) {
-        s_b[i][0][lane_id] = r_b[i];
-        if (lane_id < 16) {
-          s_dx[i][0][lane_id] = r_dx[i];
+#pragma unroll
+        for (int j = 0; j < G; ++j) {
+          if (j >= ntiles) {
+            continue;
+          }
+          s_b[i][j][lane_id] = r_b[j][i];
+          if (lane_id < 16) {
+            s_dx[i][j][lane_id] = r_dx[j][i];
+          }
         }
       }
     }
@@ -892,36 +933,42 @@ __launch_bounds__(256, 2) __global__ void FlintMoeGroupedGateUpWmmaKernel(
         dwu1[0] = h_ulo.x; dwu1[1] = h_ulo.y; dwu1[2] = h_ulo.z; dwu1[3] = h_ulo.w;
         dwu1[4] = h_uup.x; dwu1[5] = h_uup.y; dwu1[6] = h_uup.z; dwu1[7] = h_uup.w;
       }
-      const int32x4_t b0 = s_b[kb][0][sub_lane];
-      const int32x4_t b1 = s_b[kb][0][16 + sub_lane];
-      const float dx = s_dx[kb][0][sub_lane];
-      if constexpr (PerHalfScale) {
-        int32x8_t cg0 = {0, 0, 0, 0, 0, 0, 0, 0};
-        int32x8_t cg1 = {0, 0, 0, 0, 0, 0, 0, 0};
-        int32x8_t cu0 = {0, 0, 0, 0, 0, 0, 0, 0};
-        int32x8_t cu1 = {0, 0, 0, 0, 0, 0, 0, 0};
-        cg0 = WmmaQuant<32>(ag0, b0, cg0);
-        cg1 = WmmaQuant<32>(ag1, b1, cg1);
-        cu0 = WmmaQuant<32>(au0, b0, cu0);
-        cu1 = WmmaQuant<32>(au1, b1, cu1);
 #pragma unroll
-        for (int l = 0; l < 8; ++l) {
-          acc_g[l] += (dwg0[l] * dx) * static_cast<float>(cg0[l]) +
-                      (dwg1[l] * dx) * static_cast<float>(cg1[l]);
-          acc_u[l] += (dwu0[l] * dx) * static_cast<float>(cu0[l]) +
-                      (dwu1[l] * dx) * static_cast<float>(cu1[l]);
+      for (int j = 0; j < G; ++j) {
+        if (j >= ntiles) {
+          continue;
         }
-      } else {
-        int32x8_t cg = {0, 0, 0, 0, 0, 0, 0, 0};
-        int32x8_t cu = {0, 0, 0, 0, 0, 0, 0, 0};
-        cg = WmmaQuant<32>(ag0, b0, cg);
-        cg = WmmaQuant<32>(ag1, b1, cg);
-        cu = WmmaQuant<32>(au0, b0, cu);
-        cu = WmmaQuant<32>(au1, b1, cu);
+        const int32x4_t b0 = s_b[kb][j][sub_lane];
+        const int32x4_t b1 = s_b[kb][j][16 + sub_lane];
+        const float dx = s_dx[kb][j][sub_lane];
+        if constexpr (PerHalfScale) {
+          int32x8_t cg0 = {0, 0, 0, 0, 0, 0, 0, 0};
+          int32x8_t cg1 = {0, 0, 0, 0, 0, 0, 0, 0};
+          int32x8_t cu0 = {0, 0, 0, 0, 0, 0, 0, 0};
+          int32x8_t cu1 = {0, 0, 0, 0, 0, 0, 0, 0};
+          cg0 = WmmaQuant<32>(ag0, b0, cg0);
+          cg1 = WmmaQuant<32>(ag1, b1, cg1);
+          cu0 = WmmaQuant<32>(au0, b0, cu0);
+          cu1 = WmmaQuant<32>(au1, b1, cu1);
 #pragma unroll
-        for (int l = 0; l < 8; ++l) {
-          acc_g[l] += (dwg0[l] * dx) * static_cast<float>(cg[l]);
-          acc_u[l] += (dwu0[l] * dx) * static_cast<float>(cu[l]);
+          for (int l = 0; l < 8; ++l) {
+            acc_g[j][l] += (dwg0[l] * dx) * static_cast<float>(cg0[l]) +
+                           (dwg1[l] * dx) * static_cast<float>(cg1[l]);
+            acc_u[j][l] += (dwu0[l] * dx) * static_cast<float>(cu0[l]) +
+                           (dwu1[l] * dx) * static_cast<float>(cu1[l]);
+          }
+        } else {
+          int32x8_t cg = {0, 0, 0, 0, 0, 0, 0, 0};
+          int32x8_t cu = {0, 0, 0, 0, 0, 0, 0, 0};
+          cg = WmmaQuant<32>(ag0, b0, cg);
+          cg = WmmaQuant<32>(ag1, b1, cg);
+          cu = WmmaQuant<32>(au0, b0, cu);
+          cu = WmmaQuant<32>(au1, b1, cu);
+#pragma unroll
+          for (int l = 0; l < 8; ++l) {
+            acc_g[j][l] += (dwg0[l] * dx) * static_cast<float>(cg[l]);
+            acc_u[j][l] += (dwu0[l] * dx) * static_cast<float>(cu[l]);
+          }
         }
       }
       __builtin_amdgcn_sched_barrier(0);
@@ -935,23 +982,30 @@ __launch_bounds__(256, 2) __global__ void FlintMoeGroupedGateUpWmmaKernel(
   __syncthreads();
   float* sc_g = reinterpret_cast<float*>(&s_g[0][0][0]) + (wave_id * 256);
   float* sc_u = reinterpret_cast<float*>(&s_u[0][0][0]) + (wave_id * 256);
-#pragma unroll
-  for (int l = 0; l < 8; ++l) {
-    sc_g[(sub_lane * 16) + (2 * l) + half_id] = acc_g[l];
-    sc_u[(sub_lane * 16) + (2 * l) + half_id] = acc_u[l];
-  }
-  __builtin_amdgcn_wave_barrier();
   const std::size_t r0 = r_block + static_cast<std::size_t>(wave_id * 16);
 #pragma unroll
-  for (int s = 0; s < 8; ++s) {
-    const int flat = (s * 32) + lane_id;
-    const std::size_t out = (slot0 + static_cast<std::size_t>(flat >> 4)) *
-                                static_cast<std::size_t>(expert_ff) +
-                            r0 + static_cast<std::size_t>(flat & 15);
-    gate_out[out] = sc_g[flat];
-    up_out[out] = sc_u[flat];
+  for (int j = 0; j < G; ++j) {
+    if (j >= ntiles) {
+      continue;
+    }
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+      sc_g[(sub_lane * 16) + (2 * l) + half_id] = acc_g[j][l];
+      sc_u[(sub_lane * 16) + (2 * l) + half_id] = acc_u[j][l];
+    }
+    __builtin_amdgcn_wave_barrier();
+    const std::size_t sj = slot0 + static_cast<std::size_t>(j) * 16;
+#pragma unroll
+    for (int s = 0; s < 8; ++s) {
+      const int flat = (s * 32) + lane_id;
+      const std::size_t out = (sj + static_cast<std::size_t>(flat >> 4)) *
+                                  static_cast<std::size_t>(expert_ff) +
+                              r0 + static_cast<std::size_t>(flat & 15);
+      gate_out[out] = sc_g[flat];
+      up_out[out] = sc_u[flat];
+    }
+    __builtin_amdgcn_wave_barrier();
   }
-  __builtin_amdgcn_wave_barrier();
 }
 
 /// Grouped down projection over the expert stacks on WMMA int8 tensor cores:
@@ -971,6 +1025,7 @@ __launch_bounds__(256, 2) __global__ void FlintMoeGroupedDownWmmaKernel(
     std::size_t slab_bytes) {
   constexpr int BM = 128;
   constexpr int BK = 2;
+  constexpr int G = kFlintGroupTiles;
   constexpr int kRowTiles = BM / 16;
   constexpr bool PerHalfScale =
       WType == core::GgmlType::kQ6_K || WType == core::GgmlType::kQ3_K;
@@ -981,6 +1036,24 @@ __launch_bounds__(256, 2) __global__ void FlintMoeGroupedDownWmmaKernel(
     return;
   }
   const int e = tile_expert[t];
+  // Tiles are expert-sorted. A block claims a group of up to G consecutive
+  // tiles of one expert: the group leader is the tile whose offset within the
+  // expert's run is a multiple of G. One decoded weight block then feeds G
+  // activation tiles, cutting the per-expert weight re-read.
+  int run_start = t;
+  while (run_start > 0 && tile_expert[run_start - 1] == e) {
+    --run_start;
+  }
+  if (((t - run_start) % G) != 0) {
+    return;
+  }
+  int ntiles = 1;
+#pragma unroll
+  for (int j = 1; j < G; ++j) {
+    if (t + j < tile_count[0] && tile_expert[t + j] == e) {
+      ++ntiles;
+    }
+  }
   const std::size_t slot0 = static_cast<std::size_t>(tile_slot0[t]);
   const std::size_t r_block = static_cast<std::size_t>(blockIdx.y) * BM;
 
@@ -997,8 +1070,8 @@ __launch_bounds__(256, 2) __global__ void FlintMoeGroupedDownWmmaKernel(
 
   __shared__ int32x4_t s_a[BK][kRowTiles][32];
   __shared__ float s_dw[BK][kScaleHalves][kRowTiles][16];
-  __shared__ int32x4_t s_b[BK][1][32];
-  __shared__ float s_dx[BK][1][16];
+  __shared__ int32x4_t s_b[BK][G][32];
+  __shared__ float s_dx[BK][G][16];
 
   const int rr = tid / BK;
   const int kk = tid % BK;
@@ -1011,16 +1084,19 @@ __launch_bounds__(256, 2) __global__ void FlintMoeGroupedDownWmmaKernel(
       static_cast<const std::int8_t*>(act_q8) +
       ((slot0 >> 4) * num_blocks * kQ8ActTileBytes);
 
-  float acc[8];
+  float acc[G][8];
 #pragma unroll
-  for (int l = 0; l < 8; ++l) {
-    acc[l] = 0.0F;
+  for (int j = 0; j < G; ++j) {
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+      acc[j][l] = 0.0F;
+    }
   }
 
   int32x4_t r_q0, r_q1;
   float r_dw0, r_dw1;
-  int32x4_t r_b[BK];
-  float r_dx[BK];
+  int32x4_t r_b[G][BK];
+  float r_dx[G][BK];
 
   const auto fetch_stage = [&](int kb0) {
     const int kb = kb0 + kk;
@@ -1034,11 +1110,18 @@ __launch_bounds__(256, 2) __global__ void FlintMoeGroupedDownWmmaKernel(
     if (wave_id == 0) {
 #pragma unroll
       for (int i = 0; i < BK; ++i) {
-        const std::int8_t* tile =
-            b_base + static_cast<std::size_t>(kb0 + i) * kQ8ActTileBytes;
-        r_b[i] = reinterpret_cast<const int32x4_t*>(tile)[lane_id];
-        r_dx[i] =
-            reinterpret_cast<const float*>(tile + kQ8ActScaleOffset)[lane_id & 15];
+#pragma unroll
+        for (int j = 0; j < G; ++j) {
+          if (j >= ntiles) {
+            continue;
+          }
+          const std::int8_t* tile =
+              b_base + ((static_cast<std::size_t>(j) * num_blocks) + kb0 + i) *
+                           kQ8ActTileBytes;
+          r_b[j][i] = reinterpret_cast<const int32x4_t*>(tile)[lane_id];
+          r_dx[j][i] = reinterpret_cast<const float*>(
+              tile + kQ8ActScaleOffset)[lane_id & 15];
+        }
       }
     }
   };
@@ -1053,9 +1136,15 @@ __launch_bounds__(256, 2) __global__ void FlintMoeGroupedDownWmmaKernel(
     if (wave_id == 0) {
 #pragma unroll
       for (int i = 0; i < BK; ++i) {
-        s_b[i][0][lane_id] = r_b[i];
-        if (lane_id < 16) {
-          s_dx[i][0][lane_id] = r_dx[i];
+#pragma unroll
+        for (int j = 0; j < G; ++j) {
+          if (j >= ntiles) {
+            continue;
+          }
+          s_b[i][j][lane_id] = r_b[j][i];
+          if (lane_id < 16) {
+            s_dx[i][j][lane_id] = r_dx[j][i];
+          }
         }
       }
     }
@@ -1089,26 +1178,32 @@ __launch_bounds__(256, 2) __global__ void FlintMoeGroupedDownWmmaKernel(
         dw1[0] = h_lo.x; dw1[1] = h_lo.y; dw1[2] = h_lo.z; dw1[3] = h_lo.w;
         dw1[4] = h_up.x; dw1[5] = h_up.y; dw1[6] = h_up.z; dw1[7] = h_up.w;
       }
-      const int32x4_t b0 = s_b[kb][0][sub_lane];
-      const int32x4_t b1 = s_b[kb][0][16 + sub_lane];
-      const float dx = s_dx[kb][0][sub_lane];
-      if constexpr (PerHalfScale) {
-        int32x8_t c0 = {0, 0, 0, 0, 0, 0, 0, 0};
-        int32x8_t c1 = {0, 0, 0, 0, 0, 0, 0, 0};
-        c0 = WmmaQuant<32>(a0, b0, c0);
-        c1 = WmmaQuant<32>(a1, b1, c1);
 #pragma unroll
-        for (int l = 0; l < 8; ++l) {
-          acc[l] += (dw0[l] * dx) * static_cast<float>(c0[l]) +
-                    (dw1[l] * dx) * static_cast<float>(c1[l]);
+      for (int j = 0; j < G; ++j) {
+        if (j >= ntiles) {
+          continue;
         }
-      } else {
-        int32x8_t c = {0, 0, 0, 0, 0, 0, 0, 0};
-        c = WmmaQuant<32>(a0, b0, c);
-        c = WmmaQuant<32>(a1, b1, c);
+        const int32x4_t b0 = s_b[kb][j][sub_lane];
+        const int32x4_t b1 = s_b[kb][j][16 + sub_lane];
+        const float dx = s_dx[kb][j][sub_lane];
+        if constexpr (PerHalfScale) {
+          int32x8_t c0 = {0, 0, 0, 0, 0, 0, 0, 0};
+          int32x8_t c1 = {0, 0, 0, 0, 0, 0, 0, 0};
+          c0 = WmmaQuant<32>(a0, b0, c0);
+          c1 = WmmaQuant<32>(a1, b1, c1);
 #pragma unroll
-        for (int l = 0; l < 8; ++l) {
-          acc[l] += (dw0[l] * dx) * static_cast<float>(c[l]);
+          for (int l = 0; l < 8; ++l) {
+            acc[j][l] += (dw0[l] * dx) * static_cast<float>(c0[l]) +
+                         (dw1[l] * dx) * static_cast<float>(c1[l]);
+          }
+        } else {
+          int32x8_t c = {0, 0, 0, 0, 0, 0, 0, 0};
+          c = WmmaQuant<32>(a0, b0, c);
+          c = WmmaQuant<32>(a1, b1, c);
+#pragma unroll
+          for (int l = 0; l < 8; ++l) {
+            acc[j][l] += (dw0[l] * dx) * static_cast<float>(c[l]);
+          }
         }
       }
       __builtin_amdgcn_sched_barrier(0);
@@ -1118,21 +1213,28 @@ __launch_bounds__(256, 2) __global__ void FlintMoeGroupedDownWmmaKernel(
 
   __syncthreads();
   float* scratch = reinterpret_cast<float*>(&s_a[0][0][0]) + (wave_id * 256);
-#pragma unroll
-  for (int l = 0; l < 8; ++l) {
-    scratch[(sub_lane * 16) + (2 * l) + half_id] = acc[l];
-  }
-  __builtin_amdgcn_wave_barrier();
   const std::size_t r0 = r_block + static_cast<std::size_t>(wave_id * 16);
 #pragma unroll
-  for (int s = 0; s < 8; ++s) {
-    const int flat = (s * 32) + lane_id;
-    const std::size_t slot = slot0 + static_cast<std::size_t>(flat >> 4);
-    down_out[slot * static_cast<std::size_t>(hidden) + r0 +
-             static_cast<std::size_t>(flat & 15)] =
-        slot_weights[slot] * scratch[flat];
+  for (int j = 0; j < G; ++j) {
+    if (j >= ntiles) {
+      continue;
+    }
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+      scratch[(sub_lane * 16) + (2 * l) + half_id] = acc[j][l];
+    }
+    __builtin_amdgcn_wave_barrier();
+    const std::size_t sj = slot0 + static_cast<std::size_t>(j) * 16;
+#pragma unroll
+    for (int s = 0; s < 8; ++s) {
+      const int flat = (s * 32) + lane_id;
+      const std::size_t slot = sj + static_cast<std::size_t>(flat >> 4);
+      down_out[slot * static_cast<std::size_t>(hidden) + r0 +
+               static_cast<std::size_t>(flat & 15)] =
+          slot_weights[slot] * scratch[flat];
+    }
+    __builtin_amdgcn_wave_barrier();
   }
-  __builtin_amdgcn_wave_barrier();
 }
 
 }  // namespace
