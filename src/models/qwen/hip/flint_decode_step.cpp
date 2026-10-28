@@ -161,11 +161,13 @@ void RunFlintLayer(const models::FlintModelWeights& weights,
     const char* v = std::getenv("GUFO_FLINT_ATTN_SPLITKV");
     return v != nullptr && v[0] == '1';
   }();
-  // Global layers only: windowed layers see a span of sliding_window (513),
-  // where split-KV is slower, so they keep the online-tile route.
+  // Both layer classes route here: the launcher picks the 64-key window chunk
+  // for windowed layers (span bounded by the 513 window) and the 256-key
+  // global chunk otherwise, so the windowed layers get the same block-split
+  // KV traffic reduction as the global ones.
   const bool use_splitkv =
       splitkv_flag && b.attn_splitkv_scratch != nullptr &&
-      !layer.attrs.windowed && b.max_context > 4096 &&
+      b.max_context > 4096 &&
       config.num_attention_heads == 8 * config.num_key_value_heads &&
       config.head_dim == 128;
   if (d_control != nullptr) {

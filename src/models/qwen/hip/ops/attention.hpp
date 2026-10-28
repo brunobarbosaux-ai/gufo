@@ -82,6 +82,12 @@ void LaunchAttention(const float* q, const float* k, const float* v,
 
 /// Keys per block in the split-KV decode path.
 inline constexpr std::uint32_t kFlintSplitKvChunk = 256;
+/// Keys per block for the windowed (sliding-window) split-KV path. The window
+/// bounds the span (513), so a 256-key chunk would leave only ~3 chunks per KV
+/// head — 12 blocks on a 40-CU iGPU. A 64-key chunk gives ~9 chunks per KV
+/// head (36 blocks) while keeping the 8-head GQA sharing, so the windowed
+/// layers get the same block-split KV traffic reduction as the global ones.
+inline constexpr std::uint32_t kFlintSplitKvWindowChunk = 64;
 /// Query heads per KV head that the split-KV path shares within one block.
 inline constexpr std::uint32_t kFlintSplitKvGroupSize = 8;
 
@@ -97,12 +103,14 @@ inline constexpr std::uint32_t kFlintSplitKvGroupSize = 8;
   return num_chunks * num_heads * (static_cast<std::size_t>(head_dim) + 2);
 }
 
-/// Split-KV, GQA-sharing decode attention for flint global layers. Each block
-/// owns one KV head and one 256-key chunk and serves all eight query heads of
-/// the group, so every K/V row is read once per group. Chunk partials go to
-/// `scratch` and are reduced in fixed chunk order (no atomics, deterministic).
-/// The sink joins chunk 0 only. Requires num_heads == 8 * num_kv_heads and
-/// head_dim == 128; prefers the f16 plane when both f16 planes are supplied.
+/// Split-KV, GQA-sharing decode attention for flint layers. Each block owns
+/// one KV head and one chunk (256 keys for global layers, 64 for windowed
+/// ones — the window bounds the span, so the smaller chunk keeps the grid
+/// populated) and serves all eight query heads of the group, so every K/V row
+/// is read once per group. Chunk partials go to `scratch` and are reduced in
+/// fixed chunk order (no atomics, deterministic). The sink joins chunk 0 only.
+/// Requires num_heads == 8 * num_kv_heads and head_dim == 128; prefers the f16
+/// plane when both f16 planes are supplied.
 /// Unless skip_kv_write is set and `k`/`v` are non-null, the current token's
 /// K/V are written to the cache first (WriteKVCachePtrKernel, same arguments
 /// as LaunchAttention); callers that pass no `k`/`v` never write.

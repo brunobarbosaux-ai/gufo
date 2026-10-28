@@ -569,7 +569,7 @@ __global__ void FlintDecodeOnlineAttentionPtrKernel(
 /// [2, head_dim + 2) the unnormalized output o relative to m. The sink joins
 /// chunk 0 only (m = sink, l = 1), so it counts once in the combine. A chunk
 /// that starts past seq_len writes the neutral record (m = -inf, l = 0, o = 0).
-template <typename KVT = float>
+template <typename KVT = float, std::uint32_t kChunk = kFlintSplitKvChunk>
 __global__ void __launch_bounds__(256) FlintDecodeSplitKvGqaKernel(
     const float* __restrict__ q, const KVT* __restrict__ k_cache,
     const KVT* __restrict__ v_cache, float* __restrict__ scratch,
@@ -606,7 +606,7 @@ __global__ void __launch_bounds__(256) FlintDecodeSplitKvGqaKernel(
   float* record = scratch + ((static_cast<std::size_t>(chunk) * num_heads) + h) *
                                 kRecord;
   const std::size_t chunk_begin =
-      p_begin + static_cast<std::size_t>(chunk) * kFlintSplitKvChunk;
+      p_begin + static_cast<std::size_t>(chunk) * kChunk;
   if (chunk_begin >= seq_len) {
     if (lane == 0) {
       record[0] = -INFINITY;
@@ -619,7 +619,7 @@ __global__ void __launch_bounds__(256) FlintDecodeSplitKvGqaKernel(
     return;
   }
   const std::size_t chunk_end =
-      std::min(chunk_begin + kFlintSplitKvChunk, seq_len);
+      std::min(chunk_begin + kChunk, seq_len);
 
   const bool has_sink = policy.sinks != nullptr;
   const float sink = has_sink ? policy.sinks[h] : 0.0F;
@@ -785,8 +785,17 @@ bool LaunchFlintDecodeSplitKvAttention(
   }
   const detail::FlintKernelPolicy kernel_policy =
       policy != nullptr ? *policy : detail::FlintKernelPolicy{};
+  // Windowed layers see a span bounded by the sliding window (513), so a
+  // 256-key chunk leaves only ~3 chunks per KV head (12 blocks on 40 CUs).
+  // Use the smaller window chunk there to keep the grid populated; the
+  // global layers keep the 256-key chunk (their span grows to max_context).
+  const bool windowed = kernel_policy.window != 0;
+  const std::uint32_t chunk_size =
+      windowed ? kFlintSplitKvWindowChunk : kFlintSplitKvChunk;
+  const std::uint32_t span_bound =
+      windowed ? std::min(kernel_policy.window, max_context) : max_context;
   const std::uint32_t num_chunks =
-      (max_context + kFlintSplitKvChunk - 1) / kFlintSplitKvChunk;
+      (span_bound + chunk_size - 1) / chunk_size;
   const std::size_t base = layer_base;
   const std::uint32_t rows = policy != nullptr ? policy->kv_rows : 0U;
   if (!skip_kv_write && k != nullptr && v != nullptr) {
@@ -797,15 +806,31 @@ bool LaunchFlintDecodeSplitKvAttention(
   }
   const dim3 grid(num_kv_heads, num_chunks);
   if (use_f16) {
-    FlintDecodeSplitKvGqaKernel<__half><<<grid, 256, 0, stream>>>(
-        q, static_cast<const __half*>(k_cache_f16),
-        static_cast<const __half*>(v_cache_f16), scratch, layer_idx,
-        layer_base, d_pos, max_context, num_heads, num_kv_heads, head_dim,
-        kernel_policy);
+    const auto* k16 = static_cast<const __half*>(k_cache_f16);
+    const auto* v16 = static_cast<const __half*>(v_cache_f16);
+    if (windowed) {
+      FlintDecodeSplitKvGqaKernel<__half, kFlintSplitKvWindowChunk>
+          <<<grid, 256, 0, stream>>>(q, k16, v16, scratch, layer_idx,
+                                     layer_base, d_pos, max_context, num_heads,
+                                     num_kv_heads, head_dim, kernel_policy);
+    } else {
+      FlintDecodeSplitKvGqaKernel<__half, kFlintSplitKvChunk>
+          <<<grid, 256, 0, stream>>>(q, k16, v16, scratch, layer_idx,
+                                     layer_base, d_pos, max_context, num_heads,
+                                     num_kv_heads, head_dim, kernel_policy);
+    }
   } else {
-    FlintDecodeSplitKvGqaKernel<float><<<grid, 256, 0, stream>>>(
-        q, k_cache, v_cache, scratch, layer_idx, layer_base, d_pos,
-        max_context, num_heads, num_kv_heads, head_dim, kernel_policy);
+    if (windowed) {
+      FlintDecodeSplitKvGqaKernel<float, kFlintSplitKvWindowChunk>
+          <<<grid, 256, 0, stream>>>(q, k_cache, v_cache, scratch, layer_idx,
+                                     layer_base, d_pos, max_context, num_heads,
+                                     num_kv_heads, head_dim, kernel_policy);
+    } else {
+      FlintDecodeSplitKvGqaKernel<float, kFlintSplitKvChunk>
+          <<<grid, 256, 0, stream>>>(q, k_cache, v_cache, scratch, layer_idx,
+                                     layer_base, d_pos, max_context, num_heads,
+                                     num_kv_heads, head_dim, kernel_policy);
+    }
   }
   FlintDecodeSplitKvCombine<<<num_heads, 128, 0, stream>>>(
       scratch, out_context, num_heads, num_chunks, head_dim);
