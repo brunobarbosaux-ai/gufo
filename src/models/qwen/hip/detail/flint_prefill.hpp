@@ -18,7 +18,7 @@ namespace gufo::hip {
 /// what makes the grouped expert kernels worth their launch: at 512 tokens a
 /// bucket holds about twelve rows, so a decoded weight block feeds twelve
 /// tokens instead of one.
-inline constexpr std::size_t kFlintPrefillBatchCapacity = 1024;
+inline constexpr std::size_t kFlintPrefillBatchCapacity = 2048;
 
 /// Upper bound on the slot tables for a chunk of `tokens`: the compact slot
 /// count plus the 16-row bucket padding the grouped WMMA route requires (at
