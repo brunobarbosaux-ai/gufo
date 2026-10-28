@@ -572,18 +572,19 @@ void LaunchAttention(const float* q, const float* k, const float* v,
                 head_dim
           : layer_base;
   const std::uint32_t rows = policy != nullptr ? policy->kv_rows : 0U;
-  // 7.4a (GUFO_FLINT_ATTN_WINDOW_ONLINE=1): route the windowed layers to the
-  // online-tile kernel. The fixed-LDS ladder costs 0.46 ms per windowed layer
-  // per token, flat in depth (7.1 attribution: 16.81 ms/token, 49% of a
-  // 512-token step) because its score loop walks one key at a time with a
-  // full 256-thread tree reduction per key. The online-tile kernel carries the
-  // same window policy, the same fixed grid and fixed LDS, so nothing about
-  // graph capture changes; only the softmax accumulation order does (tile-wise
-  // online vs per-key tree), which is why this stays opt-in until the gates
-  // pass.
+  // 7.4a (GUFO_FLINT_ATTN_WINDOW_ONLINE, default ON): route the windowed
+  // layers to the online-tile kernel. The fixed-LDS ladder costs 0.46 ms per
+  // windowed layer per token, flat in depth (7.1 attribution: 16.81 ms/token,
+  // 49% of a 512-token step) because its score loop walks one key at a time
+  // with a full 256-thread tree reduction per key. The online-tile kernel
+  // carries the same window policy, the same fixed grid and fixed LDS, so
+  // nothing about graph capture changes; only the softmax accumulation order
+  // does (tile-wise online vs per-key tree). UT/G3/GX/G4/G8 all pass with the
+  // route on, so it is the default; set GUFO_FLINT_ATTN_WINDOW_ONLINE=0 to
+  // fall back to the fixed-LDS ladder.
   static const bool window_online = [] {
     const char* value = std::getenv("GUFO_FLINT_ATTN_WINDOW_ONLINE");
-    return value != nullptr && value[0] == '1';
+    return value == nullptr || value[0] != '0';
   }();
   if (!skip_kv_write) {
     WriteKVCachePtrKernel<<<num_kv_heads, 256, 0, stream>>>(
