@@ -190,6 +190,49 @@ constexpr int kMoERowsPerBlock = kMoEWavesPerBlock * 2;  // 2 rows per warp
 __device__ constexpr std::int8_t kIq4NlDeviceLut[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 
+// Q6_K lane decode (7.4b): lane `lane` owns elements {lane, lane+32, lane+64,
+// lane+96} of each 128-half of one 256-wide block, so a warp covers the whole
+// block with each lane reading exactly 6 bytes (4 ql + 2 qh) instead of the
+// generic sub16 route's 32 bytes per 16 elements. The per-16-element int8
+// scales are applied directly (four per lane per half). `xb` points at the
+// block's 256 x values; the block's fp16 `d` is applied by the caller so it
+// can be shared across the gate/up pair. Mirrors ggml's dequantize_row_q6_K
+// element order exactly.
+__device__ inline float Q6KBlockDotLane(const Q6KBlock& blk,
+                                        const float* __restrict__ xb,
+                                        std::size_t lane) noexcept {
+  const std::size_t is = lane / 16;
+  float acc = 0.0F;
+#pragma unroll
+  for (int h = 0; h < 2; ++h) {
+    const std::uint8_t* ql = blk.ql + (h * 64);
+    const std::uint8_t* qh = blk.qh + (h * 32);
+    const std::int8_t* sc = blk.scales + (h * 8);
+    const float* xh = xb + (h * 128);
+    const std::uint8_t qhb = qh[lane];
+    const int q1 = static_cast<int>((ql[lane] & 0x0FU) |
+                                    (((qhb >> 0U) & 3U) << 4U)) -
+                   32;
+    const int q2 = static_cast<int>((ql[lane + 32] & 0x0FU) |
+                                    (((qhb >> 2U) & 3U) << 4U)) -
+                   32;
+    const int q3 = static_cast<int>((ql[lane] >> 4U) |
+                                    (((qhb >> 4U) & 3U) << 4U)) -
+                   32;
+    const int q4 = static_cast<int>((ql[lane + 32] >> 4U) |
+                                    (((qhb >> 6U) & 3U) << 4U)) -
+                   32;
+    acc += static_cast<float>(sc[is + 0]) * static_cast<float>(q1) * xh[lane];
+    acc +=
+        static_cast<float>(sc[is + 2]) * static_cast<float>(q2) * xh[lane + 32];
+    acc +=
+        static_cast<float>(sc[is + 4]) * static_cast<float>(q3) * xh[lane + 64];
+    acc +=
+        static_cast<float>(sc[is + 6]) * static_cast<float>(q4) * xh[lane + 96];
+  }
+  return acc;
+}
+
 __global__ void __launch_bounds__(kMoEWavesPerBlock * 32, 4)
     FlintFusedMoESwiGLUKernel(
         const void* __restrict__ gate_stack, const void* __restrict__ up_stack,
@@ -385,6 +428,45 @@ __global__ void __launch_bounds__(kMoEWavesPerBlock * 32, 4)
         }
         sum_g1 += gscale1 * acc_g1;
         sum_u1 += uscale1 * acc_u1;
+      }
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+      sum_g0 += __shfl_xor(sum_g0, off);
+      sum_u0 += __shfl_xor(sum_u0, off);
+      sum_g1 += __shfl_xor(sum_g1, off);
+      sum_u1 += __shfl_xor(sum_u1, off);
+    }
+    if (lane == 0) {
+      act_e[r0] = (sum_g0 / (1.0F + expf(-sum_g0))) * sum_u0;
+      if (has_r1) {
+        act_e[r0 + 1] = (sum_g1 / (1.0F + expf(-sum_g1))) * sum_u1;
+      }
+    }
+    return;
+  }
+
+  if (gt == core::GgmlType::kQ6_K && ut == core::GgmlType::kQ6_K &&
+      hidden % kQ6KBlockSize == 0) {
+    // Q6_K 2-row loop (7.4b): one warp covers a whole 256-wide block per
+    // pass, each lane owning 8 elements, so the block's ql/qh bytes are read
+    // once instead of the generic sub16 route's ~2.4x amplification. x is
+    // loaded once and shared by both rows and both matrices; one butterfly
+    // per row-matrix at the end.
+    const std::size_t blocks = hidden / kQ6KBlockSize;
+    const auto* g_blocks = static_cast<const Q6KBlock*>(gate);
+    const auto* u_blocks = static_cast<const Q6KBlock*>(up);
+    float sum_g0 = 0.0F, sum_u0 = 0.0F, sum_g1 = 0.0F, sum_u1 = 0.0F;
+    for (std::size_t b = 0; b < blocks; ++b) {
+      const float* xb = x + (b * kQ6KBlockSize);
+      const Q6KBlock& gb0 = g_blocks[(r0 * blocks) + b];
+      const Q6KBlock& ub0 = u_blocks[(r0 * blocks) + b];
+      sum_g0 += __half2float(gb0.d) * Q6KBlockDotLane(gb0, xb, lane);
+      sum_u0 += __half2float(ub0.d) * Q6KBlockDotLane(ub0, xb, lane);
+      if (has_r1) {
+        const Q6KBlock& gb1 = g_blocks[((r0 + 1) * blocks) + b];
+        const Q6KBlock& ub1 = u_blocks[((r0 + 1) * blocks) + b];
+        sum_g1 += __half2float(gb1.d) * Q6KBlockDotLane(gb1, xb, lane);
+        sum_u1 += __half2float(ub1.d) * Q6KBlockDotLane(ub1, xb, lane);
       }
     }
     for (int off = 16; off > 0; off >>= 1) {
