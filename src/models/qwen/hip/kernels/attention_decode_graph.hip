@@ -2,6 +2,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -555,6 +556,251 @@ __global__ void FlintDecodeOnlineAttentionPtrKernel(
   if (tid < head_dim) {
     out_context[static_cast<std::size_t>(h) * head_dim + tid] = o / s_l;
   }
+}
+
+/// Split-KV GQA-sharing partial for flint global-layer decode (see
+/// LaunchFlintDecodeSplitKvAttention). Block (kv_h, chunk) covers one KV head
+/// and one kChunk-key slice, and serves all eight query heads of the group:
+/// thread (hg, lane) owns query head hg of the group and dims lane + 32k, so
+/// every K/V row is staged in LDS once per block instead of once per head.
+///
+/// Scratch layout (fp32): record r = chunk * num_heads + h, each record is
+/// (head_dim + 2) floats: [0] running max m, [1] denominator l, then
+/// [2, head_dim + 2) the unnormalized output o relative to m. The sink joins
+/// chunk 0 only (m = sink, l = 1), so it counts once in the combine. A chunk
+/// that starts past seq_len writes the neutral record (m = -inf, l = 0, o = 0).
+template <typename KVT = float>
+__global__ void __launch_bounds__(256) FlintDecodeSplitKvGqaKernel(
+    const float* __restrict__ q, const KVT* __restrict__ k_cache,
+    const KVT* __restrict__ v_cache, float* __restrict__ scratch,
+    std::uint32_t layer_idx, std::size_t layer_base,
+    const std::uint32_t* __restrict__ d_pos, std::uint32_t max_context,
+    std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t head_dim,
+    detail::FlintKernelPolicy policy) {
+  constexpr std::uint32_t kDim = 128;             // head_dim (launcher-checked)
+  constexpr std::uint32_t kGroup = 8;             // query heads per KV head
+  constexpr std::uint32_t kLanes = 32;            // lanes per query head
+  constexpr std::uint32_t kPerLane = kDim / kLanes;
+  constexpr std::uint32_t kTile = 32;             // keys per LDS sub-tile
+  constexpr std::uint32_t kThreads = kGroup * kLanes;
+
+  const std::uint32_t kv_h = blockIdx.x;
+  const std::uint32_t chunk = blockIdx.y;
+  const std::uint32_t tid = threadIdx.x;
+  const std::uint32_t hg = tid / kLanes;
+  const std::uint32_t lane = tid % kLanes;
+  const std::uint32_t h = kv_h * kGroup + hg;
+
+  const std::uint32_t pos = *d_pos;
+  const std::size_t seq_len = static_cast<std::size_t>(pos) + 1;
+  const std::size_t p_begin =
+      (policy.window != 0 && seq_len > policy.window)
+          ? seq_len - policy.window
+          : 0;
+  if (blockIdx.x == 0 && blockIdx.y == 0 && tid == 0) {
+    detail::FlintKeyCountAdd(layer_idx,
+                             static_cast<std::uint32_t>(seq_len - p_begin));
+  }
+
+  constexpr std::size_t kRecord = kDim + 2;
+  float* record = scratch + ((static_cast<std::size_t>(chunk) * num_heads) + h) *
+                                kRecord;
+  const std::size_t chunk_begin =
+      p_begin + static_cast<std::size_t>(chunk) * kFlintSplitKvChunk;
+  if (chunk_begin >= seq_len) {
+    if (lane == 0) {
+      record[0] = -INFINITY;
+      record[1] = 0.0F;
+    }
+#pragma unroll
+    for (std::uint32_t k = 0; k < kPerLane; ++k) {
+      record[2 + lane + (kLanes * k)] = 0.0F;
+    }
+    return;
+  }
+  const std::size_t chunk_end =
+      std::min(chunk_begin + kFlintSplitKvChunk, seq_len);
+
+  const bool has_sink = policy.sinks != nullptr;
+  const float sink = has_sink ? policy.sinks[h] : 0.0F;
+  const bool owns_sink = has_sink && chunk == 0;
+  const float scale = 1.0F / sqrtf(static_cast<float>(head_dim));
+
+  __shared__ float s_k[kTile * kDim];
+  __shared__ float s_v[kTile * kDim];
+  __shared__ float s_score[kGroup][kTile];
+  __shared__ float s_w[kGroup][kTile];
+  __shared__ float s_m[kGroup];
+  __shared__ float s_l[kGroup];
+  __shared__ float s_alpha[kGroup];
+
+  const float* q_h = q + (static_cast<std::size_t>(h) * kDim);
+  float q_reg[kPerLane];
+  float o_reg[kPerLane] = {};
+#pragma unroll
+  for (std::uint32_t k = 0; k < kPerLane; ++k) {
+    q_reg[k] = q_h[lane + (kLanes * k)];
+  }
+  if (lane == 0) {
+    s_m[hg] = owns_sink ? sink : -INFINITY;
+    s_l[hg] = owns_sink ? 1.0F : 0.0F;
+  }
+
+  for (std::size_t t = chunk_begin; t < chunk_end; t += kTile) {
+    const std::size_t n = std::min<std::size_t>(kTile, chunk_end - t);
+
+    // S1: stage the K and V sub-tiles once for all eight query heads.
+    for (std::size_t i = tid; i < n * kDim; i += kThreads) {
+      const std::size_t j = i / kDim;
+      const std::size_t d = i % kDim;
+      const std::size_t offset =
+          FlintKvOffset<KVT>(layer_base, kv_h, t + j, policy.kv_rows,
+                             max_context, num_kv_heads, head_dim) +
+          d;
+      s_k[i] = FlintKvLoad(k_cache + offset);
+      s_v[i] = FlintKvLoad(v_cache + offset);
+    }
+    __syncthreads();
+
+    // Scores: each 32-lane group reduces its head's dot products with xor
+    // shuffles (offsets < 32 stay inside the lane group on wave32 and wave64).
+    for (std::size_t j = 0; j < n; ++j) {
+      float dot = 0.0F;
+#pragma unroll
+      for (std::uint32_t k = 0; k < kPerLane; ++k) {
+        dot += q_reg[k] * s_k[(j * kDim) + lane + (kLanes * k)];
+      }
+#pragma unroll
+      for (int offset = 16; offset > 0; offset >>= 1) {
+        dot += __shfl_xor(dot, offset);
+      }
+      if (lane == 0) {
+        s_score[hg][j] = dot * scale;
+      }
+    }
+    __syncthreads();
+
+    // S3 prep: lane 0 of each group runs the online-softmax update for its
+    // head. Its (m, l) and the tile's rescale are shared through LDS.
+    if (lane == 0) {
+      float tile_max = -INFINITY;
+      for (std::size_t j = 0; j < n; ++j) {
+        tile_max = fmaxf(tile_max, s_score[hg][j]);
+      }
+      const float m_old = s_m[hg];
+      const float m_new = fmaxf(m_old, tile_max);
+      const float alpha = expf(m_old - m_new);
+      float tile_sum = 0.0F;
+      for (std::size_t j = 0; j < n; ++j) {
+        const float p = expf(s_score[hg][j] - m_new);
+        s_w[hg][j] = p;
+        tile_sum += p;
+      }
+      s_alpha[hg] = alpha;
+      s_m[hg] = m_new;
+      s_l[hg] = (s_l[hg] * alpha) + tile_sum;
+    }
+    __syncthreads();
+
+    // O accumulation: rescale, then add this tile's weighted V rows from LDS.
+    const float alpha = s_alpha[hg];
+#pragma unroll
+    for (std::uint32_t k = 0; k < kPerLane; ++k) {
+      o_reg[k] *= alpha;
+    }
+    for (std::size_t j = 0; j < n; ++j) {
+      const float w = s_w[hg][j];
+#pragma unroll
+      for (std::uint32_t k = 0; k < kPerLane; ++k) {
+        o_reg[k] += w * s_v[(j * kDim) + lane + (kLanes * k)];
+      }
+    }
+    // S4: the next tile overwrites s_k / s_v.
+    __syncthreads();
+  }
+
+#pragma unroll
+  for (std::uint32_t k = 0; k < kPerLane; ++k) {
+    record[2 + lane + (kLanes * k)] = o_reg[k];
+  }
+  if (lane == 0) {
+    record[0] = s_m[hg];
+    record[1] = s_l[hg];
+  }
+}
+
+/// Fixed-order LSE combine of the split-KV partials (no atomics). One block
+/// per query head, one thread per output dim; chunks are folded in index
+/// order. Neutral records (l == 0) are skipped.
+__launch_bounds__(128) __global__ void FlintDecodeSplitKvCombine(
+    const float* __restrict__ scratch, float* __restrict__ out_context,
+    std::uint32_t num_heads, std::uint32_t num_chunks,
+    std::uint32_t head_dim) {
+  const std::uint32_t h = blockIdx.x;
+  const std::uint32_t d = threadIdx.x;
+  if (h >= num_heads || d >= head_dim) {
+    return;
+  }
+  const std::size_t record_size = static_cast<std::size_t>(head_dim) + 2;
+  float running_max = -INFINITY;
+  float running_sum = 0.0F;
+  float running_out = 0.0F;
+  for (std::uint32_t c = 0; c < num_chunks; ++c) {
+    const float* record =
+        scratch + ((static_cast<std::size_t>(c) * num_heads) + h) * record_size;
+    const float chunk_max = record[0];
+    const float chunk_sum = record[1];
+    if (chunk_sum <= 0.0F) {
+      continue;
+    }
+    const float new_max = fmaxf(running_max, chunk_max);
+    const float previous_scale = expf(running_max - new_max);
+    const float chunk_scale = expf(chunk_max - new_max);
+    running_sum = (running_sum * previous_scale) + (chunk_sum * chunk_scale);
+    running_out = (running_out * previous_scale) +
+                  (record[2 + d] * chunk_scale);
+    running_max = new_max;
+  }
+  out_context[(static_cast<std::size_t>(h) * head_dim) + d] =
+      running_sum > 0.0F ? running_out / running_sum : 0.0F;
+}
+
+bool LaunchFlintDecodeSplitKvAttention(
+    const float* q, float* k_cache, float* v_cache, void* k_cache_f16,
+    void* v_cache_f16, float* out_context, std::uint32_t layer_idx,
+    std::size_t layer_base, const std::uint32_t* d_pos,
+    std::uint32_t max_context, std::uint32_t num_heads,
+    std::uint32_t num_kv_heads, std::uint32_t head_dim, float* scratch,
+    hipStream_t stream, const detail::FlintKernelPolicy* policy) {
+  if (q == nullptr || out_context == nullptr || d_pos == nullptr ||
+      scratch == nullptr || max_context == 0 || num_kv_heads == 0 ||
+      num_heads != kFlintSplitKvGroupSize * num_kv_heads || head_dim != 128) {
+    return false;
+  }
+  const bool use_f16 = k_cache_f16 != nullptr && v_cache_f16 != nullptr;
+  const bool use_f32 = !use_f16 && k_cache != nullptr && v_cache != nullptr;
+  if (!use_f16 && !use_f32) {
+    return false;
+  }
+  const detail::FlintKernelPolicy kernel_policy =
+      policy != nullptr ? *policy : detail::FlintKernelPolicy{};
+  const std::uint32_t num_chunks =
+      (max_context + kFlintSplitKvChunk - 1) / kFlintSplitKvChunk;
+  const dim3 grid(num_kv_heads, num_chunks);
+  if (use_f16) {
+    FlintDecodeSplitKvGqaKernel<__half><<<grid, 256, 0, stream>>>(
+        q, static_cast<const __half*>(k_cache_f16),
+        static_cast<const __half*>(v_cache_f16), scratch, layer_idx,
+        layer_base, d_pos, max_context, num_heads, num_kv_heads, head_dim,
+        kernel_policy);
+  } else {
+    FlintDecodeSplitKvGqaKernel<float><<<grid, 256, 0, stream>>>(
+        q, k_cache, v_cache, scratch, layer_idx, layer_base, d_pos,
+        max_context, num_heads, num_kv_heads, head_dim, kernel_policy);
+  }
+  FlintDecodeSplitKvCombine<<<num_heads, 128, 0, stream>>>(
+      scratch, out_context, num_heads, num_chunks, head_dim);
+  return hipGetLastError() == hipSuccess;
 }
 
 void LaunchAttention(const float* q, const float* k, const float* v,

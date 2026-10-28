@@ -441,6 +441,225 @@ void TestBatchedPrefillSinksWindow() {
   std::cout << "  batched prefill sinks/window ok\n";
 }
 
+// Split-KV GQA-sharing decode (LaunchFlintDecodeSplitKvAttention) at the flint
+// geometry (32 query / 4 KV heads, head_dim 128) over long spans. One layer:
+// the fp32 cache is head-major and the f16 twin token-major, as FlintKvOffset
+// lays them out with layer_base 0 and rows 0.
+constexpr std::uint32_t kSplitHeads = 32;
+constexpr std::uint32_t kSplitKvHeads = 4;
+constexpr std::uint32_t kSplitHeadDim = 128;
+constexpr std::uint32_t kSplitMaxContext = 32768;
+
+std::vector<float> MakeSplitQ() {
+  std::vector<float> q(kSplitHeads * kSplitHeadDim);
+  for (std::size_t i = 0; i < q.size(); ++i) {
+    q[i] = 0.6F * std::sin(static_cast<float>(i % 197) * 0.11F) -
+           0.2F * std::cos(static_cast<float>(i % 89) * 0.07F);
+  }
+  return q;
+}
+
+// Head-major fp32 image [kv][p][d]. Pseudo-random phases keep scores varied
+// across all positions so the softmax weights are not near-uniform.
+std::vector<float> MakeSplitKv(std::uint32_t which) {
+  std::vector<float> image(static_cast<std::size_t>(kSplitKvHeads) *
+                           kSplitMaxContext * kSplitHeadDim);
+  for (std::uint32_t kvh = 0; kvh < kSplitKvHeads; ++kvh) {
+    for (std::uint32_t p = 0; p < kSplitMaxContext; ++p) {
+      for (std::uint32_t d = 0; d < kSplitHeadDim; ++d) {
+        const std::uint32_t mixed =
+            p * 2654435761U + d * 40503U + kvh * 97U + which * 1013U;
+        const float phase = static_cast<float>(mixed % 1024U) / 1024.0F;
+        image[((static_cast<std::size_t>(kvh) * kSplitMaxContext) + p) *
+                  kSplitHeadDim +
+              d] = 3.0F * std::sin(6.2831853F * phase);
+      }
+    }
+  }
+  return image;
+}
+
+std::vector<float> RoundedCopy(const std::vector<float>& image) {
+  std::vector<float> out(image.size());
+  for (std::size_t i = 0; i < image.size(); ++i) {
+    out[i] = HalfRound(image[i]);
+  }
+  return out;
+}
+
+// CPU reference over the head-major image; `k_src`/`v_src` are either the raw
+// image or its f16-rounded copy.
+void SplitReference(const std::vector<float>& q, const std::vector<float>& k_src,
+                    const std::vector<float>& v_src, const float* sinks,
+                    std::uint32_t window, std::uint32_t pos,
+                    std::vector<float>& out) {
+  out.assign(q.size(), 0.0F);
+  const std::size_t seq = static_cast<std::size_t>(pos) + 1;
+  const std::size_t begin = (window != 0 && seq > window) ? seq - window : 0;
+  const float scale = 1.0F / std::sqrt(static_cast<float>(kSplitHeadDim));
+  const std::size_t group = kSplitHeads / kSplitKvHeads;
+  for (std::uint32_t h = 0; h < kSplitHeads; ++h) {
+    const std::uint32_t kvh = h / group;
+    const float* k_base =
+        k_src.data() +
+        static_cast<std::size_t>(kvh) * kSplitMaxContext * kSplitHeadDim;
+    const float* v_base =
+        v_src.data() +
+        static_cast<std::size_t>(kvh) * kSplitMaxContext * kSplitHeadDim;
+    const float* q_h = q.data() + static_cast<std::size_t>(h) * kSplitHeadDim;
+    std::vector<float> scores(seq - begin);
+    float max_score = sinks != nullptr ? sinks[h]
+                                       : -std::numeric_limits<float>::infinity();
+    for (std::size_t p = begin; p < seq; ++p) {
+      const float* k_p = k_base + p * kSplitHeadDim;
+      float dot = 0.0F;
+      for (std::uint32_t d = 0; d < kSplitHeadDim; ++d) {
+        dot += q_h[d] * k_p[d];
+      }
+      scores[p - begin] = dot * scale;
+      max_score = std::max(max_score, scores[p - begin]);
+    }
+    float sum = 0.0F;
+    for (float& s : scores) {
+      s = std::exp(s - max_score);
+      sum += s;
+    }
+    if (sinks != nullptr) {
+      sum += std::exp(sinks[h] - max_score);
+    }
+    float* out_h = out.data() + static_cast<std::size_t>(h) * kSplitHeadDim;
+    for (std::size_t p = begin; p < seq; ++p) {
+      const float w = scores[p - begin] / sum;
+      const float* v_p = v_base + p * kSplitHeadDim;
+      for (std::uint32_t d = 0; d < kSplitHeadDim; ++d) {
+        out_h[d] += w * v_p[d];
+      }
+    }
+  }
+}
+
+void TestSplitKvDecode() {
+  const auto q = MakeSplitQ();
+  const auto k_img = MakeSplitKv(0);
+  const auto v_img = MakeSplitKv(1);
+  const auto k_img16 = RoundedCopy(k_img);
+  const auto v_img16 = RoundedCopy(v_img);
+  std::vector<float> sinks(kSplitHeads);
+  for (std::uint32_t h = 0; h < kSplitHeads; ++h) {
+    sinks[h] = -0.15F + 0.3F * static_cast<float>(h);
+  }
+
+  // f16 twin: token-major ((p * kv_heads + kvh) * head_dim + d).
+  const std::size_t elems = k_img.size();
+  std::vector<__half> k16(elems), v16(elems);
+  for (std::uint32_t kvh = 0; kvh < kSplitKvHeads; ++kvh) {
+    for (std::uint32_t p = 0; p < kSplitMaxContext; ++p) {
+      for (std::uint32_t d = 0; d < kSplitHeadDim; ++d) {
+        const std::size_t src =
+            ((static_cast<std::size_t>(kvh) * kSplitMaxContext) + p) *
+                kSplitHeadDim +
+            d;
+        const std::size_t dst =
+            ((static_cast<std::size_t>(p) * kSplitKvHeads) + kvh) *
+                kSplitHeadDim +
+            d;
+        k16[dst] = __float2half(k_img[src]);
+        v16[dst] = __float2half(v_img[src]);
+      }
+    }
+  }
+
+  float* d_q = nullptr;
+  float* d_out = nullptr;
+  float* d_sinks = nullptr;
+  float* d_scratch = nullptr;
+  float* d_k32 = nullptr;
+  float* d_v32 = nullptr;
+  __half* d_k16 = nullptr;
+  __half* d_v16 = nullptr;
+  std::uint32_t* d_pos = nullptr;
+  const std::size_t scratch_elems = gufo::hip::FlintDecodeSplitKvScratchElements(
+      kSplitMaxContext, kSplitHeads, kSplitHeadDim);
+  HIP_CHECK(hipMalloc(&d_q, q.size() * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_out, q.size() * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_sinks, kSplitHeads * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_scratch, scratch_elems * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_k32, elems * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_v32, elems * sizeof(float)));
+  HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&d_k16), elems * sizeof(__half)));
+  HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&d_v16), elems * sizeof(__half)));
+  HIP_CHECK(hipMalloc(&d_pos, sizeof(std::uint32_t)));
+  HIP_CHECK(hipMemcpy(d_q, q.data(), q.size() * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_sinks, sinks.data(), kSplitHeads * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_k32, k_img.data(), elems * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_v32, v_img.data(), elems * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_k16, k16.data(), elems * sizeof(__half),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_v16, v16.data(), elems * sizeof(__half),
+                      hipMemcpyHostToDevice));
+
+  constexpr std::uint32_t kSpans[] = {1, 7, 256, 257, 4096, 32768};
+  constexpr std::uint32_t kWindows[] = {0, kWindow};
+  std::vector<float> out(q.size());
+  std::vector<float> expected;
+  for (const std::uint32_t span : kSpans) {
+    const std::uint32_t pos = span - 1;
+    HIP_CHECK(hipMemcpy(d_pos, &pos, sizeof(pos), hipMemcpyHostToDevice));
+    for (const std::uint32_t window : kWindows) {
+      for (const bool use_sinks : {false, true}) {
+        const float* sink_data = use_sinks ? sinks.data() : nullptr;
+        FlintKernelPolicy policy{use_sinks ? d_sinks : nullptr, window, 0};
+        const std::string label = "split-kv span " + std::to_string(span) +
+                                  " window " + std::to_string(window) +
+                                  (use_sinks ? " sinks" : " no-sinks");
+
+        SplitReference(q, k_img, v_img, sink_data, window, pos, expected);
+        HIP_CHECK(hipMemset(d_out, 0, q.size() * sizeof(float)));
+        if (!gufo::hip::LaunchFlintDecodeSplitKvAttention(
+                d_q, d_k32, d_v32, nullptr, nullptr, d_out, 0, 0, d_pos,
+                kSplitMaxContext, kSplitHeads, kSplitKvHeads, kSplitHeadDim,
+                d_scratch, nullptr, &policy)) {
+          std::cerr << label << ": launch rejected\n";
+          std::exit(1);
+        }
+        HIP_CHECK(hipDeviceSynchronize());
+        HIP_CHECK(hipMemcpy(out.data(), d_out, q.size() * sizeof(float),
+                            hipMemcpyDeviceToHost));
+        CheckClose(expected, out, 1.0e-4F, label);
+
+        SplitReference(q, k_img16, v_img16, sink_data, window, pos, expected);
+        HIP_CHECK(hipMemset(d_out, 0, q.size() * sizeof(float)));
+        if (!gufo::hip::LaunchFlintDecodeSplitKvAttention(
+                d_q, nullptr, nullptr, d_k16, d_v16, d_out, 0, 0, d_pos,
+                kSplitMaxContext, kSplitHeads, kSplitKvHeads, kSplitHeadDim,
+                d_scratch, nullptr, &policy)) {
+          std::cerr << label << ": f16 launch rejected\n";
+          std::exit(1);
+        }
+        HIP_CHECK(hipDeviceSynchronize());
+        HIP_CHECK(hipMemcpy(out.data(), d_out, q.size() * sizeof(float),
+                            hipMemcpyDeviceToHost));
+        CheckClose(expected, out, 4.0e-2F, label + " [f16 cache]");
+      }
+    }
+  }
+
+  hipFree(d_q);
+  hipFree(d_out);
+  hipFree(d_sinks);
+  hipFree(d_scratch);
+  hipFree(d_k32);
+  hipFree(d_v32);
+  hipFree(d_k16);
+  hipFree(d_v16);
+  hipFree(d_pos);
+  std::cout << "  split-kv gqa decode cases ok\n";
+}
+
 }  // namespace
 #endif  // defined(ENGINE_ENABLE_HIP)
 
@@ -455,6 +674,7 @@ int main() {
   TestSinksAndWindow();
   TestCausalDecodeBatchWithPolicy();
   TestBatchedPrefillSinksWindow();
+  TestSplitKvDecode();
   std::cout << "Flint decode ops test passed on gfx1151.\n";
   return 0;
 #else

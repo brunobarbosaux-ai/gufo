@@ -80,6 +80,40 @@ void LaunchAttention(const float* q, const float* k, const float* v,
                      const detail::FlintKernelPolicy* policy = nullptr,
                      std::size_t layer_base = kUniformKvBase);
 
+/// Keys per block in the split-KV decode path.
+inline constexpr std::uint32_t kFlintSplitKvChunk = 256;
+/// Query heads per KV head that the split-KV path shares within one block.
+inline constexpr std::uint32_t kFlintSplitKvGroupSize = 8;
+
+/// Scratch elements for LaunchFlintDecodeSplitKvAttention: one partial record
+/// of (head_dim + 2) floats per (chunk, query head). The chunk count comes
+/// from max_context, not the live position, so the size is fixed for graphs.
+[[nodiscard]] constexpr std::size_t FlintDecodeSplitKvScratchElements(
+    std::uint32_t max_context, std::uint32_t num_heads,
+    std::uint32_t head_dim) noexcept {
+  const std::size_t num_chunks =
+      (static_cast<std::size_t>(max_context) + kFlintSplitKvChunk - 1) /
+      kFlintSplitKvChunk;
+  return num_chunks * num_heads * (static_cast<std::size_t>(head_dim) + 2);
+}
+
+/// Split-KV, GQA-sharing decode attention for flint global layers. Each block
+/// owns one KV head and one 256-key chunk and serves all eight query heads of
+/// the group, so every K/V row is read once per group. Chunk partials go to
+/// `scratch` and are reduced in fixed chunk order (no atomics, deterministic).
+/// The sink joins chunk 0 only. Requires num_heads == 8 * num_kv_heads and
+/// head_dim == 128; prefers the f16 plane when both f16 planes are supplied.
+/// Returns false on unsupported shape, missing cache, or launch failure. Not
+/// yet routed from LaunchAttention.
+[[nodiscard]] bool LaunchFlintDecodeSplitKvAttention(
+    const float* q, float* k_cache, float* v_cache, void* k_cache_f16,
+    void* v_cache_f16, float* out_context, std::uint32_t layer_idx,
+    std::size_t layer_base, const std::uint32_t* d_pos,
+    std::uint32_t max_context, std::uint32_t num_heads,
+    std::uint32_t num_kv_heads, std::uint32_t head_dim, float* scratch,
+    hipStream_t stream = nullptr,
+    const detail::FlintKernelPolicy* policy = nullptr);
+
 /// Fuses per-head Q/K RMSNorm, RoPE, and the KV-cache write for a single decode
 /// token into one launch (opt-c010-qk-rope-kv). Writes the normed+roped Q into
 /// q_out and the normed+roped K into k_out, and K/V into every non-null cache
