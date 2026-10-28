@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <type_traits>
 
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
@@ -571,6 +572,19 @@ void LaunchAttention(const float* q, const float* k, const float* v,
                 head_dim
           : layer_base;
   const std::uint32_t rows = policy != nullptr ? policy->kv_rows : 0U;
+  // 7.4a (GUFO_FLINT_ATTN_WINDOW_ONLINE=1): route the windowed layers to the
+  // online-tile kernel. The fixed-LDS ladder costs 0.46 ms per windowed layer
+  // per token, flat in depth (7.1 attribution: 16.81 ms/token, 49% of a
+  // 512-token step) because its score loop walks one key at a time with a
+  // full 256-thread tree reduction per key. The online-tile kernel carries the
+  // same window policy, the same fixed grid and fixed LDS, so nothing about
+  // graph capture changes; only the softmax accumulation order does (tile-wise
+  // online vs per-key tree), which is why this stays opt-in until the gates
+  // pass.
+  static const bool window_online = [] {
+    const char* value = std::getenv("GUFO_FLINT_ATTN_WINDOW_ONLINE");
+    return value != nullptr && value[0] == '1';
+  }();
   if (!skip_kv_write) {
     WriteKVCachePtrKernel<<<num_kv_heads, 256, 0, stream>>>(
         k, v, k_cache, v_cache, static_cast<__half*>(k_cache_f16),
@@ -597,6 +611,13 @@ void LaunchAttention(const float* q, const float* k, const float* v,
       // these).
       const auto* k16 = static_cast<const __half*>(k_cache_f16);
       const auto* v16 = static_cast<const __half*>(v_cache_f16);
+      if (window_online && span_needed <= 513) {
+        detail::EmitAttentionDispatch("decode_online_flint_window_f16", "");
+        FlintDecodeOnlineAttentionPtrKernel<__half><<<num_heads, 256, 0, stream>>>(
+            q, k16, v16, out_context, layer_idx, base, d_pos, max_context,
+            num_heads, num_kv_heads, head_dim, *policy);
+        return;
+      }
       if (span_needed <= 513) {
         detail::EmitAttentionDispatch("decode_baseline_flint_graph_f16", "");
         AttentionKernelGraph<513, __half><<<num_heads, 256, 0, stream>>>(
@@ -623,6 +644,13 @@ void LaunchAttention(const float* q, const float* k, const float* v,
       return;
     }
     if (k_cache != nullptr && v_cache != nullptr) {
+      if (window_online && span_needed <= 513) {
+        detail::EmitAttentionDispatch("decode_online_flint_window", "");
+        FlintDecodeOnlineAttentionPtrKernel<<<num_heads, 256, 0, stream>>>(
+            q, k_cache, v_cache, out_context, layer_idx, base, d_pos,
+            max_context, num_heads, num_kv_heads, head_dim, *policy);
+        return;
+      }
       if (span_needed <= 513) {
         detail::EmitAttentionDispatch("decode_baseline_flint_graph", "");
         AttentionKernelGraph<513><<<num_heads, 256, 0, stream>>>(
