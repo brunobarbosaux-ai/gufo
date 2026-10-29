@@ -188,13 +188,13 @@ speculative::VerificationChunkResult FlintGpuSpeculativeTarget::ForwardVerificat
 void FlintGpuSpeculativeTarget::CommitVerificationChunk(
     std::span<const tokenization::TokenId> committed_tokens,
     std::uint32_t start_pos) {
-  // The verify tail uses batched-prefill arithmetic, which rounds differently
-  // from the decode GEMV path. Replay the committed rows through the decode
-  // step so the retained KV matches a plain autoregressive run exactly (GX).
-  std::uint32_t pos = start_pos;
-  for (const auto token : committed_tokens) {
-    (void)ForwardToken(token, pos++, /*compute_logits=*/false);
-  }
+  // The verify tail already wrote the committed rows through the batched
+  // prefill arithmetic. The 7.6 policy accepts the resulting per-position
+  // argmax divergence ("prefill-greedy"), so no decode replay is needed;
+  // only the absolute position advances. The stale rows past the committed
+  // prefix are overwritten by the next forward pass before any attention
+  // reads them (the ring cache keeps sliding_window + chunk rows).
+  position_ = start_pos + static_cast<std::uint32_t>(committed_tokens.size());
 }
 
 }  // namespace gufo::hip
