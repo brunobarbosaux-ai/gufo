@@ -30,6 +30,7 @@ inline constexpr std::uint32_t kFlintRingContextCap = 262144;
 /// names the offending flag; the first violation is reported.
 [[nodiscard]] inline bool ValidateFlintOptions(bool has_mmproj,
                                                bool speculative_requested,
+                                               bool speculative_lookup,
                                                bool has_mtp_model,
                                                bool has_dflash_model,
                                                bool has_dspark_model,
@@ -59,9 +60,10 @@ inline constexpr std::uint32_t kFlintRingContextCap = 262144;
         "flint does not support --dspark-model: DSpark drafting is closed "
         "for this architecture");
   }
-  if (speculative_requested) {
+  if (speculative_requested && !speculative_lookup) {
     return reject(
-        "flint does not support --speculative: autoregressive-only build");
+        "flint does not support --speculative: autoregressive-only build "
+        "(only the lookup backend is available)");
   }
   return true;
 }

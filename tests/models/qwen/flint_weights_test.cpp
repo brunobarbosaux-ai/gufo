@@ -721,32 +721,35 @@ void TestExpertWeightScaleRoutedOnly() {
 // F-B3/F-B4: the option gate rejects every drafting/vision flag, naming it.
 void TestFlintOptionGate() {
   std::string err;
-  Expect(gufo::core::ValidateFlintOptions(false, false, false, false, false, &err),
+  Expect(gufo::core::ValidateFlintOptions(false, false, false, false, false, false, &err),
          "clean options pass");
   err.clear();
-  Expect(!gufo::core::ValidateFlintOptions(true, false, false, false, false, &err),
+  Expect(!gufo::core::ValidateFlintOptions(true, false, false, false, false, false, &err),
          "--mmproj rejected");
   Expect(err.find("--mmproj") != std::string::npos, "names --mmproj: " + err);
   err.clear();
-  Expect(!gufo::core::ValidateFlintOptions(false, false, true, false, false, &err),
+  Expect(!gufo::core::ValidateFlintOptions(false, false, false, true, false, false, &err),
          "--mtp-model rejected");
   Expect(err.find("--mtp-model") != std::string::npos,
          "names --mtp-model: " + err);
   err.clear();
-  Expect(!gufo::core::ValidateFlintOptions(false, false, false, true, false, &err),
+  Expect(!gufo::core::ValidateFlintOptions(false, false, false, false, true, false, &err),
          "--dflash-model rejected");
   Expect(err.find("--dflash-model") != std::string::npos,
          "names --dflash-model: " + err);
   err.clear();
-  Expect(!gufo::core::ValidateFlintOptions(false, false, false, false, true, &err),
+  Expect(!gufo::core::ValidateFlintOptions(false, false, false, false, false, true, &err),
          "--dspark-model rejected");
   Expect(err.find("--dspark-model") != std::string::npos,
          "names --dspark-model: " + err);
   err.clear();
-  Expect(!gufo::core::ValidateFlintOptions(false, true, false, false, false, &err),
+  Expect(!gufo::core::ValidateFlintOptions(false, true, false, false, false, false, &err),
          "--speculative rejected");
   Expect(err.find("--speculative") != std::string::npos,
          "names --speculative: " + err);
+  err.clear();
+  Expect(gufo::core::ValidateFlintOptions(false, true, true, false, false, false, &err),
+         "--speculative lookup accepted");
   std::cout << "TestFlintOptionGate ok\n";
 }
 

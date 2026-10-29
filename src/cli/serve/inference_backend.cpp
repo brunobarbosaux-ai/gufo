@@ -3921,6 +3921,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
             !vision_model_path.empty(),
             speculative_config.backend != TextSpeculativeBackend::kDisabled ||
                 !speculative_config.draft_model_path.empty(),
+            speculative_config.backend == TextSpeculativeBackend::kLookup,
             /*has_mtp_model=*/false, /*has_dflash_model=*/false,
             /*has_dspark_model=*/false, &flint_err)) {
       SetError(error, flint_err);
