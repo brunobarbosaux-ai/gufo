@@ -13,6 +13,7 @@ target_sources(gufo_core PRIVATE
   ${PROJECT_SOURCE_DIR}/src/models/qwen/modules/attention.cpp
   ${PROJECT_SOURCE_DIR}/src/models/qwen/modules/embed.cpp
   ${PROJECT_SOURCE_DIR}/src/models/qwen/modules/ffn.cpp
+  ${PROJECT_SOURCE_DIR}/src/models/qwen/modules/moe.cpp
   ${PROJECT_SOURCE_DIR}/src/models/qwen/modules/norm.cpp
   ${PROJECT_SOURCE_DIR}/src/models/qwen/modules/quant_gemm.cpp
   ${PROJECT_SOURCE_DIR}/src/models/qwen/modules/residual.cpp
@@ -28,6 +29,11 @@ if (ENGINE_ENABLE_HIP)
   find_package(OpenSSL REQUIRED COMPONENTS Crypto)
   target_link_libraries(gufo_core PRIVATE OpenSSL::Crypto)
   target_link_libraries(gufo_core PRIVATE gufo_cache_hip)
+  # Routed-expert MoE (qwen35moe) reuses the vendored llama.cpp-derived MMQ
+  # quantized kernels and the routed F16 expert GEMMs built for the
+  # Flash-Next runner.
+  target_link_libraries(gufo_core PRIVATE gufo_qwen38_flash_next_mmq
+    gufo_qwen38_flash_next_kernels)
   target_sources(gufo_core PRIVATE
     ${PROJECT_SOURCE_DIR}/src/models/qwen/continuation_adapter.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/vision/encoder.hip
@@ -68,9 +74,11 @@ if (ENGINE_ENABLE_HIP)
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/attention_decode_graph.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/attention_tile.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/attention_wmma.hip
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/attention_wmma_decode.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/flint_attention_wmma.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/hipblas_gemm.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/hipblaslt_gemm.hip
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/moe.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/dflash_kernels.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/flint_moe.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/flint_moe_batch.hip

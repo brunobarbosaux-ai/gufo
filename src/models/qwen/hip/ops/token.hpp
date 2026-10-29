@@ -68,9 +68,10 @@ void AllocateGpuSamplingWorkspace(GpuSamplingWorkspace* workspace,
 void FreeGpuSamplingWorkspace(GpuSamplingWorkspace* workspace) noexcept;
 
 /// Sorts finite logits into workspace.sorted_logits/sorted_token_ids.
+/// A nonzero keep requests only that exact prefix; other entries are undefined.
 /// Equal logits retain ascending token IDs. Non-finite values sort last.
 void LaunchGPUSortLogits(const float* logits, GpuSamplingWorkspace* workspace,
-                         hipStream_t stream = nullptr);
+                         hipStream_t stream = nullptr, std::size_t keep = 0);
 
 /// Samples one device-resident logit row and writes a single device token.
 ///
@@ -145,6 +146,14 @@ void LaunchRoPE(float* q, float* k, std::uint32_t num_heads,
 /// Computes parallel GPU argmax reduction over logits
 void LaunchGPUArgmax(const float* logits, std::uint32_t* out_token,
                      std::size_t vocab_size, hipStream_t stream = nullptr);
+
+/// Maps an argmax over a small draft head (`prefix` leading vocabulary rows,
+/// then `rows` table rows) back to a token ID: an index at or above `prefix`
+/// selects `table[index - prefix]`. Other values, including
+/// kInvalidSampleToken, are left unchanged.
+void LaunchRemapDraftToken(std::uint32_t* token, std::uint32_t prefix,
+                           const std::int32_t* table, std::uint32_t rows,
+                           hipStream_t stream = nullptr);
 
 /// Resolves batched argmax kernels without running them or touching model
 /// state.

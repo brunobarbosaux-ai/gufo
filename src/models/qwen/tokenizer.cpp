@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/control_tokens.hpp"
 
 namespace gufo::tokenization {
@@ -590,6 +591,8 @@ std::unique_ptr<QwenTokenizer> QwenTokenizer::CreateFromGguf(
   if (tokenizer == nullptr) {
     return nullptr;
   }
+  tokenizer->ornith_chat_template_ = QwenChatTemplate::IsOrnithTemplate(
+      reader.GetMetadataString("tokenizer.chat_template").value_or(""));
   if (tokenizer_pre == std::optional<std::string_view>{"qwen35"}) {
     tokenizer->pre_tokenizer_ = PreTokenizer::kQwen35;
   } else if (is_flint) {

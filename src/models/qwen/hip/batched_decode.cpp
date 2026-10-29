@@ -7,11 +7,14 @@
 #include <string_view>
 #include <vector>
 
+#include "qfn_mmq.h"
 #include "src/core/hip/hip_utils.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/detail/decode_step.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/ops.hpp"
+#include "src/models/qwen/hip/ops/moe.hpp"
+#include "src/models/qwen/modules/moe.hpp"
 
 namespace gufo::hip {
 namespace {
@@ -29,6 +32,19 @@ void LaunchProjection(const models::QwenTensorRef& weight, const float* input,
                       float* output, std::size_t batch_size,
                       std::size_t output_size, std::size_t input_size,
                       hipStream_t stream) {
+  // Rows of a shape that single-token decode sends to the vendored vector
+  // kernel take it here too, so drafted and verified tokens match plain
+  // decode.
+  const auto single_row = models::qwen::ResolveQwenGemmRoute(
+      {.type = weight.type,
+       .m = output_size,
+       .k = input_size,
+       .mode = models::qwen::QwenGemmMode::kHipDecode});
+  if (single_row.route == models::qwen::QwenGemmRoute::kHipQuantMmvq) {
+    LaunchGEMVRows(weight.data, weight.type, input, output, batch_size,
+                   output_size, input_size, stream);
+    return;
+  }
   if (SupportsExactSharedProjection(weight.type)) {
     LaunchBatchedQuantGEMMFp32(weight.type, weight.data, input, output,
                                batch_size, output_size, input_size, stream);
@@ -40,10 +56,8 @@ void LaunchProjection(const models::QwenTensorRef& weight, const float* input,
     return;
   }
 
-  for (std::size_t row = 0; row < batch_size; ++row) {
-    LaunchGEMV(weight.data, weight.type, input + (row * input_size),
-               output + (row * output_size), output_size, input_size, stream);
-  }
+  LaunchGEMVRows(weight.data, weight.type, input, output, batch_size,
+                 output_size, input_size, stream);
 }
 
 void LaunchFfnActivation(const models::QwenLayerWeights& layer,
@@ -100,6 +114,89 @@ struct SsmControls {
   std::size_t row_stride;
 };
 
+/// Batched routed MoE FFN (qwen35moe), decode batch <= kMaxDecodeBatch.
+/// Mirrors ExecuteMoeDecodeStep with the batch-aware kernels; the routed
+/// expert GEMMs keep the same MMQ quantization and reduction order as
+/// single-token decode.
+void LaunchMoeFfn(const models::QwenLayerWeights& layer,
+                  const QwenGpuScratchView& scratch, std::size_t batch_size,
+                  const core::ModelConfig& config, hipStream_t stream) {
+  const auto view = models::qwen::MakeMoeView(layer, config);
+  const auto& moe = scratch.moe;
+  const std::size_t hidden = config.hidden_size;
+  const std::uint32_t n_experts = config.expert_count;
+  const std::uint32_t n_used = config.expert_used_count;
+  const std::size_t expert_ff = config.expert_ff_length;
+  const std::size_t shared_ff = config.expert_shared_ff_length;
+  const std::uint32_t slots = static_cast<std::uint32_t>(batch_size) * n_used;
+
+  LaunchProjection(view.router, scratch.decode.normed.data(),
+                   moe.router_logits.data(), batch_size, n_experts, hidden,
+                   stream);
+  LaunchProjection(view.shexp_gate_inp, scratch.decode.normed.data(),
+                   moe.shexp_gate.data(), batch_size, 1, hidden, stream);
+  LaunchMoeRouterTopK(
+      moe.router_logits.data(), n_experts, moe.ids.data(), moe.weights.data(),
+      static_cast<std::uint32_t>(batch_size), n_experts, n_used, stream);
+
+  LaunchProjection(view.shexp_gate, scratch.decode.normed.data(),
+                   scratch.ffn.gate.data(), batch_size, shared_ff, hidden,
+                   stream);
+  LaunchProjection(view.shexp_up, scratch.decode.normed.data(),
+                   scratch.ffn.up.data(), batch_size, shared_ff, hidden,
+                   stream);
+  LaunchBatchedSwiGLUActivation(scratch.ffn.gate.data(), scratch.ffn.up.data(),
+                                moe.shexp_act.data(), nullptr,
+                                batch_size * shared_ff, stream);
+  LaunchProjection(view.shexp_down, moe.shexp_act.data(), moe.shexp_out.data(),
+                   batch_size, hidden, shared_ff, stream);
+
+  if (view.gate_exps.type == view.up_exps.type &&
+      IsMoeMmqGatedVecType(view.gate_exps.type)) {
+    // The gated vector kernel takes at most 8 token rows per launch
+    // (MMVQ_MAX_BATCH_SIZE), but concurrent verification stacks up to
+    // kMaxDecodeBatch rows per session. Rows are independent, so launch
+    // row slices over the token-major activations, ids and outputs.
+    constexpr std::size_t kGatedVecMaxRows = 8;
+    for (std::size_t row = 0; row < batch_size; row += kGatedVecMaxRows) {
+      const std::size_t rows = std::min(kGatedVecMaxRows, batch_size - row);
+      if (qfn_mmq_moe_gated_vec(
+              static_cast<int>(view.gate_exps.type), view.gate_exps.data,
+              view.up_exps.data, scratch.decode.normed.data() + row * hidden,
+              moe.ids.data() + row * n_used,
+              moe.gate_e.data() + row * n_used * expert_ff,
+              static_cast<int>(expert_ff), static_cast<int>(hidden),
+              static_cast<int>(rows), static_cast<int>(n_experts),
+              static_cast<int>(n_used), stream) != 0) {
+        throw std::runtime_error("MoE gated expert projection failed");
+      }
+    }
+  } else {
+    LaunchMoeSlotSwigluGemv(
+        view.gate_exps.data, view.gate_exps.type, view.up_exps.data,
+        view.up_exps.type, scratch.decode.normed.data(), moe.ids.data(),
+        moe.gate_e.data(), expert_ff, hidden, slots, n_used, stream);
+  }
+  if (IsMoeMmqVecType(view.down_exps.type)) {
+    if (qfn_mmq_moe_vec(static_cast<int>(view.down_exps.type),
+                        view.down_exps.data, moe.gate_e.data(), moe.ids.data(),
+                        moe.down_e.data(), static_cast<int>(hidden),
+                        static_cast<int>(expert_ff), static_cast<int>(slots),
+                        static_cast<int>(n_experts), 1, stream, nullptr,
+                        nullptr) != 0) {
+      throw std::runtime_error("MoE down expert projection failed");
+    }
+  } else {
+    LaunchMoeSlotGemv(view.down_exps.data, view.down_exps.type,
+                      moe.gate_e.data(), moe.ids.data(), moe.down_e.data(),
+                      hidden, expert_ff, slots, 1, stream);
+  }
+  LaunchMoeEpilogue(moe.down_e.data(), moe.weights.data(), moe.shexp_out.data(),
+                    moe.shexp_gate.data(), scratch.ffn.out.data(),
+                    static_cast<std::uint32_t>(batch_size), n_used, hidden,
+                    stream);
+}
+
 SsmControls LaunchSsmControls(const models::QwenLayerWeights& layer,
                               const QwenGpuScratchView& scratch,
                               std::size_t batch_size,
@@ -125,6 +222,18 @@ SsmControls LaunchSsmControls(const models::QwenLayerWeights& layer,
                        row_stride, hidden_size, stream);
       return {packed, packed + time_step_rank, row_stride};
     }
+  }
+  // Single-token decode computes the controls in its fused input projection.
+  // Formats without a shared exact projection (F32, BF16) take that kernel's
+  // arithmetic for every row instead of the row GEMV.
+  if ((!SupportsExactSharedProjection(alpha.type) ||
+       !SupportsExactSharedProjection(beta.type)) &&
+      LaunchSsmControlProjectionsRows(alpha.data, alpha.type, beta.data,
+                                      beta.type, scratch.decode.normed.data(),
+                                      scratch.ssm.alpha.data(),
+                                      scratch.ssm.beta.data(), batch_size,
+                                      hidden_size, time_step_rank, stream)) {
+    return {scratch.ssm.alpha.data(), scratch.ssm.beta.data(), time_step_rank};
   }
   LaunchProjection(alpha, scratch.decode.normed.data(),
                    scratch.ssm.alpha.data(), batch_size, time_step_rank,
@@ -359,11 +468,15 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
                          scratch.decode.normed.data(), nullptr, batch_size,
                          hidden_size, 1e-6F, arena.stream);
 
-    LaunchFfnActivation(layer, scratch, batch_size, intermediate_size,
-                        hidden_size, arena.stream);
-    LaunchProjection(layer.ffn_down, scratch.ffn.activation.data(),
-                     scratch.ffn.out.data(), batch_size, hidden_size,
-                     intermediate_size, arena.stream);
+    if (config.IsMoE()) {
+      LaunchMoeFfn(layer, scratch, batch_size, config, arena.stream);
+    } else {
+      LaunchFfnActivation(layer, scratch, batch_size, intermediate_size,
+                          hidden_size, arena.stream);
+      LaunchProjection(layer.ffn_down, scratch.ffn.activation.data(),
+                       scratch.ffn.out.data(), batch_size, hidden_size,
+                       intermediate_size, arena.stream);
+    }
     LaunchBatchedResidualAdd(
         scratch.decode.hidden.data(), scratch.ffn.out.data(),
         scratch.decode.hidden.data(), batch_size, hidden_size, arena.stream);
@@ -746,11 +859,15 @@ QwenGpuExecutor::ForwardVerificationBatch(
                          scratch.decode.normed.data(), nullptr, batch_size,
                          hidden_size, 1e-6F, arena_.stream);
 
-    LaunchFfnActivation(layer, scratch, batch_size, intermediate_size,
-                        hidden_size, arena_.stream);
-    LaunchProjection(layer.ffn_down, scratch.ffn.activation.data(),
-                     scratch.ffn.out.data(), batch_size, hidden_size,
-                     intermediate_size, arena_.stream);
+    if (config.IsMoE()) {
+      LaunchMoeFfn(layer, scratch, batch_size, config, arena_.stream);
+    } else {
+      LaunchFfnActivation(layer, scratch, batch_size, intermediate_size,
+                          hidden_size, arena_.stream);
+      LaunchProjection(layer.ffn_down, scratch.ffn.activation.data(),
+                       scratch.ffn.out.data(), batch_size, hidden_size,
+                       intermediate_size, arena_.stream);
+    }
     LaunchBatchedResidualAdd(
         scratch.decode.hidden.data(), scratch.ffn.out.data(),
         scratch.decode.hidden.data(), batch_size, hidden_size, arena_.stream);

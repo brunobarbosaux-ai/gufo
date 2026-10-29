@@ -17,6 +17,8 @@ add_qwen27b_test(qwen27b_continuation_layout_test continuation_layout_test.cpp
 
 add_qwen27b_test(qwen_mtp_reference_test mtp_reference_test.cpp
   "cpu;mtp;external-model")
+add_qwen27b_test(qwen_mtp_draft_vocab_test mtp_draft_vocab_test.cpp
+  "cpu;mtp;correctness")
 if (ENGINE_ENABLE_HIP)
   add_executable(qwen27b_continuation_adapter_test EXCLUDE_FROM_ALL
     continuation_adapter_test.cpp continuation_fault.cpp)
@@ -24,13 +26,16 @@ if (ENGINE_ENABLE_HIP)
   add_qwen27b_test(qwen_sampling_hip_test sampling_test.hip
     "hip;gpu;sampling;correctness")
   target_link_libraries(qwen_sampling_hip_test PRIVATE hip::host)
-  add_test(NAME qwen27b.cli-options COMMAND ${Python3_EXECUTABLE}
-    ${CMAKE_CURRENT_SOURCE_DIR}/cli_test.py $<TARGET_FILE:gufo> --scope options)
-  set_tests_properties(qwen27b.cli-options PROPERTIES LABELS "qwen27b;cpu;cli")
-  add_test(NAME qwen27b.cli COMMAND ${Python3_EXECUTABLE}
-    ${CMAKE_CURRENT_SOURCE_DIR}/cli_test.py $<TARGET_FILE:gufo>)
-  set_tests_properties(qwen27b.cli PROPERTIES
-    LABELS "qwen27b;gpu;hip;cli;external-model" SKIP_RETURN_CODE 77)
+  # The CLI tests drive the gufo binary, which Windows does not build yet.
+  if (TARGET gufo)
+    add_test(NAME qwen27b.cli-options COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/cli_test.py $<TARGET_FILE:gufo> --scope options)
+    set_tests_properties(qwen27b.cli-options PROPERTIES LABELS "qwen27b;cpu;cli")
+    add_test(NAME qwen27b.cli COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/cli_test.py $<TARGET_FILE:gufo>)
+    set_tests_properties(qwen27b.cli PROPERTIES
+      LABELS "qwen27b;gpu;hip;cli;external-model" SKIP_RETURN_CODE 77)
+  endif()
   add_qwen27b_test(qwen27b_target_test target_test.cpp
     "gpu;hip;target;external-model")
   add_qwen27b_test(qwen_mtp_gpu_test mtp_test.cpp "gpu;hip;mtp;external-model")

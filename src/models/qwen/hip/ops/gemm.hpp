@@ -96,6 +96,15 @@ void LaunchGEMV(
     std::size_t M, std::size_t K, hipStream_t stream = nullptr,
     models::qwen::QwenGemmMode mode = models::qwen::QwenGemmMode::kHipDecode);
 
+/// `rows` independent GEMVs sharing A: y[row] = A * x[row], with x rows of K
+/// and y rows of M elements. Each row is bit-identical to LaunchGEMV; the
+/// baseline F32/BF16 routes take one launch for all rows.
+void LaunchGEMVRows(
+    const void* A, core::GgmlType a_type, const float* x, float* y,
+    std::size_t rows, std::size_t M, std::size_t K,
+    hipStream_t stream = nullptr,
+    models::qwen::QwenGemmMode mode = models::qwen::QwenGemmMode::kHipDecode);
+
 /// opt-c1xx-q8k-gemv: computes y = A * x where A is stored as block_q8_K
 /// ({ float d; int8_t qs[256]; int16_t bsums[16]; }, QK_K=256). The dot runs
 /// at Q8 (activation quantized to int8, integer MAC, single fp scale at block
@@ -248,6 +257,55 @@ void LaunchBatchedFusedRMSNormQuantizeQ8_1(
     const float* x, const float* residual, const float* weight, float* sum_out,
     void* q8_1_out, std::size_t batch_size, std::size_t dim, float eps,
     hipStream_t stream = nullptr);
+
+/// The GDN qkv projection with its causal convolution and SiLU applied in the
+/// GEMM epilogue, for Q8_0 weights. `conv_out` receives every token except the
+/// first three of each 64-token span; `y` receives the raw projection of those
+/// three, of the last four tokens of each span and of the last four tokens of
+/// the batch, which is what LaunchBatchedSSMConvRecurrenceRowSplit with
+/// `conv_fused` reads. Both are bit-identical to the projection followed by
+/// the convolution. Returns false, launching nothing, for any other shape.
+[[nodiscard]] bool TryLaunchBatchedQuantGEMMSsmConv(
+    core::GgmlType type, const void* w, const void* q8_1_x, float* y,
+    const float* conv_weights, float* conv_out, std::size_t batch,
+    std::size_t m, std::size_t k, hipStream_t stream = nullptr);
+
+/// Whether LaunchBatchedFusedResidualRMSNormQuantizeQ8_1 accepts this width.
+bool IsFusedResidualRMSNormQuantizeQ8_1Supported(std::size_t dim) noexcept;
+
+/// One pass for LaunchBatchedResidualAdd (when `residual` is non-null; the sum
+/// goes to `sum_out`, which may alias `x`), LaunchBatchedRMSNorm into `out`
+/// and `out_bf16`, and LaunchQuantizeActivationQ8_1 of that BF16 row into
+/// `q8_1_out`. Every output is bit-identical to the separate launches.
+/// `out_bf16_tiled`, when set, receives the same BF16 values tiled as
+/// [dim / 64][batch][64] for LaunchBf16WmmaGemmTiled.
+void LaunchBatchedFusedResidualRMSNormQuantizeQ8_1(
+    const float* x, const float* residual, const float* weight, float* sum_out,
+    float* out, void* out_bf16, void* q8_1_out, std::size_t batch_size,
+    std::size_t dim, float eps, hipStream_t stream = nullptr,
+    void* out_bf16_tiled = nullptr);
+
+/// One decode row of LaunchBatchedFusedResidualRMSNormQuantizeQ8_1 without
+/// the BF16 and Q8_1 outputs: `sum_out` (which may alias `x`) receives
+/// x + residual and `out` its RMSNorm, bit-identical to LaunchResidualAdd
+/// followed by LaunchRMSNorm. Only widths accepted by
+/// IsFusedResidualRMSNormQuantizeQ8_1Supported.
+void LaunchFusedResidualRMSNorm(const float* x, const float* residual,
+                                const float* weight, float* sum_out, float* out,
+                                std::size_t dim, float eps,
+                                hipStream_t stream = nullptr);
+
+/// LaunchFusedResidualRMSNorm whose residual is the one-token MoE epilogue
+/// (LaunchMoeEpilogue of expert_out [k, dim], expert_weights [k], shared_out
+/// [dim] and the pre-sigmoid shared_gate [1]), computed in place of reading
+/// it: same bytes as LaunchMoeEpilogue followed by LaunchFusedResidualRMSNorm.
+void LaunchFusedMoeResidualRMSNorm(const float* x, const float* expert_out,
+                                   const float* expert_weights,
+                                   const float* shared_out,
+                                   const float* shared_gate, std::uint32_t k,
+                                   const float* weight, float* sum_out,
+                                   float* out, std::size_t dim, float eps,
+                                   hipStream_t stream = nullptr);
 
 void LaunchQuantizeActivationQ8_1FromFp32(const float* fp32_x, void* q8_1_out,
                                           std::size_t batch, std::size_t k,

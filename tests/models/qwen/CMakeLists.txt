@@ -19,6 +19,10 @@ add_qwen_cpu_test(qwen_chat_template_test
 target_compile_definitions(qwen_chat_template_test PRIVATE
   GUFO_QWEN38_CHAT_TEMPLATE_REFERENCE="${PROJECT_SOURCE_DIR}/src/models/qwen/reference/chat_template.jinja"
   GUFO_CHAT_TEMPLATE_HF_GOLDENS="${PROJECT_SOURCE_DIR}/tests/fixtures/chat_template_hf_goldens.json")
+foreach(test qwen_tokenizer_test qwen_chat_template_test)
+  target_compile_definitions(${test} PRIVATE
+    GUFO_ORNITH_CHAT_TEMPLATE_REFERENCE="${PROJECT_SOURCE_DIR}/tests/models/qwen/tokenization/ornith_chat_template.jinja")
+endforeach()
 
 add_qwen_cpu_test(qwen_flint_weights_test
   tests/models/qwen/flint_weights_test.cpp
@@ -127,6 +131,9 @@ if (ENGINE_ENABLE_HIP)
   add_qwen_hip_test(qwen_attention_fusion_ops_test
     tests/models/qwen/hip/attention/qk_rope_kv_ops_test.cpp
     "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;attention;fusion;opt-c010-qk-rope-kv")
+  add_qwen_hip_test(qwen_attention_wmma_decode_ops_test
+    tests/models/qwen/hip/attention/wmma_decode_ops_test.cpp
+    "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;attention;decode")
   add_qwen_hip_test(qwen_attention_wmma_prefill_ops_test
     tests/models/qwen/hip/attention/wmma_prefill_ops_test.cpp
     "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;attention;prefill;opt-c177-attn-wmma")
@@ -156,6 +163,11 @@ if (ENGINE_ENABLE_HIP)
   add_qwen_hip_test(qwen_kquant_gemv_ops_test
     tests/models/qwen/hip/quant/kquant_gemv_ops_test.cpp
     "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;quant;gemv;k-quant")
+  add_qwen_hip_test(qwen_mmvq_gemv_rows_test
+    tests/models/qwen/hip/quant/mmvq_gemv_rows_test.cpp
+    "hip;gpu;kernels;qwen;qwen-kernel-oracle;quant;gemv;k-quant;mmvq")
+  target_link_libraries(qwen_mmvq_gemv_rows_test PRIVATE
+    gufo_qwen38_flash_next_mmq)
   add_qwen_hip_test(qwen_dequant_ops_test
     tests/models/qwen/hip/dequant_ops_test.cpp
     "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;quant;dequant;opt-c162-q8k-model")

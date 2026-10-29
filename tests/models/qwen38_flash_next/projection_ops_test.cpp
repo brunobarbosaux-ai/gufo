@@ -166,17 +166,35 @@ void CheckSsmProjection(const void* w, const __half* x, float* projected,
   const auto expected_history = download(conv_state, history.size());
   const auto expected_state = download(state, state_count);
   const auto expected_out = download(out, out_count);
-  for (int replay = 0; replay < 2; ++replay) {
+  // Replay 2 queues the Z row tiles on a second stream, as the overlapped
+  // prefill does: the same products, so every byte must match.
+  // Both streams are non-blocking, so the Z tiles really run beside the QKV
+  // tiles and the convolution boundary (the legacy default stream would
+  // serialize them).
+  hipStream_t main_stream = nullptr;
+  hipStream_t z_stream = nullptr;
+  hipEvent_t z_start = nullptr;
+  CheckHip(hipStreamCreateWithFlags(&main_stream, hipStreamNonBlocking),
+           "main stream");
+  CheckHip(hipStreamCreateWithFlags(&z_stream, hipStreamNonBlocking),
+           "Z stream");
+  CheckHip(hipEventCreateWithFlags(&z_start, hipEventDisableTiming), "Z event");
+  for (int replay = 0; replay < 3; ++replay) {
     upload(conv_state, history);
     upload(state, initial_state);
     CheckHip(hipMemset(fused, 0xFF, (reference.size() + 8) * sizeof(float)),
              "poison fused projection");
     CheckHip(hipMemset(scratch, 0xFF, conv_count * sizeof(float)),
              "poison fused convolution");
+    // The poison and uploads ran on the legacy stream, which does not order
+    // the non-blocking streams of replay 2.
+    CheckHip(hipDeviceSynchronize(), "SSM inputs");
     if (!q::DenseF16SsmGemm(w, x, conv_w, conv_state, fused, scratch, batch, m,
-                            k, channels, 4, nullptr)) {
+                            k, channels, 4, replay == 2 ? main_stream : nullptr,
+                            0, replay == 2 ? z_stream : nullptr, z_start)) {
       throw std::runtime_error("SSM projection rejected the shape");
     }
+    CheckHip(hipDeviceSynchronize(), "SSM projection");
     exact(expected_conv, scratch, "convolution");
     const auto projected = download(fused, reference.size() + 8);
     for (std::size_t t = 0; t < batch; ++t) {
@@ -197,6 +215,9 @@ void CheckSsmProjection(const void* w, const __half* x, float* projected,
     exact(expected_state, state, "recurrent state");
     exact(expected_out, out, "output");
   }
+  CheckHip(hipEventDestroy(z_start), "Z event");
+  CheckHip(hipStreamDestroy(z_stream), "Z stream");
+  CheckHip(hipStreamDestroy(main_stream), "main stream");
   // A rejected geometry must not touch any pointer.
   if (q::DenseF16SsmGemm(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
                          0, m, k, channels, 4, nullptr) ||
@@ -525,6 +546,65 @@ void CheckRoutedQ8Placement() {
   for (void* p : {dw, static_cast<void*>(dx), static_cast<void*>(dy),
                   static_cast<void*>(di)})
     CheckHip(hipFree(p), "routed Q8 free");
+}
+
+// Two streams quantize their activations into qfn_mmq scratch at the same
+// time. Each stream owns its scratch arena, so neither can overwrite the
+// other's activations while a launch is in flight.
+void CheckDenseAcrossStreams() {
+  constexpr std::size_t batch = 200, m = 2560, k = 6144;
+  const Q8Weights w = MakeWeights(m, k, 0x5713EA11U);
+  std::vector<float> x(2 * batch * k);
+  std::uint32_t state = 0x5713EA12U;
+  for (float& v : x)
+    v = Uniform(&state, 2.0F);
+  void* d_w = nullptr;
+  float* d_x = nullptr;
+  float* d_y = nullptr;
+  CheckHip(hipMalloc(&d_w, w.blocks.size() + 4096), "hipMalloc");
+  CheckHip(hipMalloc(&d_x, x.size() * 4), "hipMalloc");
+  CheckHip(hipMalloc(&d_y, 2 * batch * m * 4), "hipMalloc");
+  CheckHip(
+      hipMemcpy(d_w, w.blocks.data(), w.blocks.size(), hipMemcpyHostToDevice),
+      "upload");
+  CheckHip(hipMemcpy(d_x, x.data(), x.size() * 4, hipMemcpyHostToDevice),
+           "upload");
+  const auto dense = [&](int input, hipStream_t stream) {
+    if (qfn_mmq_q8_0_dense(d_w, d_x + input * batch * k,
+                           d_y + input * batch * m, static_cast<int>(m),
+                           static_cast<int>(batch), static_cast<int>(k),
+                           stream) != 0)
+      throw std::runtime_error("MMQ dense failed");
+  };
+  dense(0, nullptr);
+  dense(1, nullptr);
+  CheckHip(hipDeviceSynchronize(), "serial dense");
+  std::vector<float> expected(2 * batch * m);
+  CheckHip(hipMemcpy(expected.data(), d_y, expected.size() * 4,
+                     hipMemcpyDeviceToHost),
+           "download");
+  hipStream_t streams[2] = {};
+  for (auto& stream : streams)
+    CheckHip(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "stream");
+  std::vector<float> actual(expected.size());
+  for (int round = 0; round < 20; ++round) {
+    CheckHip(hipMemset(d_y, 0xff, actual.size() * 4), "clear");
+    CheckHip(hipDeviceSynchronize(), "clear");
+    dense(0, streams[0]);
+    dense(1, streams[1]);
+    CheckHip(hipDeviceSynchronize(), "concurrent dense");
+    CheckHip(
+        hipMemcpy(actual.data(), d_y, actual.size() * 4, hipMemcpyDeviceToHost),
+        "download");
+    if (actual != expected)
+      throw std::runtime_error("MMQ dense output depends on another stream");
+  }
+  for (auto stream : streams) {
+    qfn_mmq_release_stream(stream);
+    CheckHip(hipStreamDestroy(stream), "stream destroy");
+  }
+  for (void* p : {d_w, static_cast<void*>(d_x), static_cast<void*>(d_y)})
+    CheckHip(hipFree(p), "free");
 }
 
 double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
@@ -953,6 +1033,7 @@ int main() {
     if (qfn_mmq_init(0) != 0)
       throw std::runtime_error("prepare quantized decode projections");
     CheckRoutedQ8Placement();
+    CheckDenseAcrossStreams();
     CheckSmallProjection(q::WeightType::kF32, 513, 2560);
     CheckSmallProjection(q::WeightType::kF32, 96, 2560);
     CheckSmallProjection(q::WeightType::kBF16, 129, 2560);

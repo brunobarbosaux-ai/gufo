@@ -12,6 +12,12 @@ namespace gufo::server {
 HttpResponse HandleOpenAiChat(const HttpRequest& request,
                               TextGenerationBackend& backend);
 
+/// llama-server's /apply-template: the prompt a Chat Completions body renders
+/// to, with the server's reasoning defaults applied, without generating.
+/// `model` is optional, as outside llama-server router mode.
+HttpResponse HandleApplyTemplate(const HttpRequest& request,
+                                 TextGenerationBackend& backend);
+
 /// Responses nests output schema under text.format and effort under reasoning.
 /// Shared controls stay validated as in Chat Completions, but the Responses
 /// adapter tolerates standard Responses fields with no native effect (hosted
@@ -44,12 +50,13 @@ bool ParseAnthropicToolMessage(const json::Value& item,
                                std::string* error);
 /// Responses text output uses the same reasoning/UTF-8 filter and scheduler
 /// as Chat Completions, including streaming cancellation and cache retention.
+/// `model` is the served name to report; empty reports the primary name.
 HttpResponse CreateOpenAiResponse(const HttpRequest& request,
                                   TextGenerationBackend& backend,
                                   const ChatRequest& chat,
                                   std::size_t max_tokens,
                                   const sampling::SamplingConfig& sampling,
-                                  bool stream);
+                                  bool stream, std::string_view model = {});
 /// Messages output through the same path: content blocks when buffered,
 /// Anthropic SSE events when streamed.
 HttpResponse CreateAnthropicMessage(const HttpRequest& request,
@@ -57,7 +64,7 @@ HttpResponse CreateAnthropicMessage(const HttpRequest& request,
                                     const ChatRequest& chat,
                                     std::size_t max_tokens,
                                     const sampling::SamplingConfig& sampling,
-                                    bool stream);
+                                    bool stream, std::string_view model = {});
 
 }  // namespace gufo::server
 

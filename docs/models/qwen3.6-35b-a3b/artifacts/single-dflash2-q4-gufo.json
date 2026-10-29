@@ -1,0 +1,263 @@
+{
+  "artifactType": "model-bench-table",
+  "fingerprint": {
+    "canonical": {
+      "cppStandard": "C++20",
+      "cpuArchitecture": "x86_64",
+      "cpuLogicalCores": 32,
+      "cpuModel": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+      "cpuPhysicalCores": 16,
+      "cxxCompiler": "GCC 15.3.0",
+      "gpuArchitecture": "gfx1151",
+      "gpuComputeUnits": 20,
+      "gpuDriver": "amdgpu",
+      "gpuName": "AMD Radeon 8060S Graphics",
+      "gpuPciId": "1002:1586",
+      "kernelRelease": "7.0.0-34-generic",
+      "memoryTotalBytes": 134307635200,
+      "memoryType": "LPDDR5X (Unified)",
+      "rocmVersion": "7.2.3",
+      "schemaVersion": "1.0.0"
+    },
+    "fingerprintId": "fc9a031161170511545286fa0e767880e688de9c0af46c05dc9e21d2680b3fe5",
+    "schemaVersion": "1.0.0"
+  },
+  "measuredOn": "2026-10-27",
+  "mode": "dflash2",
+  "model": {
+    "id": "Qwen3.6-35B-A3B",
+    "variant": "q4"
+  },
+  "notes": [
+    "pp2048/tg128; depth is a cached conversation prefix of synthetic text (8-token reply); measured turn task is recorded per row; tolerance max(32, 0.500%) on cache_n and prompt_n; actual counts per sample in rows",
+    "synthetic text: 1.161 tokens/word, template overhead 12 tokens"
+  ],
+  "referenceName": "llama.cpp",
+  "rows": {
+    "0": {
+      "acceptance": 46.3,
+      "acceptance_sd": null,
+      "accepted_per_step": 1.42,
+      "accepted_per_step_sd": null,
+      "command": "gufo serve --port 36905 --sessions 1 llm --model Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --prefill-chunk 2048 --prefill-decode-rounds 8 --speculative dflash2 --dflash-model Qwen3.6-35B-A3B-DFlash2-Q8_0.gguf --draft-tokens 7 --draft-policy adaptive",
+      "counts": [
+        {
+          "cache_n": 0,
+          "completion_sha256": "a0b8dd18ba9d0466f1c5c254ab6f7f113283cb3ded68e616bcbf8751e6948039",
+          "draft_n": 162,
+          "draft_n_accepted": 75,
+          "predicted_n": 128,
+          "prompt_n": 2040
+        }
+      ],
+      "pp": 2829.78,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 74.53,
+      "tg_sd": null,
+      "workload": "prose"
+    },
+    "12288": {
+      "acceptance": 49.02,
+      "acceptance_sd": null,
+      "accepted_per_step": 1.42,
+      "accepted_per_step_sd": null,
+      "command": "gufo serve --port 36905 --sessions 1 llm --model Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --prefill-chunk 2048 --prefill-decode-rounds 8 --speculative dflash2 --dflash-model Qwen3.6-35B-A3B-DFlash2-Q8_0.gguf --draft-tokens 7 --draft-policy adaptive",
+      "counts": [
+        {
+          "cache_n": 12249,
+          "completion_sha256": "0c6c013d739fd9cc850bbc2e7eb15b6c1772d362a8dea7f0f267ee2a92ff450e",
+          "draft_n": 153,
+          "draft_n_accepted": 75,
+          "predicted_n": 128,
+          "prompt_n": 2047
+        }
+      ],
+      "pp": 2387.05,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 72.41,
+      "tg_sd": null,
+      "workload": "prose"
+    },
+    "131072": {
+      "acceptance": 60.17,
+      "acceptance_sd": null,
+      "accepted_per_step": 1.25,
+      "accepted_per_step_sd": null,
+      "command": "gufo serve --port 36905 --sessions 1 llm --model Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --prefill-chunk 2048 --prefill-decode-rounds 8 --speculative dflash2 --dflash-model Qwen3.6-35B-A3B-DFlash2-Q8_0.gguf --draft-tokens 7 --draft-policy adaptive",
+      "counts": [
+        {
+          "cache_n": 130932,
+          "completion_sha256": "f322bed907c40d10f23fd2e54c5cc058c084bc49782b6d8818d69ae7b49d74f9",
+          "draft_n": 118,
+          "draft_n_accepted": 71,
+          "predicted_n": 128,
+          "prompt_n": 2047
+        }
+      ],
+      "pp": 864.84,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 54.58,
+      "tg_sd": null,
+      "workload": "prose"
+    },
+    "16384": {
+      "acceptance": 46.99,
+      "acceptance_sd": null,
+      "accepted_per_step": 1.56,
+      "accepted_per_step_sd": null,
+      "command": "gufo serve --port 36905 --sessions 1 llm --model Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --prefill-chunk 2048 --prefill-decode-rounds 8 --speculative dflash2 --dflash-model Qwen3.6-35B-A3B-DFlash2-Q8_0.gguf --draft-tokens 7 --draft-policy adaptive",
+      "counts": [
+        {
+          "cache_n": 16324,
+          "completion_sha256": "87fcd55a7d54c063c0f4786992b349fbfcca348052964e0af30c2eaf45e82ef5",
+          "draft_n": 166,
+          "draft_n_accepted": 78,
+          "predicted_n": 128,
+          "prompt_n": 2047
+        }
+      ],
+      "pp": 2244.0,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 71.78,
+      "tg_sd": null,
+      "workload": "prose"
+    },
+    "32768": {
+      "acceptance": 48.59,
+      "acceptance_sd": null,
+      "accepted_per_step": 1.17,
+      "accepted_per_step_sd": null,
+      "command": "gufo serve --port 36905 --sessions 1 llm --model Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --prefill-chunk 2048 --prefill-decode-rounds 8 --speculative dflash2 --dflash-model Qwen3.6-35B-A3B-DFlash2-Q8_0.gguf --draft-tokens 7 --draft-policy adaptive",
+      "counts": [
+        {
+          "cache_n": 32718,
+          "completion_sha256": "96b425a25c769fc0029b362dfe8c2339727dbc02becf9f679208cbb0971f8384",
+          "draft_n": 142,
+          "draft_n_accepted": 69,
+          "predicted_n": 128,
+          "prompt_n": 2029
+        }
+      ],
+      "pp": 1822.05,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 63.53,
+      "tg_sd": null,
+      "workload": "prose"
+    },
+    "4096": {
+      "acceptance": 48.75,
+      "acceptance_sd": null,
+      "accepted_per_step": 1.56,
+      "accepted_per_step_sd": null,
+      "command": "gufo serve --port 36905 --sessions 1 llm --model Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --prefill-chunk 2048 --prefill-decode-rounds 8 --speculative dflash2 --dflash-model Qwen3.6-35B-A3B-DFlash2-Q8_0.gguf --draft-tokens 7 --draft-policy adaptive",
+      "counts": [
+        {
+          "cache_n": 4095,
+          "completion_sha256": "ce9a068b95d5eb5e0881ca46cb3f6de310dadf5a2801fe794095b7798b37c865",
+          "draft_n": 160,
+          "draft_n_accepted": 78,
+          "predicted_n": 128,
+          "prompt_n": 2043
+        }
+      ],
+      "pp": 2722.07,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 77.31,
+      "tg_sd": null,
+      "workload": "prose"
+    },
+    "65536": {
+      "acceptance": 51.15,
+      "acceptance_sd": null,
+      "accepted_per_step": 1.1,
+      "accepted_per_step_sd": null,
+      "command": "gufo serve --port 36905 --sessions 1 llm --model Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --prefill-chunk 2048 --prefill-decode-rounds 8 --speculative dflash2 --dflash-model Qwen3.6-35B-A3B-DFlash2-Q8_0.gguf --draft-tokens 7 --draft-policy adaptive",
+      "counts": [
+        {
+          "cache_n": 65447,
+          "completion_sha256": "06d05db31d54d7363b1ca4fffadff2953b75449f8db750d7006e9399329589fe",
+          "draft_n": 131,
+          "draft_n_accepted": 67,
+          "predicted_n": 128,
+          "prompt_n": 2058
+        }
+      ],
+      "pp": 1328.9,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 58.3,
+      "tg_sd": null,
+      "workload": "prose"
+    },
+    "8192": {
+      "acceptance": 48.03,
+      "acceptance_sd": null,
+      "accepted_per_step": 1.33,
+      "accepted_per_step_sd": null,
+      "command": "gufo serve --port 36905 --sessions 1 llm --model Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --prefill-chunk 2048 --prefill-decode-rounds 8 --speculative dflash2 --dflash-model Qwen3.6-35B-A3B-DFlash2-Q8_0.gguf --draft-tokens 7 --draft-policy adaptive",
+      "counts": [
+        {
+          "cache_n": 8184,
+          "completion_sha256": "5ef7c72fb3681024b8f7029aa8ff61649571495dd6bd93e13338f02b20cdce7f",
+          "draft_n": 152,
+          "draft_n_accepted": 73,
+          "predicted_n": 128,
+          "prompt_n": 2048
+        }
+      ],
+      "pp": 2526.99,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 71.81,
+      "tg_sd": null,
+      "workload": "prose"
+    }
+  },
+  "schemaVersion": 1,
+  "server": {
+    "command": [
+      "gufo",
+      "serve",
+      "--port",
+      "36905",
+      "--sessions",
+      "1",
+      "llm",
+      "--model",
+      "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+      "--context",
+      "133760",
+      "--served-model-name",
+      "bench",
+      "--think",
+      "off",
+      "--max-pending-per-client",
+      "8",
+      "--prefill-chunk",
+      "2048",
+      "--prefill-decode-rounds",
+      "8",
+      "--speculative",
+      "dflash2",
+      "--dflash-model",
+      "Qwen3.6-35B-A3B-DFlash2-Q8_0.gguf",
+      "--draft-tokens",
+      "7",
+      "--draft-policy",
+      "adaptive"
+    ]
+  },
+  "source": {
+    "buildMode": "nix-release",
+    "dirty": true,
+    "revision": "dc4a513edcf5ef3cb6bf5c003ce1b2507450195a"
+  },
+  "table": "single-dflash2-q4",
+  "target": "gufo"
+}

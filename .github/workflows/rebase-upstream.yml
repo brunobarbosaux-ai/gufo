@@ -1,0 +1,41 @@
+name: Check a Gufo rebase
+
+# Strycast is rebased on each Gufo release. This workflow checks a rebase PR
+# and prints the commands that replace staging or main; the rulesets block
+# force-pushes, so an admin lifts that for the push itself. See
+# tools/ci/rebase-upstream.sh and "Rebasing onto Gufo" in README.md.
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "Pull request to check: rebase/<tag> -> staging, or staging -> main"
+        required: true
+        type: number
+
+permissions: {}
+
+concurrency:
+  group: rebase-upstream
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check the rebase
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Check the rebase
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ inputs.pr }}
+        run: bash tools/ci/rebase-upstream.sh

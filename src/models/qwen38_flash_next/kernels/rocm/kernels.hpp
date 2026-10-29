@@ -44,6 +44,7 @@ enum class WeightType : std::uint32_t {
   kQ8_0 = 8,
   kQ4_K = 12,
   kQ5_K = 13,
+  kQ6_K = 14,
   kBF16 = 30,
 };
 
@@ -248,11 +249,17 @@ bool DenseBf16Gemm(const void* w, const void* x, float* out, std::size_t batch,
 /// history is read only; pass convolved=true to GatedDeltaNet to consume
 /// this result and update history. Speculative snapshots need all raw QKV
 /// rows and must use DenseF16Gemm instead. Unsupported shapes launch nothing.
+/// A non-null `z_stream` receives the Z rows' tiles (the same products)
+/// after the QKV tiles (ordered through `z_start`), so they run beside the
+/// convolution boundary and the work that follows it until a reader of the
+/// Z rows waits for them.
 bool DenseF16SsmGemm(const void* w, const __half* x, const float* conv_w,
                      const float* history, float* qkvz, float* convolved,
                      std::uint32_t n_tokens, std::uint32_t m, std::uint32_t k,
                      std::uint32_t channels, std::uint32_t kernel,
-                     hipStream_t stream, std::uint32_t checkpoint_tokens = 0);
+                     hipStream_t stream, std::uint32_t checkpoint_tokens = 0,
+                     hipStream_t z_stream = nullptr,
+                     hipEvent_t z_start = nullptr);
 
 /// Routed expert GEMMs. RoutedCompact sorts the (token, slot) assignments
 /// by expert into `rows_token`/`rows_slot` (RoutedCompactRows(slots,
@@ -274,9 +281,9 @@ void RoutedCompact(const std::int32_t* ids, const std::uint32_t* counts,
 /// projection's F32 output over the same rows) turns it into
 /// silu(gate) * result.
 /// `tile_rows` is the token rows per tile the map was built with: 16 or 48,
-/// or 64 for Q5_1/Q8_0.
-/// Q4_K and Q5_K need k % 256 == 0, Q5_1 and Q8_0 k % 64 == 0; other types
-/// and tile widths return false.
+/// or 64 for Q5_1/Q6_K/Q8_0.
+/// Q4_K, Q5_K and Q6_K need k % 256 == 0, Q5_1 and Q8_0 k % 64 == 0; other
+/// types and tile widths return false.
 bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
                    const std::int32_t* tiles, std::uint32_t n_tiles,
                    std::uint32_t tile_rows, const std::int32_t* pad_bounds,
@@ -284,12 +291,21 @@ bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
                    const float* swiglu_gate, float* out, __half* out_half,
                    std::size_t m, std::size_t k, hipStream_t stream);
 
-/// Paired Q4_K/Q5_K gate/up GEMM with SwiGLU and F16 output. Uses the same
-/// routing layout as RoutedF16Gemm, with 128 token rows per tile. The two
-/// projections share one launch and never materialize the gate output.
+/// Whether RoutedGatedF16Gemm decodes `type`.
+bool RoutedGatedF16Supported(WeightType type);
+
+/// Whether RoutedF16Gemm takes `type` with 64- and 128-row tiles; Q4_K and
+/// Q5_K stop at 48.
+bool RoutedF16WideTilesSupported(WeightType type);
+
+/// Paired Q4_K/Q5_K/Q6_K/Q8_0 gate/up GEMM with SwiGLU and F16 output. Uses
+/// the same routing layout as RoutedF16Gemm, with 64 or 128 token rows per
+/// tile. The two projections share one launch and never materialize the gate
+/// output.
 bool RoutedGatedF16Gemm(const void* gate, const void* up, WeightType type,
                         const __half* x, const std::int32_t* tiles,
-                        std::uint32_t n_tiles, const std::int32_t* pad_bounds,
+                        std::uint32_t n_tiles, std::uint32_t tile_rows,
+                        const std::int32_t* pad_bounds,
                         const std::int32_t* rows_in,
                         const std::int32_t* rows_out, __half* out,
                         std::size_t m, std::size_t k, hipStream_t stream);
@@ -353,10 +369,12 @@ struct GdnCheckpoint {
 /// (K = v_heads * d) instead of `out`. With null `out_q8`, a non-null
 /// `out_half` receives F16 rows instead of `out`. With both null, a non-null
 /// `out_q8_1` also receives the rows' unpadded Q8_1 rows (as
-/// qfn_mmq_quantize_q8_1 writes them; d == 128). `convolved` consumes
-/// convolution rows already in conv_scratch; it requires null speculative
-/// snapshots.
-void GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
+/// qfn_mmq_quantize_q8_1 writes them; d == 128). The epilogue, the reader
+/// of `z`, waits for `z_ready` when it is set. Returns false when that wait
+/// cannot be queued. `convolved`
+/// consumes convolution rows already in conv_scratch; it requires null
+/// speculative snapshots.
+bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    std::uint32_t z_stride, const float* alpha_beta,
                    const float* conv_w, const float* a, const float* dt,
                    const float* norm_w, float* conv_state, float* conv_scratch,
@@ -367,7 +385,8 @@ void GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    std::uint32_t d, std::uint32_t kernel, bool row_split,
                    bool convolved, float eps, hipStream_t stream,
                    __half* out_half = nullptr, GdnCheckpoint checkpoint = {},
-                   std::uint32_t out_half_stride = 0, void* out_q8_1 = nullptr);
+                   std::uint32_t out_half_stride = 0, void* out_q8_1 = nullptr,
+                   hipEvent_t z_ready = nullptr);
 
 /// Private rows for one request in a decode batch. Scratch regions and all
 /// recurrent/history/rollback buffers must be disjoint between requests.

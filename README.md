@@ -1,10 +1,87 @@
-# Gufo: The ***Open Source*** Strix Halo AI engine 
+# Strycast: Strix Halo outcasts for Gufo
 
 <p align="center">
-  <img src="assets/gufo-logo.jpg" alt="Gufo logo" width="180">
+  <img src="assets/strycast-logo.png" alt="Strycast logo" width="180">
 </p>
 
-Gufo is a vertical local inference engine specifically built and optimized for the AMD Strix Halo hardware:
+Strycast ("Strix outcast") is a community fork of [Gufo](https://github.com/gufo-org/gufo),
+the open-source inference engine for AMD Strix Halo. Gufo supports only the best
+model for each size on a 128 GiB Strix Halo. Strycast takes models that aren't
+Gufo's first choice there but are worth running anyway:
+
+- **Smaller memory.** Models that fit a 64 GiB Strix Halo or a Ryzen AI laptop
+  (gfx1150) where Gufo's flagship models don't.
+- **A specific use case.** For example, a low-latency local assistant (Home
+  Assistant voice control) that leaves room on the same box for speech-to-text,
+  text-to-speech, embeddings and reranking.
+
+Strycast tracks Gufo releases and is rebased on each one (currently Gufo
+v0.26.0). Everything Gufo supports still works here; the models below are the
+additions. Strycast is not affiliated with gufo-org: report problems with
+these models here, not upstream.
+
+| Model | Status |
+| --- | --- |
+| [Qwen3.6 35B-A3B](docs/models/qwen3.6-35b-a3b/README.md) | Unsloth UD-Q4_K_XL / UD-Q6_K_XL / UD-Q8_K_XL and lmstudio-community [Q4_K_M](https://huggingface.co/lmstudio-community/Qwen3.6-35B-A3B-GGUF/blob/68a34855558af61cbef0324d31f411be8a506b08/Qwen3.6-35B-A3B-Q4_K_M.gguf), AR, MTP (Unsloth files), DFlash2, batched serving. Formerly [gufo-org/gufo#299](https://github.com/gufo-org/gufo/pull/299). |
+| [Ornith 1.5 122B](docs/models/ornith-1.5-122b/README.md) (Qwen3.5-122B-A10B fine-tune) | Q4_K_M, AR, MTP, images, batched serving. Contributed by [@lucasmcoleman](https://github.com/lucasmcoleman) in [#12](https://github.com/slimsami/strycast/pull/12), formerly [gufo-org/gufo#735](https://github.com/gufo-org/gufo/pull/735). |
+
+### Credits
+
+- [@lucasmcoleman](https://github.com/lucasmcoleman) brought
+  up Ornith 1.5 122B: its attention, MMVQ decode and chat-template support, and
+  Gufo's device-memory weights change ([gufo-org/gufo#708](https://github.com/gufo-org/gufo/pull/708)),
+  which every Qwen model here now uses.
+
+### Contributing a model
+
+PRs for other models are welcome; open them against `staging`. Approved PRs
+are squash-merged there, and `staging` is promoted to `main` once its CPU and
+GPU tests pass, so `main` only holds tested work. Strycast keeps Gufo's quality
+bar:
+
+- Greedy speculative and batched decoding must stay bit-exact against plain
+  (AR) decoding, with a test that asserts it.
+- Each model gets a guide under `docs/models` with its files pinned to a
+  revision, plus `BENCHMARKS.md` and `QUALITY.md`.
+- Changes must leave the outputs of Gufo's own models byte-identical.
+- Build with the ROCm 10.1 toolchain Gufo pins; other compilers can break the
+  bit-exact checks.
+
+A model PR can be opened at any stage, so the work is visible and can be
+reviewed as it goes. It is merged only once Strycast runs the model faster than
+llama.cpp runs the same GGUF on the same machine; otherwise there is little
+reason to run it on Strycast. The model's `BENCHMARKS.md` carries that
+comparison, and its guide lists any gaps that remain.
+
+### Rebasing onto Gufo
+
+Each Gufo release is brought in by rebasing, not merging, so Strycast stays a
+short series of commits on top of a Gufo tag. The rulesets block force-pushes
+to `staging` and `main`, so a rebase goes through the
+[Check a Gufo rebase](.github/workflows/rebase-upstream.yml) workflow and an
+admin:
+
+1. Rebase `staging` onto the new tag on a branch named `rebase/<tag>`, update
+   "currently Gufo" above, and open a PR against `staging`.
+2. Run the GPU checks for every Strycast model and for Gufo's own models, put
+   the results in the PR, and add the `gpu-checked` label.
+3. Run the workflow with the PR number. It checks that the branch sits exactly
+   on the tag, that no Strycast commit was dropped and that the required checks
+   passed, then prints the commands that tag the old head
+   `archive/staging-<old tag>` and replace `staging`.
+4. An admin sets the ruleset's bypass for the repository admin role to
+   "always", runs those commands and sets it back to "pull requests only".
+5. Promote with a `staging` → `main` PR as usual, labelled `gpu-checked`, and
+   repeat steps 3 and 4 with that PR to replace `main`.
+
+After a rebase, move an open branch onto the new `staging` with
+`git rebase --onto origin/staging archive/staging-<old tag> <branch>`.
+
+The rest of this README is Gufo's.
+
+## About Gufo
+
+Gufo is a vertical local inference engine for Linux and Windows, specifically built and optimized for AMD Strix Halo hardware:
 Ryzen AI MAX+ 395 systems with Radeon 8060S (`gfx1151`), up to 128 GiB of unified memory.
 
 **Contributions are welcome!**
@@ -13,7 +90,7 @@ See the [changelog](CHANGELOG.md) and [GitHub Releases](https://github.com/gufo-
 for user-facing changes and release history.
 
 > [!TIP]
-> There are two Gufo variants that haven't been merged yet: A **[Windows port](https://github.com/pixmaate/gufo)** and **[Gufo RDMA for Dual Strix Halo](https://github.com/neuhaus/gufo)**. Check them out!
+> Check out **[Gufo RDMA for Dual Strix Halo](https://github.com/neuhaus/gufo)**, a Gufo variant that has not been merged yet!
 
 ## Models and benchmarks
 
@@ -22,9 +99,11 @@ All model documentation lives under [docs/models](docs/models/README.md):
 | Model | Inference modes | Hugging Face weights | Benchmarks | Quality |
 | --- | --- | --- | --- | --- |
 | [Qwen3.8 27B](docs/models/qwen3.8-27b/README.md) | Q4/Q8, images, AR, DFlash2 | Unsloth [Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-Q4_K_XL.gguf) / [Q8_K_XL](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-Q8_K_XL.gguf) · [DFlash2 Q4_K_M](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF/blob/2d9571f8ce46e151f61c6499c99dee6079e1d610/Qwen3.8-27B-DFlash2-Q4_K_M.gguf) | Q4: **648.89 tok/s pp**; up to **71.55 tok/s tg** single user and **128.42 aggregated tok/s** on 8 concurrent requests with DFlash2 · [Benchmarks](docs/models/qwen3.8-27b/BENCHMARKS.md) | [Quality](docs/models/qwen3.8-27b/QUALITY.md) |
+| [Qwen3.6 35B-A3B](docs/models/qwen3.6-35b-a3b/README.md) | Q4/Q4_K_M/Q6/Q8, AR, DFlash2, MTP | Unsloth [Q4_K_XL](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/blob/5bc3e238d916f48a861bac2f8a1990a0e9b7e98d/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf) / [Q6_K_XL](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/blob/5bc3e238d916f48a861bac2f8a1990a0e9b7e98d/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf) / [Q8_K_XL](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/blob/5bc3e238d916f48a861bac2f8a1990a0e9b7e98d/Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf) · lmstudio [Q4_K_M](https://huggingface.co/lmstudio-community/Qwen3.6-35B-A3B-GGUF/blob/68a34855558af61cbef0324d31f411be8a506b08/Qwen3.6-35B-A3B-Q4_K_M.gguf) · [DFlash2 Q8_0](https://huggingface.co/aminya/Qwen3.6-35B-A3B-DFlash2-GGUF/blob/1e26e3499d865b9d2fc55e019d65b3f0e8ab6846/Qwen3.6-35B-A3B-DFlash2-Q8_0.gguf) | Q4: **3,266.95 tok/s pp**; up to **213.95 tok/s tg** single user and **253.43 aggregated tok/s** on 8 concurrent requests with DFlash2 · [Benchmarks](docs/models/qwen3.6-35b-a3b/BENCHMARKS.md) | [Quality](docs/models/qwen3.6-35b-a3b/QUALITY.md) |
 | [Qwen3.8 Flash-Next](docs/models/qwen3.8-flash-next/README.md) | Q4, images, AR, MTP | Unsloth [Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/38bb39ee97821de2c9009abb7e93950eec396e66/UD-Q4_K_XL) · [MTP Q8_0](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/blob/38bb39ee97821de2c9009abb7e93950eec396e66/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf) | **1,801.01 tok/s pp** (AR); up to **116.93 tok/s tg** single user and **245.81 aggregated tok/s** on 8 concurrent requests with MTP · [Benchmarks](docs/models/qwen3.8-flash-next/BENCHMARKS.md) | [Quality](docs/models/qwen3.8-flash-next/QUALITY.md) |
 | [DeepSeek V4 Flash](docs/models/deepseek-v4-flash/README.md) | AR, DSpark | [antirez Flash 0731 IQ2XXS](https://huggingface.co/antirez/deepseek-v4-gguf/blob/1cd7b564460821938add0475a60b942c409295e0/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf) · [DSpark](https://huggingface.co/antirez/deepseek-v4-gguf/blob/e7f04037032990db0346398d249baf9fb9df1ccc/DeepSeek-V4-Flash-DSpark-support-0731.gguf) | **484.62 tok/s pp**; up to **26.62 tok/s tg** single user and **54.74 aggregated tok/s** on 8 concurrent requests with DSpark · [Benchmarks](docs/models/deepseek-v4-flash/BENCHMARKS.md) | [Quality](docs/models/deepseek-v4-flash/QUALITY.md) |
 | [Qwen3-ASR 1.7B](docs/models/qwen3-asr/README.md) | Speech recognition | [BF16](https://huggingface.co/Qwen/Qwen3-ASR-1.7B/tree/7278e1e70fe206f11671096ffdd38061171dd6e5) | **15.27× realtime** · [Benchmarks](docs/models/qwen3-asr/BENCHMARKS.md) | [Quality](docs/models/qwen3-asr/QUALITY.md) |
+| [EmbeddingGemma 2](docs/models/embeddinggemma-2/README.md) | Text and image embeddings | [BF16](https://huggingface.co/google/embeddinggemma-2/tree/914f7f89142e33e77833254d9c9b90c3cef7303b) | Up to **41.5k tokens/s** over HTTP; **13.0 ms** for a 404-token request · [Benchmarks](docs/models/embeddinggemma-2/BENCHMARKS.md) | [Quality](docs/models/embeddinggemma-2/QUALITY.md) |
 | [Qwen3-TTS 1.7B](docs/models/qwen3-tts/README.md) | Speech synthesis and voice cloning | BF16 [CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice) / [VoiceDesign](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign) / [Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) | Up to **2.54× realtime**; **201 ms** to first audio (CustomVoice) · [Benchmarks](docs/models/qwen3-tts/BENCHMARKS.md) | [Quality](docs/models/qwen3-tts/QUALITY.md) |
 | [Qwen-Image-2.1](docs/models/qwen-image-2.1/README.md) | BF16 image generation and editing | [Complete pipeline](https://huggingface.co/Qwen/Qwen-Image-2.1/tree/b3179ad355be050328e483a9dfdd9e60cd62adfa) | In progress · [Benchmarks](docs/models/qwen-image-2.1/BENCHMARKS.md) | [Quality](docs/models/qwen-image-2.1/QUALITY.md) |
 | [MiniMax H3](docs/models/minimax-h3/README.md) | BF16 text to video/audio | [FL2VA pipeline](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/42ed227ee7df40d41602854ae760620d6eb651fe/FL2VA) | In progress · [Benchmarks](docs/models/minimax-h3/BENCHMARKS.md) | [Quality](docs/models/minimax-h3/QUALITY.md) |
@@ -135,7 +214,9 @@ Reasoning tokens count toward that response limit.
 
 ## Build from source
 
-Linux x86-64 on AMD Strix Halo (`gfx1151`) is the supported target. CMake owns
+Production packages target Linux x86-64 on AMD Strix Halo (`gfx1151`).
+Windows x86-64 is a supported native build target for development; see
+[BUILD-WINDOWS.md](BUILD-WINDOWS.md). CMake owns
 one production configuration for both Nix and ordinary Linux builds. Tests,
 profilers, tuning executables and Python reference runners are not installed
 with the production package. No `build.sh` wrapper is needed.
@@ -156,17 +237,32 @@ requirements. Optional benchmark baselines are selected separately with
 See [testing](docs/TESTING.md) for the small hosted CI suite and
 explicit local quality checks.
 
-The Nix package and development shell include a ROCr 7.2.3
-[queue-memory patch](.devops/nix/patches/rocr-fixed-cwsr.patch) for Strix Halo.
-It keeps queue save/restore buffers, launch/copy arenas and code-loading
-staging resident during host memory compaction, while retaining managed-memory
-support and the ordinary fine-grained host-allocation policy.
+Prebuilt store paths are published to the `gufo` Cachix cache. The flake
+declares it in `nixConfig`: users listed in `trusted-users` are asked to accept
+it, or pass `--accept-flake-config`. Nix ignores it for other users; add it
+system-wide with `cachix use gufo` or in `/etc/nix/nix.conf`:
+
+```
+extra-substituters = https://gufo.cachix.org
+extra-trusted-public-keys = gufo.cachix.org-1:rfZe3n4lHINgyoACKzs5EthIZmBNvEyCCtufUpth0PE=
+```
+
+The Nix package and development shell use ROCm 10.1.0 (HIP Clang 24)
+from the pinned [nixpkgs ROCm 10.1 update](https://github.com/NixOS/nixpkgs/pull/573885).
+Python, Python packages and general build dependencies come from the pinned
+`nixos-unstable` input. The ROCm package set comes from the separate fork,
+retaining its compiler/runtime dependencies to reuse the gfx1151 binaries on
+`gufo.cachix.org`. All Nix workflows configure this cache explicitly.
+Both include a [queue-memory patch](.devops/nix/patches/rocr-fixed-cwsr-rocm10.patch)
+for Strix Halo. It keeps queue save/restore buffers, launch/copy arenas and
+code-loading staging resident during host memory compaction, while retaining
+managed-memory support and the ordinary fine-grained host-allocation policy.
 
 ### Without Nix
 
 Install a C++20 compiler, CMake 3.21+, Ninja, pkg-config and the
-following development libraries. The currently qualified toolchain is GCC
-15.3 and ROCm 7.2.3. Attention and audio convolution kernels are compiled
+following development libraries. The pinned Nix toolchain uses GCC
+16.2 and ROCm 10.1.0 (HIP Clang 24). Attention and audio convolution kernels are compiled
 directly from HIP. Python, Triton/AOTriton, Composable Kernel and MIOpen are
 not production build or runtime requirements.
 For the same protection against queue evictions as the Nix build, apply the
@@ -179,6 +275,7 @@ limits disallow those pins. Gufo leaves `HSA_USERPTR_FOR_PAGED_MEM` unchanged.
 | ROCm HIP compiler/runtime, hipBLAS, hipBLASLt, rocBLAS | GPU execution and matrix multiplication |
 | hipCUB, rocPRIM, rocWMMA headers | Compiled GPU kernels |
 | ICU, libcurl, OpenSSL, libpng, libjpeg, libwebp | Tokenization, HTTPS, hashing and images |
+| libsndfile, libsoxr | Audio decoding and reference-compatible resampling |
 | FFmpeg and ffprobe | Video/audio output; invoked as separate executables |
 
 Install ROCm using [AMD's Linux instructions](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/).
@@ -189,7 +286,7 @@ For example, on Debian/Ubuntu the ordinary system libraries are:
 
 ```sh
 sudo apt install build-essential cmake ninja-build pkg-config \
-  libicu-dev libcurl4-openssl-dev libssl-dev libpng-dev libjpeg-dev libwebp-dev ffmpeg
+  libicu-dev libcurl4-openssl-dev libssl-dev libpng-dev libjpeg-dev libwebp-dev libsndfile1-dev libsoxr-dev ffmpeg
 
 # ROCm libraries from the table, named as AMD's repository ships them.
 sudo apt install hipblas-dev hipblaslt-dev rocblas-dev \

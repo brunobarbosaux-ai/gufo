@@ -1,8 +1,19 @@
 #if defined(ENGINE_ENABLE_HIP)
+#include <algorithm>
+#include <atomic>
+#include <cstring>
 #include <limits>
+#include <memory>
+#include <span>
 #include <string_view>
 #include <utility>
+#include <vector>
 
+#include "qfn_mmq.h"
+#include "src/core/hip/heap_placement.hpp"
+#include "src/core/hip/weight_upload.hpp"
+#include "src/core/platform/pages.hpp"
+#include "src/core/platform/prefault.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/hip/detail/weight_regions.hpp"
 #include "src/models/qwen/hip/executor.hpp"
@@ -66,6 +77,17 @@ std::shared_ptr<const QwenGpuModel> QwenGpuModel::CreateFromGguf(
     return nullptr;
   }
 
+  if (weights_opt->config.IsMoE()) {
+    // The routed-expert GEMMs run on the vendored llama.cpp-derived MMQ
+    // kernels; bind their device context before first use.
+    if (qfn_mmq_init(0) != 0) {
+      if (error_msg != nullptr) {
+        *error_msg = "Failed to initialize the MoE quant kernel backend";
+      }
+      return nullptr;
+    }
+  }
+
   auto tokenizer =
       tokenization::QwenTokenizer::CreateFromGguf(*reader, error_msg);
   if (!tokenizer)
@@ -91,7 +113,11 @@ std::shared_ptr<const QwenGpuModel> QwenGpuModel::CreateFromGguf(
                remap(layer.ssm_beta) && remap(layer.ssm_a) &&
                remap(layer.ssm_dt) && remap(layer.ssm_norm) &&
                remap(layer.ffn_norm) && remap(layer.ffn_gate) &&
-               remap(layer.ffn_up) && remap(layer.ffn_down);
+               remap(layer.ffn_up) && remap(layer.ffn_down) &&
+               remap(layer.ffn_gate_inp) && remap(layer.ffn_gate_inp_shexp) &&
+               remap(layer.ffn_gate_exps) && remap(layer.ffn_up_exps) &&
+               remap(layer.ffn_down_exps) && remap(layer.ffn_gate_shexp) &&
+               remap(layer.ffn_up_shexp) && remap(layer.ffn_down_shexp);
   }
   if (!remapped) {
     ReleaseWeightRegions(weight_regions);

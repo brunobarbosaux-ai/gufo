@@ -1,17 +1,21 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <limits>
+#include <numeric>
 #include <span>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
 
 #include "src/core/sampling.hpp"
+#include "src/models/qwen/hip/kernels/dflash_kernels.hpp"
 #include "src/models/qwen/hip/ops/token.hpp"
 #include "tests/models/qwen27b/sampling_cases.hpp"
 
@@ -525,8 +529,8 @@ void TestSamplingBoundaryValues() {
     gufo::hip::GpuSamplingParameters parameters;
     parameters.temperature = 1.0F;
     parameters.top_k = top_k;
-    const auto result = SampleSpeculatively(
-        equal_logits, parameters, 0, 0.25F, ids, probabilities, gpu_draw, 0.5F);
+    const auto result = SampleSpeculatively(equal_logits, parameters, 0, 0.25F,
+                                            ids, probabilities, gpu_draw, 0.5F);
     Expect(result.accepted && result.token == 0,
            "p(y) = q(y) accepts even the largest draw on both GPU routes");
   }
@@ -580,6 +584,61 @@ void TestExactNucleusBoundaryAndGreedyTies() {
   CheckHip(hipFree(device_token), "free tie token");
   CheckHip(hipFree(device_logits), "free batched tie");
   Expect(batched_token == 1, "batched verification uses the same greedy tie");
+}
+
+// The MTP small head scores `prefix` vocabulary rows, then table rows; the
+// argmax index of a winning table row maps back to that row's token ID.
+void TestRemapDraftToken() {
+  constexpr std::uint32_t kPrefix = 8;
+  const std::vector<std::int32_t> table{500, 900, 7};
+  std::vector<float> logits(kPrefix + table.size(), -1.0F);
+  logits[kPrefix + 1] = 2.0F;
+  float* device_logits = nullptr;
+  std::int32_t* device_table = nullptr;
+  std::uint32_t* device_token = nullptr;
+  CheckHip(hipMalloc(&device_logits, logits.size() * sizeof(float)),
+           "allocate draft logits");
+  CheckHip(hipMalloc(&device_table, table.size() * sizeof(std::int32_t)),
+           "allocate draft table");
+  CheckHip(hipMalloc(&device_token, sizeof(std::uint32_t)),
+           "allocate draft token");
+  CheckHip(hipMemcpy(device_logits, logits.data(),
+                     logits.size() * sizeof(float), hipMemcpyHostToDevice),
+           "upload draft logits");
+  CheckHip(hipMemcpy(device_table, table.data(),
+                     table.size() * sizeof(std::int32_t),
+                     hipMemcpyHostToDevice),
+           "upload draft table");
+  const auto rows = static_cast<std::uint32_t>(table.size());
+  const auto remap = [&](std::uint32_t index) {
+    CheckHip(hipMemcpy(device_token, &index, sizeof(index),
+                       hipMemcpyHostToDevice),
+             "upload draft index");
+    gufo::hip::LaunchRemapDraftToken(device_token, kPrefix, device_table, rows);
+    std::uint32_t token = 0;
+    CheckHip(hipMemcpy(&token, device_token, sizeof(token),
+                       hipMemcpyDeviceToHost),
+             "download draft token");
+    return token;
+  };
+  Expect(remap(3) == 3, "a prefix index is its own token");
+  Expect(remap(kPrefix) == 500 && remap(kPrefix + 2) == 7,
+         "a table index maps to its row's token");
+  Expect(remap(kPrefix + rows) == kPrefix + rows,
+         "an index past the rows in use is left unchanged");
+  Expect(remap(gufo::hip::kInvalidSampleToken) ==
+             gufo::hip::kInvalidSampleToken,
+         "an invalid argmax stays invalid");
+  gufo::hip::LaunchGPUArgmax(device_logits, device_token, logits.size());
+  gufo::hip::LaunchRemapDraftToken(device_token, kPrefix, device_table, rows);
+  std::uint32_t token = 0;
+  CheckHip(hipMemcpy(&token, device_token, sizeof(token),
+                     hipMemcpyDeviceToHost),
+           "download draft argmax");
+  Expect(token == 900, "a winning table row proposes its token");
+  CheckHip(hipFree(device_token), "free draft token");
+  CheckHip(hipFree(device_table), "free draft table");
+  CheckHip(hipFree(device_logits), "free draft logits");
 }
 
 void TestFullVocabularyQuantiles() {
@@ -734,6 +793,209 @@ void TestBatchedArgmaxTiles() {
   }
 }
 
+void TestExactCandidatePrefix() {
+  for (const std::size_t size : {1023U, 1024U, 1025U, 32769U, 248320U}) {
+    std::vector<float> logits(size);
+    std::vector<std::uint32_t> expected(size);
+    float* device = nullptr;
+    CheckHip(hipMalloc(&device, size * sizeof(float)), "candidate input");
+    gufo::hip::GpuSamplingWorkspace workspace;
+    gufo::hip::AllocateGpuSamplingWorkspace(&workspace, size, 0);
+    for (unsigned fixture = 0; fixture < 4; ++fixture) {
+      for (std::size_t i = 0; i < size; ++i) {
+        if (fixture == 0)
+          logits[i] =
+              static_cast<float>(static_cast<int>(i * 131U % 997) - 498) /
+              97.0F;
+        else if (fixture == 1)
+          logits[i] = i % 2 ? -0.0F : 0.0F;
+        else if (fixture == 2)
+          logits[i] = i % 3 ? -INFINITY : NAN;
+        else
+          logits[i] = i % 1024 == 1023 ? 10.0F : -1.0F;
+      }
+      if (fixture != 1) {
+        logits[size / 2] = INFINITY;
+        logits[size - 1] = -INFINITY;
+      }
+      std::iota(expected.begin(), expected.end(), 0U);
+      const auto finite = [&](auto id) {
+        return std::isfinite(logits[id]) ? logits[id] : -INFINITY;
+      };
+      std::stable_sort(expected.begin(), expected.end(),
+                       [&](auto a, auto b) { return finite(a) > finite(b); });
+      CheckHip(hipMemcpy(device, logits.data(), size * sizeof(float),
+                         hipMemcpyHostToDevice),
+               "candidate upload");
+      gufo::hip::LaunchGPUSortLogits(device, &workspace);
+      std::vector<float> reference(64), actual(64);
+      std::vector<std::uint32_t> reference_ids(64), ids(64);
+      CheckHip(hipMemcpy(reference.data(), workspace.sorted_logits,
+                         64 * sizeof(float), hipMemcpyDeviceToHost),
+               "full sort logits");
+      CheckHip(hipMemcpy(reference_ids.data(), workspace.sorted_token_ids,
+                         64 * sizeof(std::uint32_t), hipMemcpyDeviceToHost),
+               "full sort ids");
+      Expect(std::equal(reference_ids.begin(), reference_ids.end(),
+                        expected.begin()),
+             "full sort independent ordering");
+      for (const std::size_t keep : {1U, 20U, 32U, 33U, 64U}) {
+        gufo::hip::LaunchGPUSortLogits(device, &workspace, nullptr, keep);
+        CheckHip(hipMemcpy(actual.data(), workspace.sorted_logits,
+                           keep * sizeof(float), hipMemcpyDeviceToHost),
+                 "bounded logits");
+        CheckHip(hipMemcpy(ids.data(), workspace.sorted_token_ids,
+                           keep * sizeof(std::uint32_t), hipMemcpyDeviceToHost),
+                 "bounded ids");
+        Expect(std::memcmp(actual.data(), reference.data(),
+                           keep * sizeof(float)) == 0 &&
+                   std::equal(ids.begin(), ids.begin() + keep,
+                              reference_ids.begin()),
+               "bounded candidates must retain exact scores and tie order");
+      }
+    }
+    gufo::hip::FreeGpuSamplingWorkspace(&workspace);
+    CheckHip(hipFree(device), "free candidate input");
+  }
+  std::cout << "Bounded candidate prefixes match full sort and CPU ordering.\n";
+}
+
+void TestDraftSamplingControls() {
+  using namespace gufo;
+  constexpr std::size_t vocab = 2051, rows = 4, count = 8, rank = 16;
+  const std::array<sampling::TokenId, count> ids{3,    4,    5,    6,
+                                                 1025, 1026, 1027, 2048};
+  std::vector<float> logits(rows * vocab, -20.0F);
+  for (std::size_t row = 0; row < rows; ++row)
+    for (std::size_t i = 0; i < count; ++i)
+      logits[row * vocab + ids[i]] = 4.0F - float(i / 2) * 0.2F;
+  for (int policy = 0; policy < 8; ++policy) {
+    sampling::SamplingConfig config{
+        .temperature = 0.7F,
+        .repeat_penalty = policy == 1 || policy == 7 ? 1.2F
+                          : policy == 2              ? 0.8F
+                                                     : 1.0F,
+        .repeat_last_n = 2,
+        .frequency_penalty = policy == 3   ? 0.2F
+                             : policy == 4 ? -0.2F
+                                           : 0.0F,
+        .presence_penalty = policy == 5 || policy == 7 ? 1.5F
+                            : policy == 6              ? -1.5F
+                                                       : 0.0F,
+    };
+    if (policy == 7)
+      config.temperature = 0.0001F;
+    sampling::SamplerState expected(config, std::span(ids).first(4));
+    expected.Accept(3);
+    expected.Accept(5);
+    std::vector<void*> allocations;
+    const auto allocate = [&](std::size_t bytes) {
+      void* pointer = nullptr;
+      CheckHip(hipMalloc(&pointer, std::max<std::size_t>(bytes, 4)),
+               "draft control allocation");
+      allocations.push_back(pointer);
+      return pointer;
+    };
+    const auto upload = [&](const void* source, std::size_t bytes) {
+      auto* pointer = allocate(bytes);
+      if (bytes)
+        CheckHip(hipMemcpy(pointer, source, bytes, hipMemcpyHostToDevice),
+                 "draft control upload");
+      return pointer;
+    };
+    auto* d_logits =
+        static_cast<float*>(upload(logits.data(), logits.size() * 4));
+    auto* codebook = allocate(vocab * rank * 2);
+    CheckHip(hipMemset(codebook, 0, vocab * rank * 2),
+             "zero transition oracle");
+    auto* hidden = static_cast<float*>(allocate(rows * rank * 4));
+    CheckHip(hipMemset(hidden, 0, rows * rank * 4), "zero selector oracle");
+    auto* tokens = static_cast<std::uint32_t*>(allocate((rows + 1) * 4));
+    CheckHip(hipMemset(tokens, 0, (rows + 1) * 4), "set draft anchor");
+    auto* partial = static_cast<float*>(allocate(
+        rows * hip::kernels::DFlashSelectorScratchElements(vocab) * 4));
+    auto* partial_ids = static_cast<std::uint32_t*>(allocate(
+        rows * hip::kernels::DFlashSelectorScratchElements(vocab) * 4));
+    const std::array<float, rows> uniforms{0.0F, 0.23F, 0.91F, 0.99999994F};
+    auto* draws =
+        static_cast<float*>(upload(uniforms.data(), sizeof(uniforms)));
+    auto* candidates = static_cast<std::uint32_t*>(allocate(rows * count * 4));
+    auto* probabilities = static_cast<float*>(allocate(rows * count * 4));
+    const auto penalties = expected.penalties();
+    const auto history = expected.history();
+    hip::kernels::DFlashSampling controls{
+        .repeat_penalty = config.repeat_penalty,
+        .frequency_penalty = config.frequency_penalty,
+        .presence_penalty = config.presence_penalty,
+        .repeat_last_n = std::uint32_t(config.repeat_last_n),
+        .penalties = static_cast<const sampling::TokenPenalty*>(
+            upload(penalties.data(), penalties.size_bytes())),
+        .penalty_count = std::uint32_t(penalties.size()),
+        .history = static_cast<const sampling::TokenId*>(
+            upload(history.data(), history.size_bytes())),
+        .history_count = std::uint32_t(history.size()),
+    };
+    const std::array sequences{hip::kernels::DFlashSelectorSequence{
+        rows, config.temperature, controls}};
+    hip::kernels::LaunchDFlashSelectorBatch(
+        d_logits, hidden, codebook, codebook, tokens, nullptr, partial,
+        partial_ids, draws, candidates, probabilities, sequences, vocab, rank,
+        count, nullptr);
+    std::array<std::uint32_t, rows + 1> actual{};
+    std::array<std::uint32_t, rows * count> actual_ids{};
+    std::array<float, rows * count> actual_probabilities{};
+    CheckHip(
+        hipMemcpy(actual.data(), tokens, sizeof(actual), hipMemcpyDeviceToHost),
+        "draft controlled samples");
+    CheckHip(hipMemcpy(actual_ids.data(), candidates, sizeof(actual_ids),
+                       hipMemcpyDeviceToHost),
+             "draft controlled IDs");
+    CheckHip(hipMemcpy(actual_probabilities.data(), probabilities,
+                       sizeof(actual_probabilities), hipMemcpyDeviceToHost),
+             "draft controlled probabilities");
+    for (std::size_t row = 0; row < rows; ++row) {
+      // The base lattice keeps the selector's existing lane-order tie breaks.
+      // Its set is known independently; filter a full-vocabulary CPU row so
+      // numeric sampler ties use actual token IDs, not compact row indices.
+      auto selected = std::span(actual_ids).subspan(row * count, count);
+      std::array<std::uint32_t, count> sorted{};
+      std::ranges::copy(selected, sorted.begin());
+      std::ranges::sort(sorted);
+      Expect(std::ranges::equal(sorted, ids), "selector candidate set changed");
+      std::vector<float> scores(vocab, -INFINITY);
+      for (auto id : ids)
+        scores[id] = logits[row * vocab + id];
+      const auto distribution = expected.Distribution(scores);
+      double cumulative = 0.0;
+      bool checked = false;
+      for (std::size_t i = 0; i < count; ++i) {
+        const double probability = distribution.probability(selected[i]);
+        if (std::abs(actual_probabilities[row * count + i] - probability) >=
+            2e-5)
+          std::cerr << "draft policy=" << policy << " row=" << row
+                    << " token=" << selected[i]
+                    << " gpu=" << actual_probabilities[row * count + i]
+                    << " cpu=" << probability << '\n';
+        Expect(std::abs(actual_probabilities[row * count + i] - probability) <
+                   2e-5,
+               "draft q differs from independent CPU distribution");
+        if (actual[row + 1] == selected[i]) {
+          Expect(probability > 0 && cumulative <= uniforms[row] + 2e-5 &&
+                     cumulative + probability >= uniforms[row] - 2e-5,
+                 "draft sample is outside its reported q CDF");
+          checked = true;
+        }
+        cumulative += probability;
+      }
+      Expect(checked, "draft sample must belong to its reported candidates");
+      expected.Accept(actual[row + 1]);
+    }
+    for (auto* allocation : allocations)
+      CheckHip(hipFree(allocation), "free draft control allocation");
+  }
+  std::cout << "DFlash sampling controls match independent conditional q.\n";
+}
+
 }  // namespace
 
 int main() {
@@ -755,8 +1017,11 @@ int main() {
   TestFilteredSpeculativeResidualSampling();
   TestSamplingBoundaryValues();
   TestExactNucleusBoundaryAndGreedyTies();
+  TestRemapDraftToken();
   TestFullVocabularyQuantiles();
   TestBatchedArgmaxTiles();
+  TestExactCandidatePrefix();
+  TestDraftSamplingControls();
   std::cout << "All Qwen GPU sampling tests passed.\n";
   return 0;
 }

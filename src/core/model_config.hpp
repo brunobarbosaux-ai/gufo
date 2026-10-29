@@ -33,11 +33,18 @@ struct ModelConfig {
   float rope_theta{10000000.0F};
   float rope_scale{1.0F};
   bool is_text_only{true};
+  // MoE (qwen35moe): zero expert_count denotes a dense FFN model.
+  std::uint32_t expert_count{0};
+  std::uint32_t expert_used_count{0};
+  std::uint32_t expert_ff_length{0};
+  std::uint32_t expert_shared_ff_length{0};
+
+  [[nodiscard]] constexpr bool IsMoE() const noexcept {
+    return expert_count > 0;
+  }
 
   // Mixture-of-experts geometry (flint.*). Zero-valued for dense artifacts;
   // only judged when expert_count > 0.
-  std::uint32_t expert_count{0};
-  std::uint32_t expert_used_count{0};
   std::uint32_t expert_feed_forward_length{0};
   std::uint32_t expert_shared_count{0};
   std::uint32_t expert_shared_feed_forward_length{0};

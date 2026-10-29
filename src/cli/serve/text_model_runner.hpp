@@ -54,7 +54,15 @@ struct TextRunnerRamCacheOptions {
   /// Explicit limits may exceed that budget up to the model's ceiling, which
   /// keeps kHostSnapshotHeadroomBytes of host RAM free.
   std::size_t capacity_bytes{0};
+  /// False keeps no RAM checkpoints and reserves no RAM-cache backing, and
+  /// capacity_bytes is ignored. Sessions still reuse their own live state.
+  bool enabled{true};
 };
+
+/// Parses a --cache-ram-bytes value: "off", or a byte count where 0 selects
+/// the automatic budget. Returns nullopt and sets `error` for anything else.
+[[nodiscard]] std::optional<TextRunnerRamCacheOptions> ParseRamCacheOption(
+    std::string_view text, std::string* error);
 
 struct TextRunnerDiskCacheOptions {
   static constexpr std::size_t kDefaultCapacityBytes =
@@ -150,6 +158,9 @@ struct TextRunnerDescriptor {
   std::uint32_t max_context{0};
   TextRunnerCapabilities capabilities;
   std::optional<TextRunnerPersistenceDescriptor> persistence;
+  /// Largest prompt step a lone request runs. Intermediate checkpoints sit on
+  /// its multiples so they never shorten a step; zero means unknown.
+  std::size_t prefill_step_tokens{0};
 };
 
 /// Optional byte claims made before state allocation.
@@ -367,6 +378,12 @@ public:
       return std::nullopt;
     return prompt->tokens.size();
   }
+  /// The text RenderAndTokenize tokenizes, or empty when the runner cannot
+  /// render its template as text.
+  [[nodiscard]] virtual std::optional<std::string> RenderPrompt(
+      const ChatRequest&) const {
+    return std::nullopt;
+  }
   /// Called before cache restoration, prefill or selection, including
   /// a complete prefix hit. Must replace, never inherit, the previous request.
   virtual void SetPromptContext(
@@ -424,6 +441,15 @@ public:
   /// the batched path cannot consume.
   virtual void PrepareBatchExecution(TextRunnerState& state) const {
     (void)state;
+  }
+  /// The next position at which the state will be decoded from, snapshotted
+  /// or shared. A runner whose draft reads a bounded window of target context
+  /// may omit that context for prompt positions the window will have left by
+  /// then. Applies to the next Prefill only.
+  virtual void SetDraftContextHorizon(TextRunnerState& state,
+                                      std::size_t position) const {
+    (void)state;
+    (void)position;
   }
   /// Processes at most max_input_tokens, yielding after one model-owned
   /// chunk even when the scheduler grants the whole remaining prompt.
