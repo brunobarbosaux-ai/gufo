@@ -13,6 +13,7 @@
 
 #include "src/core/sampling.hpp"
 #include "src/core/session_mode.hpp"
+#include "src/core/speculative/prompt_lookup.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 #include "src/models/qwen/vision/encoder.hpp"
 #include "src/models/qwen/vision/prompt.hpp"
@@ -20,13 +21,14 @@
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/mtp_policy.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
-#include "src/models/qwen38_flash_next/prompt_lookup.hpp"
 
 namespace gufo::core {
 class GgufReader;
 }
 
 namespace gufo::models::qwen38_flash_next {
+
+using core::speculative::PromptLookup;
 
 struct ModelWeights;
 struct MtpWeights;

@@ -1,11 +1,11 @@
-#include "src/models/qwen38_flash_next/prompt_lookup.hpp"
+#include "src/core/speculative/prompt_lookup.hpp"
 
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
 #include <vector>
 
-namespace qfn = gufo::models::qwen38_flash_next;
+namespace qfn = gufo::core::speculative;
 using Lookup = qfn::PromptLookup;
 
 void Require(bool condition, const char* message) {

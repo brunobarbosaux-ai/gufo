@@ -1,5 +1,5 @@
-#ifndef GUFO_MODELS_QWEN38_FLASH_NEXT_PROMPT_LOOKUP_HPP_
-#define GUFO_MODELS_QWEN38_FLASH_NEXT_PROMPT_LOOKUP_HPP_
+#ifndef GUFO_CORE_SPECULATIVE_PROMPT_LOOKUP_HPP_
+#define GUFO_CORE_SPECULATIVE_PROMPT_LOOKUP_HPP_
 
 #include <algorithm>
 #include <cstddef>
@@ -8,7 +8,7 @@
 #include <span>
 #include <vector>
 
-namespace gufo::models::qwen38_flash_next {
+namespace gufo::core::speculative {
 
 /// Prompt lookup: proposals copied from the session's own committed tokens.
 /// The drafter's context (committed tokens plus the cycle's chain so far)
@@ -318,6 +318,6 @@ private:
   std::size_t request_start_{kNoResume};
 };
 
-}  // namespace gufo::models::qwen38_flash_next
+}  // namespace gufo::core::speculative
 
-#endif  // GUFO_MODELS_QWEN38_FLASH_NEXT_PROMPT_LOOKUP_HPP_
+#endif  // GUFO_CORE_SPECULATIVE_PROMPT_LOOKUP_HPP_
