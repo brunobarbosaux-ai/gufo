@@ -43,6 +43,21 @@ do not establish upstream or original-checkpoint parity.
 - **Pre-existing chunk assertion.** The smoke `chunk` mode fails its
   chunk-vs-token cosine assertion at n=181 (cos 0.996) on the untouched
   baseline. It is not caused by later work and is not a gate failure.
+- **Pre-existing attention oracle failures.** Three qwen kernel-oracle tests
+  fail on the untouched baseline (verified on `feat/flint-p7` at `1663721b`,
+  before the strycast merge): `qwen_attention_fusion_ops_test` (fused FP16
+  KV-cache mismatch at 9728), `qwen_attention_long_context_ops_test`
+  (long-context decode mismatch), and `qwen_attention_kv_storage_ops_test`
+  (FP16 online/graph decode non-finite). The fused kernel and the test source
+  are identical on both branches, so the merge did not introduce them.
+- **Pre-existing kernel-resource budget.** `kernel_resources_test` reports
+  kernels over their scratch allowance on the untouched baseline
+  (`FlintMoeGroupedGateUpWmmaKernel<11/14>`, 32 B). The strycast merge adds
+  strycast's WMMA GEMM and `qfn_mmq::mul_mat_q` instantiations to the binary,
+  and the merged `quant_ops.hpp` adds 8 B to the two `MoeSlot*GemvKernel`s;
+  none of these are in the p7 baseline. Regenerate
+  `tools/ci/kernel-resources.json` from a release build before relying on the
+  gate.
 - **f16 KV** is opt-in. Its gates hold within the documented envelope
   (cos ≥ 0.995, token sequence holds), but it is not the default.
 - **Weights not redistributable.** Gates are reproducible only with the
