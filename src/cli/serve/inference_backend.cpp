@@ -43,6 +43,7 @@
 #include "src/core/hip/heap_placement.hpp"
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/hip/host_allocations.hpp"
+#include "src/core/speculative/prompt_lookup.hpp"
 #include "src/core/speculative/speculative_verifier.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
@@ -2335,6 +2336,8 @@ public:
   void Invalidate() noexcept override {
     position_ = 0;
     has_frontier_logits_ = false;
+    committed_.clear();
+    lookup_.Clear();
   }
 
   [[nodiscard]] TextRunnerMeasuredResources MeasuredResources()
@@ -2367,6 +2370,17 @@ public:
   }
   void mark_frontier() noexcept { has_frontier_logits_ = true; }
   void clear_frontier() noexcept { has_frontier_logits_ = false; }
+  /// Committed token history (prompt plus generated) that prompt lookup copies
+  /// from; it always holds exactly `position()` tokens while the state is live.
+  [[nodiscard]] std::vector<std::int32_t>& committed() noexcept {
+    return committed_;
+  }
+  [[nodiscard]] const std::vector<std::int32_t>& committed() const noexcept {
+    return committed_;
+  }
+  [[nodiscard]] gufo::core::speculative::PromptLookup& lookup() noexcept {
+    return lookup_;
+  }
 
 private:
   hip::FlintGpuArena arena_;
@@ -2375,6 +2389,8 @@ private:
   std::vector<float> logits_;
   std::size_t position_{0};
   bool has_frontier_logits_{false};
+  std::vector<std::int32_t> committed_;
+  gufo::core::speculative::PromptLookup lookup_;
 };
 
 /// Immutable host copy of one flint state at a checkpoint (5.3c): the fp32
@@ -2471,10 +2487,12 @@ public:
   FlintTextRunner(std::shared_ptr<const hip::FlintGpuModel> model,
                   std::shared_ptr<const tokenization::QwenTokenizer> tokenizer,
                   std::uint32_t max_context,
-                  std::string artifact_fingerprint = {})
+                  std::string artifact_fingerprint = {},
+                  bool lookup_speculation = false)
       : model_(std::move(model)),
         tokenizer_(std::move(tokenizer)),
-        max_context_(max_context) {
+        max_context_(max_context),
+        lookup_speculation_(lookup_speculation) {
     if (model_ == nullptr || tokenizer_ == nullptr) {
       throw std::invalid_argument(
           "the flint runner requires a model and a tokenizer");
@@ -2498,9 +2516,9 @@ public:
                 .incremental_prefill = true,
                 .snapshot = true,
                 .fork = true,
-                .final_token_advance_required = true,
+                .final_token_advance_required = !lookup_speculation_,
                 .incremental_text_is_exact = true,
-                .multi_token_decode = false,
+                .multi_token_decode = lookup_speculation_,
                 .batched_multi_token_decode = false,
                 .prefix_reuse = true,
                 .partial_prefill_retention = false,
@@ -2664,10 +2682,33 @@ public:
       }
     }
     flint.set_position(offset + consumed);
+    // Prompt-lookup history: a new request (offset 0) or a mismatched frontier
+    // rebuilds it from the prompt; otherwise the chunk appends.
+    if (offset == 0 || flint.committed().size() != offset) {
+      flint.committed().clear();
+      flint.committed().reserve(offset + consumed);
+      for (std::size_t i = 0; i < offset; ++i)
+        flint.committed().push_back(static_cast<std::int32_t>(prompt[i]));
+      flint.lookup().Clear();
+    }
+    for (std::size_t i = 0; i < consumed; ++i)
+      flint.committed().push_back(static_cast<std::int32_t>(prompt[offset + i]));
+    flint.lookup().Extend(flint.committed());
     return {
         .consumed_tokens = consumed,
         .decode_ready = last_chunk,
     };
+  }
+
+  void PreparePrefixReuse(TextRunnerState& state,
+                          std::span<const TextRunnerToken> prefix) const override {
+    auto& flint = RequireFlintState(state);
+    flint.committed().clear();
+    flint.committed().reserve(prefix.size());
+    for (const auto token : prefix)
+      flint.committed().push_back(static_cast<std::int32_t>(token));
+    flint.lookup().Clear();
+    flint.lookup().Extend(flint.committed());
   }
 
   [[nodiscard]] TextDecodeSelection SelectNext(
@@ -2705,6 +2746,123 @@ public:
                         hipMemcpyDeviceToHost));
     flint.mark_frontier();
     flint.set_position(flint.position() + 1);
+    flint.committed().push_back(static_cast<std::int32_t>(token));
+    flint.lookup().Extend(flint.committed());
+  }
+
+  [[nodiscard]] TextDecodeStep DecodeStep(
+      TextRunnerState& state, std::size_t max_tokens,
+      sampling::SamplerState& sampler) const override {
+    auto& flint = RequireFlintState(state);
+    // Speculation is greedy-only and needs room for an anchor plus a draft.
+    if (!lookup_speculation_ || max_tokens < 2 ||
+        !sampler.config().can_use_unmodified_argmax()) {
+      return TextModelRunner::DecodeStep(state, max_tokens, sampler);
+    }
+    if (flint.position() >= max_context_) {
+      return {.selections = {}, .stop = true};
+    }
+    if (!flint.has_frontier_logits()) {
+      throw std::logic_error("flint selection has no frontier logits");
+    }
+    constexpr std::size_t kMaxDraft = 8;
+    // Verify rows must stay inside the batched prefill's position cap.
+    std::size_t room = 0;
+    if (hip::FlintPrefillSupported(model_->GetWeights())) {
+      const std::size_t cap = hip::FlintPrefillPositionCap(max_context_);
+      if (flint.position() < cap) {
+        room = cap - flint.position();
+      }
+    }
+    const std::size_t chain_cap =
+        std::min<std::size_t>({max_tokens, kMaxDraft + 1, room});
+    const auto anchor = sampler.Sample(flint.logits());
+    if (flint.stop_at_eos() && tokenizer_->IsStopToken(anchor)) {
+      return {.selections = {}, .stop = true};
+    }
+    std::vector<std::uint32_t> chain;
+    chain.push_back(anchor);
+    std::size_t lookup_start = 0;
+    std::size_t lookup_proposed = 0;
+    // The first speculative step of a request copies nothing (PromptLookup).
+    const bool past_first_step = flint.lookup().Step(flint.position());
+    if (past_first_step && chain_cap >= 2) {
+      const std::int32_t anchor_i32 = static_cast<std::int32_t>(anchor);
+      const auto match = flint.lookup().Find(
+          flint.committed(), std::span<const std::int32_t>(&anchor_i32, 1),
+          gufo::core::speculative::PromptLookup::kMinMatch);
+      if (match.length != 0) {
+        const std::size_t available = std::min(
+            chain_cap - 1, flint.lookup().IndexedTokens() - match.start);
+        for (std::size_t i = 0; i < available; ++i) {
+          chain.push_back(static_cast<std::uint32_t>(
+              flint.committed()[match.start + i]));
+        }
+        lookup_start = match.start;
+        lookup_proposed = available;
+      }
+    }
+    if (chain.size() < 2) {
+      // No draft: a normal single-token step.
+      Advance(state, anchor);
+      return {.selections = {{.stop = false,
+                              .token = anchor,
+                              .piece = std::string(tokenizer_->DecodeToken(anchor))}}};
+    }
+    // Verify the chain through the batched prefill path.
+    hip::ExecuteFlintVerifyChunk(model_->GetWeights(), chain,
+                                 static_cast<std::uint32_t>(flint.position()),
+                                 flint.buffers(), flint.prefill_buffers());
+    HIP_CHECK(hipStreamSynchronize(flint.buffers().stream));
+    std::vector<std::uint32_t> verified(chain.size());
+    HIP_CHECK(hipMemcpy(verified.data(), flint.prefill_buffers().verify_tokens,
+                        chain.size() * sizeof(std::uint32_t),
+                        hipMemcpyDeviceToHost));
+    // Accept the longest prefix whose draft matches the verify argmax.
+    std::size_t keep = 1;
+    while (keep < chain.size() && verified[keep - 1] == chain[keep]) {
+      ++keep;
+    }
+    // keep >= 1: the anchor was checked for stop before the chain was built.
+    bool stop = false;
+    for (std::size_t i = 0; i < keep; ++i) {
+      if (flint.stop_at_eos() && tokenizer_->IsStopToken(chain[i])) {
+        keep = i;
+        stop = true;
+        break;
+      }
+    }
+    // The frontier is the verify row at the last accepted token; it predicts
+    // the next position (the deferred bonus token).
+    const std::size_t vocab = flint.logits().size();
+    HIP_CHECK(hipMemcpy(flint.logits().data(),
+                        flint.prefill_buffers().verify_logits +
+                            (keep - 1) * vocab,
+                        vocab * sizeof(float), hipMemcpyDeviceToHost));
+    flint.mark_frontier();
+    flint.set_position(flint.position() + keep);
+    for (std::size_t i = 0; i < keep; ++i) {
+      flint.committed().push_back(static_cast<std::int32_t>(chain[i]));
+    }
+    flint.lookup().Extend(flint.committed());
+    if (lookup_proposed != 0) {
+      flint.lookup().Observe(lookup_start, lookup_proposed, keep - 1);
+    }
+    TextDecodeStep step;
+    step.stop = stop;
+    step.selections.reserve(keep);
+    for (std::size_t i = 0; i < keep; ++i) {
+      step.selections.push_back(
+          {.stop = false,
+           .token = chain[i],
+           .piece = std::string(tokenizer_->DecodeToken(chain[i]))});
+    }
+    step.draft_rounds = 1;
+    step.draft_tokens = chain.size() - 1;
+    step.draft_accepted_tokens = keep - 1;
+    step.lookup_tokens = chain.size() - 1;
+    step.lookup_accepted_tokens = keep - 1;
+    return step;
   }
 
   [[nodiscard]] std::size_t CheckpointPosition(
@@ -2918,6 +3076,7 @@ private:
   std::shared_ptr<const hip::FlintGpuModel> model_;
   std::shared_ptr<const tokenization::QwenTokenizer> tokenizer_;
   std::uint32_t max_context_;
+  bool lookup_speculation_{false};
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
 };
 
@@ -3508,9 +3667,10 @@ private:
 std::shared_ptr<TextModelRunner> MakeFlintTextRunnerForTest(
     std::shared_ptr<const hip::FlintGpuModel> model,
     std::shared_ptr<const tokenization::QwenTokenizer> tokenizer,
-    std::uint32_t max_context) {
+    std::uint32_t max_context, bool lookup_speculation) {
   return std::make_shared<FlintTextRunner>(std::move(model), std::move(tokenizer),
-                                           max_context);
+                                           max_context, std::string{},
+                                           lookup_speculation);
 }
 
 std::vector<float> FlintFrontierLogitsForTest(const TextRunnerState& state) {
@@ -4089,9 +4249,13 @@ bool InferenceBackend::load(
     SetError(error, "HTTP session count must be at least one");
     return false;
   }
-  if (speculative_config.backend != TextSpeculativeBackend::kDisabled ||
-      !speculative_config.draft_model_path.empty()) {
-    SetError(error, "flint does not support speculative decoding");
+  if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
+      speculative_config.backend != TextSpeculativeBackend::kLookup) {
+    SetError(error, "flint supports only the lookup speculative backend");
+    return false;
+  }
+  if (!speculative_config.draft_model_path.empty()) {
+    SetError(error, "flint lookup speculation takes no draft model");
     return false;
   }
   if (DiskCacheEnabled(disk_cache_config) &&
@@ -4107,7 +4271,8 @@ bool InferenceBackend::load(
     new_state->sampling_defaults.supplied = {};
     auto runner = std::make_shared<FlintTextRunner>(
         std::move(model), std::move(tokenizer), max_context,
-        disk_cache_config.model_artifact_fingerprint);
+        disk_cache_config.model_artifact_fingerprint,
+        speculative_config.backend == TextSpeculativeBackend::kLookup);
     new_state->model_id = runner->Descriptor().model_id;
     new_state->max_context = max_context;
     std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;

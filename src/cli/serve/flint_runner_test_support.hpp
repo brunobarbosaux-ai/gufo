@@ -24,7 +24,7 @@ namespace gufo::server {
 std::shared_ptr<TextModelRunner> MakeFlintTextRunnerForTest(
     std::shared_ptr<const hip::FlintGpuModel> model,
     std::shared_ptr<const tokenization::QwenTokenizer> tokenizer,
-    std::uint32_t max_context);
+    std::uint32_t max_context, bool lookup_speculation = false);
 
 /// Test-only: copy of the frontier logits of a flint state, or empty when the
 /// state has no frontier.

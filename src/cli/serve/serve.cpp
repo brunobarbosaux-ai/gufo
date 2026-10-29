@@ -666,7 +666,7 @@ void PrintServeHelp(std::string_view program_name,
 
     // Speculative & Hardware
     parser.AddOption("", "--speculative", "MODE",
-                     "HTTP draft backend: dspark, dflash2, mtp, or off",
+                     "HTTP draft backend: dspark, dflash2, mtp, lookup, or off",
                      "Speculative", &speculative_backend);
     parser.AddOption("", "--dflash-model", "PATH",
                      "Path to Qwen DFlash2 GGUF file", "Speculative",
@@ -1217,7 +1217,7 @@ int RunServe(std::span<const char* const> args) {
         "(default: -1)",
         "Reasoning Defaults", &reasoning_budget);
     llm_parser.AddOption("", "--speculative", "MODE",
-                         "HTTP draft backend: dspark, dflash2, mtp, or off",
+                         "HTTP draft backend: dspark, dflash2, mtp, lookup, or off",
                          "Speculative", &speculative_backend);
     llm_parser.AddOption("", "--dflash-model", "PATH",
                          "Path to Qwen DFlash2 GGUF file", "Speculative",
@@ -1390,6 +1390,8 @@ int RunServe(std::span<const char* const> args) {
       speculative_config.backend = server::TextSpeculativeBackend::kDSpark;
     } else if (speculative_backend == "mtp") {
       speculative_config.backend = server::TextSpeculativeBackend::kMtp;
+    } else if (speculative_backend == "lookup") {
+      speculative_config.backend = server::TextSpeculativeBackend::kLookup;
     } else {
       std::cerr << "Error: speculative backend '" << speculative_backend
                 << "' is not supported by the HTTP server\n";
@@ -1416,6 +1418,8 @@ int RunServe(std::span<const char* const> args) {
             ? dspark_model_path
         : speculative_config.backend == server::TextSpeculativeBackend::kMtp
             ? mtp_model_path
+        : speculative_config.backend == server::TextSpeculativeBackend::kLookup
+            ? std::string{}
             : dflash_model_path;
     speculative_config.max_draft_tokens =
         static_cast<std::uint32_t>(draft_tokens);
@@ -1509,6 +1513,8 @@ int RunServe(std::span<const char* const> args) {
             ? "dspark"
         : speculative_config.backend == server::TextSpeculativeBackend::kMtp
             ? "mtp"
+        : speculative_config.backend == server::TextSpeculativeBackend::kLookup
+            ? "lookup"
             : "off";
     load_log.Complete(
         "model=" + backend->model_id() +

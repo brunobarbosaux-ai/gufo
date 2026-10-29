@@ -38,6 +38,7 @@ enum class TextSpeculativeBackend : std::uint8_t {
   kDFlash,
   kDSpark,
   kMtp,  ///< Qwen MTP draft block
+  kLookup,  ///< Flint prompt-lookup (no draft model)
 };
 
 struct TextSpeculativeConfig {
