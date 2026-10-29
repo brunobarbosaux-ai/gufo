@@ -84,6 +84,30 @@ void ProjectFromQ8(const models::QwenTensorRef& w, const void* q8_x,
                                      stream);
 }
 
+/// DFlash-2 target-layer tap (7.7): copies the post-layer residual rows into
+/// the capture buffer when `layer_idx` is one of the tapped layers. The
+/// destination is laid out [row][tap][hidden] (the draft's feature layout), so
+/// the tap's base is `features + tap * hidden` with row stride
+/// `target_layer_count * hidden`. A no-op when the capture is disabled.
+void CaptureTargetLayer(const FlintPrefillBuffers& prefill,
+                        std::uint32_t layer_idx, std::size_t rows,
+                        std::size_t hidden, hipStream_t stream) {
+  if (prefill.target_layer_features == nullptr ||
+      prefill.target_layer_ids == nullptr) {
+    return;
+  }
+  for (std::size_t tap = 0; tap < prefill.target_layer_count; ++tap) {
+    if (prefill.target_layer_ids[tap] == layer_idx) {
+      HIP_CHECK(hipMemcpy2DAsync(
+          prefill.target_layer_features + tap * hidden,
+          prefill.target_layer_count * hidden * sizeof(float), prefill.hidden,
+          hidden * sizeof(float), hidden * sizeof(float), rows,
+          hipMemcpyDeviceToDevice, stream));
+      return;
+    }
+  }
+}
+
 }  // namespace
 
 std::size_t FlintPrefillPositionCap(std::uint32_t max_context) {
@@ -544,6 +568,7 @@ void ExecuteFlintPrefillChunk(const models::FlintModelWeights& weights,
 
     LaunchBatchedResidualAdd(prefill.hidden, prefill.mlp_out, prefill.hidden, n,
                              hidden, stream);
+    CaptureTargetLayer(prefill, layer_idx, n, hidden, stream);
   }
 
   if (compute_logits) {

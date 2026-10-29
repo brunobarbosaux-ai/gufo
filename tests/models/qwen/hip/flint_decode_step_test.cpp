@@ -24,6 +24,7 @@
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/quant/ggml_dequant.hpp"
 #include "src/models/qwen/flint_forward.hpp"
+#include "src/models/qwen/forward.hpp"
 #include "src/models/qwen/hip/ops/attention.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/hip/ops/norm_residual.hpp"
@@ -519,6 +520,100 @@ void ProbeLayer0Ops(const gufo::models::FlintModelWeights& weights,
   HIP_CHECK(hipDeviceSynchronize());
 }
 
+// DFlash-2 target-layer capture (7.7): the decode step must copy the
+// post-layer residual after each tapped layer into the capture buffer, in tap
+// order. Compare against the CPU reference's per-layer hidden state.
+void TestTargetLayerCapture() {
+  HostStore store;
+  auto weights = BuildSyntheticWeights(store);
+  const std::uint32_t taps[2] = {0, 2};
+  const std::uint32_t token = 3;
+  const std::uint32_t pos = 0;
+
+  // CPU reference: embedding + every layer, capturing the tapped residuals.
+  gufo::models::QwenKvCache cpu_kv(weights.config.num_layers, kKvHeads,
+                                   kMaxContext, kHeadDim);
+  gufo::models::FlintScratchArena cpu_arena(weights.config);
+  gufo::models::ForwardEmbedding(token, weights.token_embd, kHidden,
+                                 cpu_arena.hidden);
+  std::vector<std::vector<float>> cpu_taps(2, std::vector<float>(kHidden));
+  for (std::uint32_t l = 0; l < weights.config.num_layers; ++l) {
+    gufo::models::FlintForwardLayer(cpu_arena.hidden, weights.layers[l],
+                                    weights.config, cpu_kv, l, pos, cpu_arena);
+    for (std::size_t t = 0; t < 2; ++t) {
+      if (taps[t] == l) {
+        std::copy(cpu_arena.hidden.begin(), cpu_arena.hidden.begin() + kHidden,
+                  cpu_taps[t].begin());
+      }
+    }
+  }
+
+  // GPU: same weights, fresh KV cache, capture enabled.
+  std::vector<void*> allocs;
+  const auto device_weights = ToDeviceModel(weights, allocs);
+  gufo::hip::FlintGpuStepBuffers buffers;
+  const std::size_t kv_elems = static_cast<std::size_t>(
+                                   weights.config.num_layers) *
+                               kKvHeads * kMaxContext * kHeadDim;
+  buffers.hidden = AllocDevice(kHidden, allocs);
+  buffers.normed = AllocDevice(kHidden, allocs);
+  buffers.q = AllocDevice(kHeads * kHeadDim, allocs);
+  buffers.k = AllocDevice(kKvHeads * kHeadDim, allocs);
+  buffers.v = AllocDevice(kKvHeads * kHeadDim, allocs);
+  buffers.attn_out = AllocDevice(kHeads * kHeadDim, allocs);
+  buffers.attn_proj = AllocDevice(kHidden, allocs);
+  buffers.act = AllocDevice(kIntermediate, allocs);
+  buffers.act_gate = AllocDevice(kIntermediate, allocs);
+  buffers.expert_out = AllocDevice(kHidden, allocs);
+  buffers.mlp_out = AllocDevice(kHidden, allocs);
+  buffers.router_logits = AllocDevice(kExperts, allocs);
+  buffers.logits = AllocDevice(kVocab, allocs);
+  buffers.k_cache = AllocDevice(kv_elems, allocs);
+  buffers.v_cache = AllocDevice(kv_elems, allocs);
+  buffers.max_context = kMaxContext;
+  std::vector<std::size_t> kv_layer_base(weights.config.num_layers);
+  std::vector<std::uint32_t> kv_layer_rows(weights.config.num_layers,
+                                           kMaxContext);
+  for (std::uint32_t l = 0; l < weights.config.num_layers; ++l) {
+    kv_layer_base[l] = static_cast<std::size_t>(l) * kKvHeads * kMaxContext *
+                       kHeadDim;
+  }
+  buffers.kv_layer_base = kv_layer_base.data();
+  buffers.kv_layer_rows = kv_layer_rows.data();
+  HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&buffers.selected),
+                      8 * sizeof(std::uint32_t)));
+  allocs.push_back(buffers.selected);
+  buffers.expert_weights = AllocDevice(8, allocs);
+  HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&buffers.d_out_token),
+                      sizeof(std::uint32_t)));
+  allocs.push_back(buffers.d_out_token);
+
+  float* capture = AllocDevice(2 * kHidden, allocs);
+  buffers.target_layer_features = capture;
+  buffers.target_layer_ids = taps;
+  buffers.target_layer_count = 2;
+
+  gufo::hip::ExecuteFlintDecodeStep(device_weights, token, pos,
+                                    /*compute_logits=*/false, buffers);
+  HIP_CHECK(hipGetLastError());
+  HIP_CHECK(hipDeviceSynchronize());
+  std::vector<float> gpu_capture(2 * kHidden, 0.0F);
+  HIP_CHECK(hipMemcpy(gpu_capture.data(), capture,
+                      gpu_capture.size() * sizeof(float),
+                      hipMemcpyDeviceToHost));
+  for (std::size_t t = 0; t < 2; ++t) {
+    for (std::uint32_t i = 0; i < kHidden; ++i) {
+      const float diff =
+          std::abs(gpu_capture[t * kHidden + i] - cpu_taps[t][i]);
+      Expect(diff <= 1e-3F * std::max(1.0F, std::abs(cpu_taps[t][i])),
+             "capture tap " + std::to_string(t) + " element " +
+                 std::to_string(i) + " differs by " + std::to_string(diff));
+    }
+  }
+  std::cout << "target-layer capture ok (taps 0,2 match the CPU residual)\n";
+  for (void* p : allocs) HIP_CHECK(hipFree(p));
+}
+
 int main(int argc, char** argv) {
   if (argc > 1 && std::string_view(argv[1]) == "probe") {
     HostStore probe_store;
@@ -675,8 +770,10 @@ int main(int argc, char** argv) {
                       hipMemcpyDeviceToHost));
   Expect(unchanged == saved, "compute_logits=false must not write logits");
 
+  TestTargetLayerCapture();
+
   std::cout << "flint_decode_step_test ok (3 tokens CPU/GPU parity + "
-               "no-logits step)\n";
+               "no-logits step + target-layer capture)\n";
   for (void* p : allocs) HIP_CHECK(hipFree(p));
   return 0;
 }

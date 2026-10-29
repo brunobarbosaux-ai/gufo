@@ -65,6 +65,17 @@ struct FlintGpuStepBuffers {
   /// Null when the flag is off, which keeps the legacy attention route.
   float* attn_splitkv_scratch = nullptr;
 
+  /// DFlash-2 target-layer capture (7.7): device buffer of
+  /// target_layer_count * hidden floats, one row per tapped layer, filled with
+  /// the post-layer residual after each tapped layer. Null when DFlash is off,
+  /// which keeps the step a no-op (no kernel, no copy) and the captured graph
+  /// byte-identical to the non-DFlash one.
+  float* target_layer_features = nullptr;
+  /// Host array of tapped layer ids (ascending); the tap index is the position
+  /// in this array. Null/empty when DFlash is off.
+  const std::uint32_t* target_layer_ids = nullptr;
+  std::size_t target_layer_count = 0;
+
   float* k_cache = nullptr;
   float* v_cache = nullptr;
   /// Token-major f16 twin planes (GUFO_FLINT_KV_F16, default on): written

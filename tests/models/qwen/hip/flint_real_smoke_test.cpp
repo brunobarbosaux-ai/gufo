@@ -1220,7 +1220,7 @@ void RunChunkParity(const gufo::hip::FlintGpuModel& model,
          "chunk parity prompt exceeds one chunk");
 
   gufo::hip::FlintGpuArena arena(config, max_context);
-  const auto buffers = arena.GetBuffers();
+  auto buffers = arena.GetBuffers();
   const auto prefill = arena.GetPrefillBuffers();
   std::vector<float> chunk_logits(config.vocab_size);
   std::vector<float> token_logits(config.vocab_size);
@@ -1276,6 +1276,18 @@ void RunChunkParity(const gufo::hip::FlintGpuModel& model,
               << " ms, norm/rope/kvwrite+launch ~" << noattn_attn << " ms\n";
   }
 
+  // DFlash-2 target-layer capture (7.7): enable the decode capture for the
+  // token-by-token pass so the graph path is exercised, then compare the
+  // chunked prefill's capture against it below.
+  const std::uint32_t capture_taps[2] = {6, 16};
+  const std::size_t capture_hidden = config.hidden_size;
+  float* d_decode_capture = nullptr;
+  HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&d_decode_capture),
+                      2 * capture_hidden * sizeof(float)));
+  buffers.target_layer_features = d_decode_capture;
+  buffers.target_layer_ids = capture_taps;
+  buffers.target_layer_count = 2;
+
   // Token-by-token reference over the same positions.
   // GUFO_FLINT_DECODE_SYNC=N: sync every N decode steps. Queue-accumulation
   // discriminator for the G6 graph-replay hang (0/unset = no sync, the
@@ -1297,6 +1309,46 @@ void RunChunkParity(const gufo::hip::FlintGpuModel& model,
   HIP_CHECK(hipMemcpy(token_logits.data(), buffers.logits,
                       token_logits.size() * sizeof(float),
                       hipMemcpyDeviceToHost));
+
+  // The chunked prefill must capture the same post-layer residuals as the
+  // token-by-token decode, laid out [row][tap][hidden]. The decode buffer
+  // holds the last token's taps; compare the chunk's last row against it.
+  {
+    float* d_prefill_capture = nullptr;
+    HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&d_prefill_capture),
+                        n * 2 * capture_hidden * sizeof(float)));
+    auto capture_prefill = prefill;
+    capture_prefill.target_layer_features = d_prefill_capture;
+    capture_prefill.target_layer_ids = capture_taps;
+    capture_prefill.target_layer_count = 2;
+    gufo::hip::ExecuteFlintPrefillChunk(model.GetWeights(), tokens, 0,
+                                        /*compute_logits=*/false, buffers,
+                                        capture_prefill);
+    HIP_CHECK(hipStreamSynchronize(buffers.stream));
+    std::vector<float> decode_taps(2 * capture_hidden);
+    std::vector<float> prefill_last(2 * capture_hidden);
+    HIP_CHECK(hipMemcpy(decode_taps.data(), d_decode_capture,
+                        decode_taps.size() * sizeof(float),
+                        hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(prefill_last.data(),
+                        d_prefill_capture + (n - 1) * 2 * capture_hidden,
+                        prefill_last.size() * sizeof(float),
+                        hipMemcpyDeviceToHost));
+    double capture_max = 0.0, capture_scale = 0.0;
+    for (std::size_t i = 0; i < decode_taps.size(); ++i) {
+      capture_max = std::max(
+          capture_max,
+          std::abs(static_cast<double>(decode_taps[i]) - prefill_last[i]));
+      capture_scale =
+          std::max(capture_scale, std::abs(static_cast<double>(decode_taps[i])));
+    }
+    std::cout << "  dflash capture: chunk-vs-token max_abs=" << capture_max
+              << " scale=" << capture_scale << "\n";
+    Expect(capture_max <= 0.05 * std::max(1.0, capture_scale),
+           "chunk prefill capture disagrees with the token-by-token capture");
+    HIP_CHECK(hipFree(d_prefill_capture));
+  }
+  HIP_CHECK(hipFree(d_decode_capture));
 
   // Chunk boundary: half the tokens, then the other half.
   const std::size_t half = n / 2;

@@ -79,6 +79,25 @@ void RunSwiGLU(const models::QwenTensorRef& gate,
          t == core::GgmlType::kIQ4_XS || t == core::GgmlType::kIQ3_S;
 }
 
+/// DFlash-2 target-layer tap (7.7): copies the post-layer residual into the
+/// capture buffer when `layer_idx` is one of the tapped layers. A no-op when
+/// the capture is disabled (null buffer), so the decode step's launch shape is
+/// unchanged with DFlash off — and the captured graph stays byte-identical.
+void CaptureTargetLayer(const FlintGpuStepBuffers& b, std::uint32_t layer_idx,
+                        std::size_t hidden_size) {
+  if (b.target_layer_features == nullptr || b.target_layer_ids == nullptr) {
+    return;
+  }
+  for (std::size_t tap = 0; tap < b.target_layer_count; ++tap) {
+    if (b.target_layer_ids[tap] == layer_idx) {
+      HIP_CHECK(hipMemcpyAsync(b.target_layer_features + tap * hidden_size,
+                               b.hidden, hidden_size * sizeof(float),
+                               hipMemcpyDeviceToDevice, b.stream));
+      return;
+    }
+  }
+}
+
 void RunFlintLayer(const models::FlintModelWeights& weights,
                    const models::FlintLayerWeights& layer,
                    std::uint32_t layer_idx, std::uint32_t pos,
@@ -223,6 +242,7 @@ void RunFlintLayer(const models::FlintModelWeights& weights,
     LaunchGEMVResidual(layer.ffn_down.data, layer.ffn_down.type, b.act,
                        b.hidden, hidden_size, config.intermediate_size,
                        b.stream);
+    CaptureTargetLayer(b, layer_idx, hidden_size);
     mark(6);
     mark(7);
     return;
@@ -294,6 +314,7 @@ void RunFlintLayer(const models::FlintModelWeights& weights,
                             used + 1, config.expert_count,
                             expert_ff, shared_ff, hidden_size,
                             down_slab_bytes, b.stream);
+    CaptureTargetLayer(b, layer_idx, hidden_size);
     mark(6);
     mark(7);
     return;
@@ -337,6 +358,7 @@ void RunFlintLayer(const models::FlintModelWeights& weights,
                               b.stream);
   mark(6);
   LaunchResidualAdd(b.hidden, b.mlp_out, b.hidden, hidden_size, b.stream);
+  CaptureTargetLayer(b, layer_idx, hidden_size);
   mark(7);
 }
 

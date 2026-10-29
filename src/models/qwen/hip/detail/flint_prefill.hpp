@@ -87,6 +87,16 @@ struct FlintPrefillBuffers {
   std::uint32_t* verify_tokens = nullptr;  ///< [kFlintVerifyMaxTokens] argmax token per verified row
   float* verify_logits = nullptr;  ///< [kFlintVerifyMaxTokens, vocab_size] per-row logits
 
+  /// DFlash-2 target-layer capture (7.7): device buffer of
+  /// batch_capacity * target_layer_count * hidden floats, laid out
+  /// [row][tap][hidden] (the draft's feature layout). Null when DFlash is off,
+  /// which keeps the prefill a no-op.
+  float* target_layer_features = nullptr;
+  /// Host array of tapped layer ids (ascending); the tap index is the position
+  /// in this array. Null/empty when DFlash is off.
+  const std::uint32_t* target_layer_ids = nullptr;
+  std::size_t target_layer_count = 0;
+
   void* q8_act = nullptr;     ///< tiled Q8_1 activation staging
   void* q8_normed = nullptr;  ///< tiled Q8_1 of normed (shared by all readers)
   void* slot_q8 = nullptr;    ///< tiled Q8_1 gathered to slot order
