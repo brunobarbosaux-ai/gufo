@@ -2371,7 +2371,9 @@ public:
   void mark_frontier() noexcept { has_frontier_logits_ = true; }
   void clear_frontier() noexcept { has_frontier_logits_ = false; }
   /// Committed token history (prompt plus generated) that prompt lookup copies
-  /// from; it always holds exactly `position()` tokens while the state is live.
+  /// from. It holds the tokens committed since the last Prefill,
+  /// PreparePrefixReuse, or restore; a restore clears it, and it is rebuilt
+  /// from the prompt on the next reuse.
   [[nodiscard]] std::vector<std::int32_t>& committed() noexcept {
     return committed_;
   }
@@ -2943,6 +2945,10 @@ public:
       flint.logits() = typed->frontier_logits;
       flint.mark_frontier();
     }
+    // The snapshot does not carry the token history; drop it so the next
+    // Prefill/PreparePrefixReuse rebuilds it from the prompt.
+    flint.committed().clear();
+    flint.lookup().Clear();
   }
 
   [[nodiscard]] std::size_t PersistentSnapshotPayloadBytes(

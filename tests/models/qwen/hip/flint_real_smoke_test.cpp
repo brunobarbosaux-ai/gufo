@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <map>
@@ -1788,6 +1789,82 @@ void RunVerifyExactness(
   std::cout << "\n";
 }
 
+/// 7.6 rollback proof: a verify chunk writes KV rows for every draft token,
+/// but a rejected suffix leaves those rows stale. The next decode must not
+/// read them. Arena A verifies all k draft rows, arena B verifies only the
+/// j accepted rows; a decode at P+j must then be bit-identical in both,
+/// because it reads only [0, P+j).
+void RunRollbackCheck(const gufo::hip::FlintGpuModel& model,
+                      const std::vector<gufo::tokenization::TokenId>& prompt_tokens,
+                      std::uint32_t max_context) {
+  const auto& config = model.GetConfig();
+  const std::size_t vocab = config.vocab_size;
+  constexpr std::size_t kPrefix = 16;
+  constexpr std::size_t kDraft = 8;  // k: verify chunk size
+  constexpr std::size_t kAccept = 3;  // j: accepted rows before rejection
+  Expect(prompt_tokens.size() >= kPrefix + kDraft,
+         "rollback prompt must tokenize to at least 24 tokens");
+
+  const std::vector<std::uint32_t> prefix(
+      prompt_tokens.begin(), prompt_tokens.begin() + kPrefix);
+  const std::vector<std::uint32_t> draft(
+      prompt_tokens.begin() + kPrefix,
+      prompt_tokens.begin() + kPrefix + kDraft);
+  const auto P = static_cast<std::uint32_t>(prefix.size());
+
+  gufo::hip::FlintGpuArena arena_a(config, max_context);
+  gufo::hip::FlintGpuArena arena_b(config, max_context);
+  const auto buf_a = arena_a.GetBuffers();
+  const auto buf_b = arena_b.GetBuffers();
+  const auto pre_a = arena_a.GetPrefillBuffers();
+  const auto pre_b = arena_b.GetPrefillBuffers();
+
+  gufo::hip::ExecuteFlintPrefillChunk(model.GetWeights(), prefix, 0,
+                                      /*compute_logits=*/false, buf_a, pre_a);
+  gufo::hip::ExecuteFlintPrefillChunk(model.GetWeights(), prefix, 0,
+                                      /*compute_logits=*/false, buf_b, pre_b);
+  HIP_CHECK(hipStreamSynchronize(buf_a.stream));
+  HIP_CHECK(hipStreamSynchronize(buf_b.stream));
+
+  // Arena A: verify all k rows (stale rows [P+j, P+k) remain afterwards).
+  gufo::hip::ExecuteFlintVerifyChunk(model.GetWeights(), draft, P, buf_a,
+                                     pre_a);
+  gufo::hip::ExecuteFlintDecodeStep(
+      model.GetWeights(), draft[kAccept], P + kAccept,
+      /*compute_logits=*/true, buf_a, nullptr, arena_a.GetGraphState());
+
+  // Arena B: verify only the j accepted rows, then decode at the same spot.
+  gufo::hip::ExecuteFlintVerifyChunk(
+      model.GetWeights(),
+      std::span<const std::uint32_t>(draft.data(), kAccept), P, buf_b, pre_b);
+  gufo::hip::ExecuteFlintDecodeStep(
+      model.GetWeights(), draft[kAccept], P + kAccept,
+      /*compute_logits=*/true, buf_b, nullptr, arena_b.GetGraphState());
+
+  HIP_CHECK(hipStreamSynchronize(buf_a.stream));
+  HIP_CHECK(hipStreamSynchronize(buf_b.stream));
+  std::vector<float> logits_a(vocab);
+  std::vector<float> logits_b(vocab);
+  HIP_CHECK(hipMemcpy(logits_a.data(), buf_a.logits, vocab * sizeof(float),
+                      hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(logits_b.data(), buf_b.logits, vocab * sizeof(float),
+                      hipMemcpyDeviceToHost));
+
+  if (std::memcmp(logits_a.data(), logits_b.data(), vocab * sizeof(float)) !=
+      0) {
+    for (std::size_t v = 0; v < vocab; ++v) {
+      if (std::memcmp(&logits_a[v], &logits_b[v], sizeof(float)) != 0) {
+        std::cout << "rollback: first diff at index " << v << " a="
+                  << logits_a[v] << " b=" << logits_b[v] << "\n";
+        break;
+      }
+    }
+    Expect(false, "rollback: decode after rejected verify is not bit-exact");
+  }
+  std::cout << "rollback: k=" << kDraft << " j=" << kAccept
+            << " bit-exact PASS\n";
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1820,7 +1897,9 @@ int main(int argc, char** argv) {
   bool probe = mode == "probe";
   const bool chunk = mode == "chunk";
   const bool verify = mode == "verify";
-  if (!mode.empty() && !probe && !chunk && !verify && mode != "keycount")
+  const bool rollback = mode == "rollback";
+  if (!mode.empty() && !probe && !chunk && !verify && !rollback &&
+      mode != "keycount")
     max_context = static_cast<std::uint32_t>(std::atoi(argv[1]));
   if (argc > 2) steps = static_cast<std::uint32_t>(std::atoi(argv[2]));
   Expect(steps > 0, "steps must be positive");
@@ -1893,6 +1972,15 @@ int main(int argc, char** argv) {
 
   if (verify) {
     RunVerifyExactness(*gpu_model, prompt_tokens, max_context);
+    return 0;
+  }
+
+  if (rollback) {
+    // The default prompt is too short for the 16+8 split; use a long one.
+    std::vector<gufo::tokenization::TokenId> rollback_tokens = tokenizer->Encode(
+        "The quick brown fox jumps over the lazy dog. The quick brown fox "
+        "jumps over the lazy dog. The quick brown fox jumps over the lazy dog.");
+    RunRollbackCheck(*gpu_model, rollback_tokens, max_context);
     return 0;
   }
 
