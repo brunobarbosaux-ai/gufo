@@ -185,7 +185,8 @@ FlintKvWindowClass FlintGpuArena::WindowClass() const noexcept {
 }
 
 FlintGpuArena::FlintGpuArena(const core::ModelConfig& config,
-                             std::uint32_t max_context)
+                             std::uint32_t max_context,
+                             std::span<const std::uint32_t> target_layer_ids)
     : config_(config), max_context_(max_context) {
   const std::size_t hidden_size = config.hidden_size;
   const std::size_t attention_size =
@@ -200,6 +201,12 @@ FlintGpuArena::FlintGpuArena(const core::ModelConfig& config,
       FlintArenaPlaneElements(config, max_context, &kv_layer_base_,
                               &kv_layer_rows_);
   kv_plane_elements_ = plane;
+
+  // DFlash-2 target-layer taps (7.7): the decode step captures one residual
+  // row per tap, the prefill captures one per (row, tap). Both buffers are
+  // null when no taps are requested, so the non-DFlash paths are unchanged.
+  target_layer_ids_.assign(target_layer_ids.begin(), target_layer_ids.end());
+  const std::size_t target_layer_count = target_layer_ids_.size();
 
   // Split-KV decode scratch (GUFO_FLINT_ATTN_SPLITKV, default ON): sized
   // from max_context so the graph-captured launch never reallocates. Set
@@ -228,6 +235,7 @@ FlintGpuArena::FlintGpuArena(const core::ModelConfig& config,
        config.expert_shared_feed_forward_length) +  // act_moe (F-J1 fused)
       config.vocab_size +  // logits
       plane * 2 +  // k/v cache
+      target_layer_count * hidden_size +  // DFlash-2 decode capture
       splitkv_floats;  // split-KV attention scratch (flag-gated)
   scratch_bytes_ = scratch_floats * sizeof(float) +
                    8 * sizeof(std::uint32_t);  // selected experts
@@ -263,6 +271,11 @@ FlintGpuArena::FlintGpuArena(const core::ModelConfig& config,
   buffers_.logits = alloc(config.vocab_size);
   buffers_.k_cache = alloc(plane);
   buffers_.v_cache = alloc(plane);
+  if (target_layer_count != 0) {
+    buffers_.target_layer_features = alloc(target_layer_count * hidden_size);
+    buffers_.target_layer_ids = target_layer_ids_.data();
+    buffers_.target_layer_count = target_layer_count;
+  }
   // f16 KV twin planes (GUFO_FLINT_KV_F16, default OFF while the serve's
   // multi-request determinism issue is open — see the f16-KV investigation
   // notes; =1 opts in): token-major layout, same element count as one
@@ -312,7 +325,8 @@ FlintGpuArena::FlintGpuArena(const core::ModelConfig& config,
       cap * (hidden_size * 5 + attention_size * 2 + kv_size * 2 +
              ffn_act * 2 + config.expert_count + used) +
       slots * (1 + config.expert_feed_forward_length * 2 + hidden_size) +
-      kFlintVerifyMaxTokens * config.vocab_size;
+      kFlintVerifyMaxTokens * config.vocab_size +
+      cap * target_layer_count * hidden_size;  // DFlash-2 prefill capture
   const std::size_t prefill_ints =
       cap +  // d_tokens staging
       cap * used +  // selected
@@ -350,6 +364,12 @@ FlintGpuArena::FlintGpuArena(const core::ModelConfig& config,
   prefill_.up_slots = prefill_alloc(slots * config.expert_feed_forward_length);
   prefill_.down_slots = prefill_alloc(slots * hidden_size);
   prefill_.verify_logits = prefill_alloc(kFlintVerifyMaxTokens * config.vocab_size);
+  if (target_layer_count != 0) {
+    prefill_.target_layer_features =
+        prefill_alloc(cap * target_layer_count * hidden_size);
+    prefill_.target_layer_ids = target_layer_ids_.data();
+    prefill_.target_layer_count = target_layer_count;
+  }
 
   int* prefill_int_block = nullptr;
   HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&prefill_int_block),
@@ -403,10 +423,13 @@ FlintGpuArena::FlintGpuArena(FlintGpuArena&& other) noexcept
       kv_layer_base_(std::move(other.kv_layer_base_)),
       kv_layer_rows_(std::move(other.kv_layer_rows_)),
       kv_plane_elements_(other.kv_plane_elements_),
+      target_layer_ids_(std::move(other.target_layer_ids_)),
       buffers_(other.buffers_),
       prefill_(other.prefill_) {
   buffers_.kv_layer_base = kv_layer_base_.data();
   buffers_.kv_layer_rows = kv_layer_rows_.data();
+  buffers_.target_layer_ids = target_layer_ids_.data();
+  prefill_.target_layer_ids = target_layer_ids_.data();
   other.scratch_bytes_ = 0;
   other.kv_plane_elements_ = 0;
   other.buffers_ = {};
@@ -425,10 +448,13 @@ FlintGpuArena& FlintGpuArena::operator=(FlintGpuArena&& other) noexcept {
     kv_layer_base_ = std::move(other.kv_layer_base_);
     kv_layer_rows_ = std::move(other.kv_layer_rows_);
     kv_plane_elements_ = other.kv_plane_elements_;
+    target_layer_ids_ = std::move(other.target_layer_ids_);
     buffers_ = other.buffers_;
     buffers_.kv_layer_base = kv_layer_base_.data();
     buffers_.kv_layer_rows = kv_layer_rows_.data();
+    buffers_.target_layer_ids = target_layer_ids_.data();
     prefill_ = other.prefill_;
+    prefill_.target_layer_ids = target_layer_ids_.data();
     other.scratch_bytes_ = 0;
     other.kv_plane_elements_ = 0;
     other.buffers_ = {};

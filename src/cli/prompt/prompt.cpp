@@ -1126,8 +1126,8 @@ int RunPrompt(std::span<const char* const> args) {
     if (!core::ValidateFlintOptions(
             !opt.vision_model_path.empty() || !opt.image_paths.empty(),
             !opt.speculative_backend.empty(),
-            /*speculative_lookup=*/false, !opt.mtp_model_path.empty(),
-            !opt.dflash_model_path.empty(), !opt.dspark_model_path.empty(),
+            /*speculative_lookup=*/false, /*speculative_dflash=*/false,
+            !opt.mtp_model_path.empty(), !opt.dspark_model_path.empty(),
             &flint_err)) {
       std::cerr << "Error: " << flint_err << "\n";
       return 1;

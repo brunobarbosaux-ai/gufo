@@ -718,7 +718,8 @@ void TestExpertWeightScaleRoutedOnly() {
   std::cout << "TestExpertWeightScaleRoutedOnly ok\n";
 }
 
-// F-B3/F-B4: the option gate rejects every drafting/vision flag, naming it.
+// F-B3/F-B4: the option gate rejects every unsupported drafting/vision flag,
+// naming it, and admits the lookup and DFlash2 speculative backends.
 void TestFlintOptionGate() {
   std::string err;
   Expect(gufo::core::ValidateFlintOptions(false, false, false, false, false, false, &err),
@@ -728,15 +729,10 @@ void TestFlintOptionGate() {
          "--mmproj rejected");
   Expect(err.find("--mmproj") != std::string::npos, "names --mmproj: " + err);
   err.clear();
-  Expect(!gufo::core::ValidateFlintOptions(false, false, false, true, false, false, &err),
+  Expect(!gufo::core::ValidateFlintOptions(false, false, false, false, true, false, &err),
          "--mtp-model rejected");
   Expect(err.find("--mtp-model") != std::string::npos,
          "names --mtp-model: " + err);
-  err.clear();
-  Expect(!gufo::core::ValidateFlintOptions(false, false, false, false, true, false, &err),
-         "--dflash-model rejected");
-  Expect(err.find("--dflash-model") != std::string::npos,
-         "names --dflash-model: " + err);
   err.clear();
   Expect(!gufo::core::ValidateFlintOptions(false, false, false, false, false, true, &err),
          "--dspark-model rejected");
@@ -750,6 +746,9 @@ void TestFlintOptionGate() {
   err.clear();
   Expect(gufo::core::ValidateFlintOptions(false, true, true, false, false, false, &err),
          "--speculative lookup accepted");
+  err.clear();
+  Expect(gufo::core::ValidateFlintOptions(false, true, false, true, false, false, &err),
+         "--speculative dflash2 accepted");
   std::cout << "TestFlintOptionGate ok\n";
 }
 

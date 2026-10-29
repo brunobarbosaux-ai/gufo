@@ -52,6 +52,7 @@
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/flint_gpu_model.hpp"
+#include "src/models/qwen/hip/flint_speculative_target.hpp"
 #include "src/models/qwen38_flash_next/continuation_adapter.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
 #endif
@@ -2326,12 +2327,34 @@ constexpr std::string_view kFlintStateAbi = "flint-kv-f32-v2";
 
 class FlintTextRunnerState final : public TextRunnerState {
 public:
-  FlintTextRunnerState(const hip::FlintGpuModel& model,
-                       std::uint32_t max_context)
-      : arena_(model.GetConfig(), max_context),
+  FlintTextRunnerState(
+      const hip::FlintGpuModel& model,
+      std::shared_ptr<const tokenization::QwenTokenizer> tokenizer,
+      std::uint32_t max_context,
+      std::shared_ptr<const hip::QwenDFlashGpuModel> dflash_model,
+      speculative::SpeculativeOptions options)
+      : arena_(model.GetConfig(), max_context,
+               dflash_model != nullptr
+                   ? dflash_model->GetDFlashConfig().target_layer_ids
+                   : std::span<const std::uint32_t>{}),
         buffers_(arena_.GetBuffers()),
         prefill_(arena_.GetPrefillBuffers()),
-        logits_(model.GetConfig().vocab_size, 0.0F) {}
+        tokenizer_(std::move(tokenizer)),
+        logits_(model.GetConfig().vocab_size, 0.0F) {
+    if (dflash_model != nullptr) {
+      target_ = std::make_unique<hip::FlintGpuSpeculativeTarget>(
+          model, arena_, tokenizer_);
+      auto draft = hip::QwenDFlashGpuDraftBackend::Create(
+          std::move(dflash_model),
+          hip::QwenDFlashGpuDraftConfig{
+              .max_context = max_context,
+              .max_draft_tokens = options.max_draft_tokens,
+              .policy = options.dflash_policy});
+      draft_backend_ = draft.get();
+      verifier_ = std::make_unique<speculative::SpeculativeVerifier>(
+          *target_, std::move(draft), options);
+    }
+  }
 
   void Invalidate() noexcept override {
     position_ = 0;
@@ -2339,6 +2362,9 @@ public:
     has_rollback_ = false;
     committed_.clear();
     lookup_.Clear();
+    if (verifier_ != nullptr) {
+      verifier_->Reset();
+    }
   }
 
   [[nodiscard]] TextRunnerMeasuredResources MeasuredResources()
@@ -2359,6 +2385,10 @@ public:
   [[nodiscard]] const hip::FlintPrefillBuffers& prefill_buffers()
       const noexcept {
     return prefill_;
+  }
+  /// DFlash-2 verifier (7.7); null when the runner is not speculative.
+  [[nodiscard]] speculative::SpeculativeVerifier* verifier() noexcept {
+    return verifier_.get();
   }
   [[nodiscard]] std::size_t position() const noexcept { return position_; }
   void set_position(std::size_t position) noexcept { position_ = position; }
@@ -2400,10 +2430,217 @@ public:
     return rollback_logits_;
   }
 
+  /// True when this state drives the DFlash-2 verifier (7.7).
+  [[nodiscard]] bool speculative() const noexcept {
+    return verifier_ != nullptr;
+  }
+
+  /// Primes the DFlash verifier with the whole prompt and records the first
+  /// target token. Mirrors QwenTextRunnerState::PrimeSpeculative.
+  void PrimeSpeculative(std::span<const TextRunnerToken> prompt,
+                        bool decode_ready) {
+    if (verifier_ == nullptr) {
+      throw std::logic_error("flint state has no speculative verifier");
+    }
+    frontier_ = verifier_->Prime(prompt, decode_ready);
+    position_ = prompt.size();
+    sequence_.assign(prompt.begin(), prompt.end());
+    committed_.assign(prompt.begin(), prompt.end());
+    lookup_.Clear();
+    lookup_.Extend(committed_);
+    frontier_published_ = false;
+    has_frontier_logits_ = false;
+    if (decode_ready) {
+      const auto logits = verifier_->CopyLastTargetLogits();
+      logits_.assign(logits.begin(), logits.end());
+      has_frontier_logits_ = true;
+    }
+  }
+
+  void ExtendSpeculative(std::span<const TextRunnerToken> suffix,
+                         bool decode_ready) {
+    if (verifier_ == nullptr) {
+      throw std::logic_error("flint state has no speculative verifier");
+    }
+    frontier_ = verifier_->ExtendPrompt(
+        suffix, static_cast<std::uint32_t>(position_), decode_ready);
+    position_ += suffix.size();
+    sequence_.insert(sequence_.end(), suffix.begin(), suffix.end());
+    for (const auto token : suffix) {
+      committed_.push_back(static_cast<std::int32_t>(token));
+    }
+    lookup_.Extend(committed_);
+    frontier_published_ = false;
+    has_frontier_logits_ = false;
+    if (decode_ready) {
+      const auto logits = verifier_->CopyLastTargetLogits();
+      logits_.assign(logits.begin(), logits.end());
+      has_frontier_logits_ = true;
+    }
+  }
+
+  /// Starts a new request on a retained prefix: resets the draft controller
+  /// without discarding the retained target/draft KV.
+  void BeginSpeculativeRequest(std::span<const TextRunnerToken> prefix) {
+    if (verifier_ == nullptr) {
+      return;
+    }
+    verifier_->BeginRequest();
+    sequence_.assign(prefix.begin(), prefix.end());
+    frontier_published_ = false;
+  }
+
+  [[nodiscard]] TextDecodeStep DecodeSpeculative(
+      std::size_t max_tokens, sampling::SamplerState& sampler) {
+    TextDecodeStep result;
+    sampling::SamplerState working_sampler = sampler;
+    if (PrepareSpeculativeDecode(max_tokens, working_sampler, result)) {
+      const auto request = VerificationRequest(
+          max_tokens - result.selections.size(), working_sampler);
+      auto verification = verifier_->VerifyStep(
+          sequence_, request.position, request.current_token, request.eos_id,
+          request.max_emitted_tokens, working_sampler);
+      FinishSpeculativeDecode(std::move(verification), working_sampler, result);
+    }
+    sampler.SetRngState(working_sampler.rng_state());
+    return result;
+  }
+
+  /// Rewinds a cancelled speculative block to its pre-step frontier. The
+  /// verifier saved the target state at the block start, so restoring the
+  /// position and discarding the draft's pending features is enough.
+  void PrepareCancellationSpeculative() {
+    if (verifier_ == nullptr || !has_rollback_) {
+      return;
+    }
+    if (rollback_tokens_.empty() || rollback_logits_.empty()) {
+      throw std::logic_error(
+          "flint cancelled verification has no exact frontier");
+    }
+    draft_backend_->DiscardPendingTargetContext(
+        static_cast<std::uint32_t>(rollback_position_));
+    target_->RestoreState();
+    target_->FinishVerification();
+    position_ = rollback_position_;
+    sequence_.resize(position_);
+    committed_.resize(position_);
+    lookup_.Clear();
+    lookup_.Extend(committed_);
+    logits_ = std::move(rollback_logits_);
+    has_frontier_logits_ = true;
+    frontier_ = rollback_tokens_.front();
+    frontier_published_ = false;
+    clear_rollback();
+  }
+
 private:
+  [[nodiscard]] TextRunnerToken SelectFrontier(
+      sampling::SamplerState& sampler) const {
+    if (!has_frontier_logits_) {
+      throw std::logic_error("flint state has no next-token frontier");
+    }
+    if (sampler.config().can_use_unmodified_argmax()) {
+      if (!frontier_.has_value()) {
+        throw std::logic_error("flint state has no retained frontier token");
+      }
+      return *frontier_;
+    }
+    return sampler.Sample(logits_);
+  }
+
+  [[nodiscard]] bool PrepareSpeculativeDecode(
+      std::size_t max_tokens, sampling::SamplerState& sampler,
+      TextDecodeStep& result) {
+    if (verifier_ == nullptr || !has_frontier_logits_) {
+      throw std::logic_error("flint speculative state has no frontier");
+    }
+    if (max_tokens == 0) {
+      throw std::invalid_argument(
+          "flint speculative decode budget must be at least one token");
+    }
+    if (!frontier_published_) {
+      if (!sampler.config().can_use_unmodified_argmax()) {
+        frontier_ = SelectFrontier(sampler);
+      }
+      if (!AppendSpeculativeSelection(*frontier_, sampler, result)) {
+        return false;
+      }
+      frontier_published_ = true;
+    }
+    return result.selections.size() < max_tokens;
+  }
+
+  [[nodiscard]] speculative::SpeculativeVerifier::StepRequest
+  VerificationRequest(std::size_t remaining, sampling::SamplerState& sampler) {
+    rollback_position_ = position_;
+    has_rollback_ = true;
+    rollback_tokens_.assign(1, *frontier_);
+    rollback_logits_ = logits_;
+    return {*verifier_,
+            sequence_,
+            static_cast<std::uint32_t>(position_),
+            *frontier_,
+            tokenizer_->GetEosTokenId(),
+            static_cast<std::uint32_t>(std::min<std::size_t>(
+                remaining, std::numeric_limits<std::uint32_t>::max())),
+            sampler};
+  }
+
+  void FinishSpeculativeDecode(
+      speculative::SpeculativeVerifier::StepResult verification,
+      sampling::SamplerState& sampler, TextDecodeStep& result) {
+    result.draft_rounds = verification.draft_count > 0 ? 1 : 0;
+    result.draft_tokens = verification.draft_count;
+    result.draft_accepted_tokens = verification.accepted_count;
+    result.execution_plan = {
+        .kind = verification.physical_width > 1
+                    ? TextExecutionPlanKind::kBatched
+                    : TextExecutionPlanKind::kSerial,
+        .physical_width = verification.physical_width,
+    };
+    for (const TextRunnerToken token : verification.emitted_tokens) {
+      ++position_;
+      if (!AppendSpeculativeSelection(token, sampler, result)) {
+        break;
+      }
+      rollback_tokens_.push_back(token);
+    }
+    frontier_ = verification.next_token;
+    logits_ = std::move(verification.next_token_logits);
+    has_frontier_logits_ = !logits_.empty();
+    frontier_published_ = !result.stop;
+    if (verification.draft_count == 0) {
+      clear_rollback();
+    }
+  }
+
+  bool AppendSpeculativeSelection(TextRunnerToken token,
+                                  sampling::SamplerState& sampler,
+                                  TextDecodeStep& result) {
+    if (stop_at_eos() && tokenizer_->IsStopToken(token)) {
+      result.stop = true;
+      return false;
+    }
+    result.selections.push_back({
+        .stop = false,
+        .token = token,
+        .piece = std::string(tokenizer_->DecodeToken(token)),
+    });
+    sequence_.push_back(token);
+    committed_.push_back(static_cast<std::int32_t>(token));
+    lookup_.Extend(committed_);
+    sampler.Accept(token);
+    return true;
+  }
+
   hip::FlintGpuArena arena_;
   hip::FlintGpuStepBuffers buffers_{};
   hip::FlintPrefillBuffers prefill_{};
+  std::shared_ptr<const tokenization::QwenTokenizer> tokenizer_;
+  std::unique_ptr<hip::FlintGpuSpeculativeTarget> target_;
+  std::unique_ptr<speculative::SpeculativeVerifier> verifier_;
+  /// Borrowed from the verifier (which owns it); used for cancellation.
+  hip::QwenDFlashGpuDraftBackend* draft_backend_{nullptr};
   std::vector<float> logits_;
   std::size_t position_{0};
   bool has_frontier_logits_{false};
@@ -2412,6 +2649,11 @@ private:
   std::size_t rollback_position_{0};
   bool has_rollback_{false};
   std::vector<float> rollback_logits_;
+  /// Speculative (DFlash-2) state, mirroring QwenTextRunnerState.
+  std::vector<tokenization::TokenId> sequence_;
+  std::optional<TextRunnerToken> frontier_;
+  bool frontier_published_{false};
+  std::vector<TextRunnerToken> rollback_tokens_;
 };
 
 /// Immutable host copy of one flint state at a checkpoint (5.3c): the fp32
@@ -2509,11 +2751,16 @@ public:
                   std::shared_ptr<const tokenization::QwenTokenizer> tokenizer,
                   std::uint32_t max_context,
                   std::string artifact_fingerprint = {},
-                  bool lookup_speculation = false)
+                  bool lookup_speculation = false,
+                  std::shared_ptr<const hip::QwenDFlashGpuModel> dflash_model =
+                      nullptr,
+                  speculative::SpeculativeOptions speculative_options = {})
       : model_(std::move(model)),
         tokenizer_(std::move(tokenizer)),
         max_context_(max_context),
-        lookup_speculation_(lookup_speculation) {
+        lookup_speculation_(lookup_speculation),
+        dflash_model_(std::move(dflash_model)),
+        speculative_options_(speculative_options) {
     if (model_ == nullptr || tokenizer_ == nullptr) {
       throw std::invalid_argument(
           "the flint runner requires a model and a tokenizer");
@@ -2537,9 +2784,11 @@ public:
                 .incremental_prefill = true,
                 .snapshot = true,
                 .fork = true,
-                .final_token_advance_required = !lookup_speculation_,
+                .final_token_advance_required = !lookup_speculation_ &&
+                                               dflash_model_ == nullptr,
                 .incremental_text_is_exact = true,
-                .multi_token_decode = lookup_speculation_,
+                .multi_token_decode =
+                    lookup_speculation_ || dflash_model_ != nullptr,
                 .batched_multi_token_decode = false,
                 .prefix_reuse = true,
                 .partial_prefill_retention = false,
@@ -2613,7 +2862,8 @@ public:
   }
 
   [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
-    return std::make_unique<FlintTextRunnerState>(*model_, max_context_);
+    return std::make_unique<FlintTextRunnerState>(
+        *model_, tokenizer_, max_context_, dflash_model_, speculative_options_);
   }
 
   [[nodiscard]] TextPrefillStep Prefill(
@@ -2633,6 +2883,18 @@ public:
       throw std::invalid_argument("flint prompt exceeds the served context");
     }
     flint.clear_rollback();
+    if (flint.speculative()) {
+      if (consumed == 0) {
+        throw std::logic_error("flint speculative prefill has no input");
+      }
+      const bool decode_ready = offset + consumed == prompt.size();
+      if (offset == 0) {
+        flint.PrimeSpeculative(prompt.first(consumed), decode_ready);
+      } else {
+        flint.ExtendSpeculative(prompt.subspan(offset, consumed), decode_ready);
+      }
+      return {.consumed_tokens = consumed, .decode_ready = decode_ready};
+    }
     const bool last_chunk = offset + consumed == prompt.size();
     // Chunked prefill (F-L4): the whole chunk runs the batched layer stack,
     // which amortises weight reads and kernel launches over its tokens. It is
@@ -2732,6 +2994,7 @@ public:
       flint.committed().push_back(static_cast<std::int32_t>(token));
     flint.lookup().Clear();
     flint.lookup().Extend(flint.committed());
+    flint.BeginSpeculativeRequest(prefix);
   }
 
   [[nodiscard]] TextDecodeSelection SelectNext(
@@ -2756,6 +3019,10 @@ public:
 
   void Advance(TextRunnerState& state, TextRunnerToken token) const override {
     auto& flint = RequireFlintState(state);
+    if (flint.speculative()) {
+      throw std::logic_error(
+          "flint DFlash decoding requires a multi-token decode step");
+    }
     if (flint.position() >= max_context_) {
       throw std::logic_error("flint decode exceeds the served context");
     }
@@ -2775,6 +3042,10 @@ public:
 
   void PrepareCancellation(TextRunnerState& state) const override {
     auto& flint = RequireFlintState(state);
+    if (flint.speculative()) {
+      flint.PrepareCancellationSpeculative();
+      return;
+    }
     if (!flint.has_rollback()) return;
     // A cancelled speculative block may have advanced past the tokens the
     // client actually received. Rewind to the block's start so the committed
@@ -2792,6 +3063,9 @@ public:
       TextRunnerState& state, std::size_t max_tokens,
       sampling::SamplerState& sampler) const override {
     auto& flint = RequireFlintState(state);
+    if (flint.speculative()) {
+      return flint.DecodeSpeculative(max_tokens, sampler);
+    }
     // Record the pre-step frontier so a cancelled step can be rewound to a
     // position the next request's prompt is guaranteed to share. The
     // multi-token path advances the state before the scheduler publishes the
@@ -3127,6 +3401,8 @@ private:
   std::shared_ptr<const tokenization::QwenTokenizer> tokenizer_;
   std::uint32_t max_context_;
   bool lookup_speculation_{false};
+  std::shared_ptr<const hip::QwenDFlashGpuModel> dflash_model_;
+  speculative::SpeculativeOptions speculative_options_{};
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
 };
 
@@ -3966,8 +4242,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
             speculative_config.backend != TextSpeculativeBackend::kDisabled ||
                 !speculative_config.draft_model_path.empty(),
             speculative_config.backend == TextSpeculativeBackend::kLookup,
-            /*has_mtp_model=*/false, /*has_dflash_model=*/false,
-            /*has_dspark_model=*/false, &flint_err)) {
+            speculative_config.backend == TextSpeculativeBackend::kDFlash,
+            /*has_mtp_model=*/false, /*has_dspark_model=*/false, &flint_err)) {
       SetError(error, flint_err);
       return false;
     }
@@ -4301,12 +4577,22 @@ bool InferenceBackend::load(
     return false;
   }
   if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
-      speculative_config.backend != TextSpeculativeBackend::kLookup) {
-    SetError(error, "flint supports only the lookup speculative backend");
+      speculative_config.backend != TextSpeculativeBackend::kLookup &&
+      speculative_config.backend != TextSpeculativeBackend::kDFlash) {
+    SetError(error,
+             "flint supports only the lookup and DFlash speculative backends");
     return false;
   }
-  if (!speculative_config.draft_model_path.empty()) {
+  if (speculative_config.backend != TextSpeculativeBackend::kDFlash &&
+      !speculative_config.draft_model_path.empty()) {
     SetError(error, "flint lookup speculation takes no draft model");
+    return false;
+  }
+  if (speculative_config.backend == TextSpeculativeBackend::kDFlash &&
+      speculative_config.min_draft_tokens != 1) {
+    SetError(error,
+             "DFlash2 requires --min-draft-tokens 1; bound blocks with "
+             "--draft-tokens");
     return false;
   }
   if (DiskCacheEnabled(disk_cache_config) &&
@@ -4317,13 +4603,49 @@ bool InferenceBackend::load(
   }
 
   try {
+    std::shared_ptr<const hip::QwenDFlashGpuModel> dflash_model;
+    speculative::SpeculativeOptions speculative_options;
+    if (speculative_config.backend == TextSpeculativeBackend::kDFlash) {
+      if (speculative_config.draft_model_path.empty()) {
+        SetError(error, "DFlash HTTP decoding requires --dflash-model");
+        return false;
+      }
+      std::string dflash_error;
+      auto dflash_reader_owner = core::GgufReader::OpenFile(
+          speculative_config.draft_model_path, &dflash_error);
+      if (dflash_reader_owner == nullptr) {
+        SetError(error, "Failed to open DFlash GGUF: " + dflash_error);
+        return false;
+      }
+      std::shared_ptr<const core::GgufReader> dflash_reader(
+          std::move(dflash_reader_owner));
+      Logger::Info("loader", "event=load_phase phase=draft_weights " +
+                                 Logger::MemoryStatus());
+      dflash_model = hip::QwenDFlashGpuModel::Create(std::move(dflash_reader),
+                                                     model, &dflash_error);
+      if (dflash_model == nullptr) {
+        SetError(error, "Failed to create DFlash model: " + dflash_error);
+        return false;
+      }
+      speculative_options.dflash_policy = speculative_config.dflash_policy;
+      speculative_options.max_draft_tokens =
+          speculative_config.max_draft_tokens;
+      speculative_options.min_draft_tokens =
+          speculative_config.min_draft_tokens;
+      speculative_options.initial_draft_tokens =
+          speculative_config.max_draft_tokens;
+      speculative_options.use_batched_verification = true;
+      speculative_options.retain_frontier_logits = true;
+      speculative_options.enable_adaptive_draft_length = false;
+    }
     auto new_state = std::make_shared<Impl::State>();
     new_state->sampling_defaults.model = sampling::TextModelPreset::kFlint;
     new_state->sampling_defaults.supplied = {};
     auto runner = std::make_shared<FlintTextRunner>(
         std::move(model), std::move(tokenizer), max_context,
         disk_cache_config.model_artifact_fingerprint,
-        speculative_config.backend == TextSpeculativeBackend::kLookup);
+        speculative_config.backend == TextSpeculativeBackend::kLookup,
+        std::move(dflash_model), speculative_options);
     new_state->model_id = runner->Descriptor().model_id;
     new_state->max_context = max_context;
     std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;

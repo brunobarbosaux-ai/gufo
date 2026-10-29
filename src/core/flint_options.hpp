@@ -25,14 +25,15 @@ inline constexpr std::uint32_t kFlintRingContextCap = 262144;
 }
 
 /// Closes every runtime option the flint architecture cannot serve (F-B3,
-/// F-B4): no MTP/nextn, no DFlash2, no DSpark drafting, and no vision
-/// projector. Callers pass exactly what the CLI received so each rejection
-/// names the offending flag; the first violation is reported.
+/// F-B4): no MTP/nextn, no DSpark drafting, and no vision projector. DFlash2
+/// drafting is served (7.7) through the flint speculative target. Callers pass
+/// exactly what the CLI received so each rejection names the offending flag;
+/// the first violation is reported.
 [[nodiscard]] inline bool ValidateFlintOptions(bool has_mmproj,
                                                bool speculative_requested,
                                                bool speculative_lookup,
+                                               bool speculative_dflash,
                                                bool has_mtp_model,
-                                               bool has_dflash_model,
                                                bool has_dspark_model,
                                                std::string* error_msg) {
   const auto reject = [error_msg](const std::string& message) {
@@ -50,20 +51,15 @@ inline constexpr std::uint32_t kFlintRingContextCap = 262144;
     return reject(
         "flint has no MTP/nextn layers; --mtp-model is not supported");
   }
-  if (has_dflash_model) {
-    return reject(
-        "flint does not support --dflash-model: DFlash2 drafting is closed "
-        "for this architecture");
-  }
   if (has_dspark_model) {
     return reject(
         "flint does not support --dspark-model: DSpark drafting is closed "
         "for this architecture");
   }
-  if (speculative_requested && !speculative_lookup) {
+  if (speculative_requested && !speculative_lookup && !speculative_dflash) {
     return reject(
-        "flint does not support --speculative: autoregressive-only build "
-        "(only the lookup backend is available)");
+        "flint does not support --speculative: only the lookup and DFlash2 "
+        "backends are available");
   }
   return true;
 }

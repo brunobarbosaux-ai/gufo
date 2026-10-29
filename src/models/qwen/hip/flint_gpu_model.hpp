@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -90,7 +91,8 @@ struct FlintKvWindowClass {
 class FlintGpuArena {
  public:
   explicit FlintGpuArena(const core::ModelConfig& config,
-                         std::uint32_t max_context = 4096);
+                         std::uint32_t max_context = 4096,
+                         std::span<const std::uint32_t> target_layer_ids = {});
   ~FlintGpuArena();
 
   FlintGpuArena(const FlintGpuArena&) = delete;
@@ -152,6 +154,9 @@ class FlintGpuArena {
   std::vector<std::size_t> kv_layer_base_;
   std::vector<std::uint32_t> kv_layer_rows_;
   std::size_t kv_plane_elements_{0};
+  /// DFlash-2 target-layer taps (7.7). Empty when DFlash is off, which leaves
+  /// the capture buffers null and the decode/prefill paths unchanged.
+  std::vector<std::uint32_t> target_layer_ids_;
   FlintGpuStepBuffers buffers_{};
   FlintPrefillBuffers prefill_{};
   FlintDecodeGraphState graph_state_{};
