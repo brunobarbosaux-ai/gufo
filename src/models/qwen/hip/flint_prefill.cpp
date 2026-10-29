@@ -521,10 +521,16 @@ void ExecuteFlintPrefillChunk(const models::FlintModelWeights& weights,
                                     hidden) &&
           !debug_force_scalar;
       if (wmma_route) {
-        const std::size_t tile_bound = prefill.slot_capacity / 16;
+        // The scratch is sized for a full 2048-token chunk, but a verify
+        // chunk carries only n*used slots. Bound the tile grid and the
+        // slot-wide elementwise passes by the actual slot count so a small
+        // chunk does not sweep the whole 16k-slot scratch (7.7).
+        const std::size_t tile_bound =
+            std::min(prefill.slot_capacity / 16, slots);
+        const std::size_t slot_bound = tile_bound * 16;
         LaunchFlintGatherQ8Act(prefill.q8_normed, prefill.slot_q8,
                                prefill.slot_tokens, prefill.expert_offsets,
-                               config.expert_count, prefill.slot_capacity,
+                               config.expert_count, slot_bound,
                                hidden, stream);
         LaunchFlintMoeGroupedGateUpWmma(
             layer.ffn_gate_exps.data, layer.ffn_up_exps.data,
@@ -534,11 +540,11 @@ void ExecuteFlintPrefillChunk(const models::FlintModelWeights& weights,
             config.expert_count, expert_ff, hidden, slab_gate, stream);
         LaunchBatchedSwiGLUActivation(prefill.act_slots, prefill.up_slots,
                                       prefill.act_slots, nullptr,
-                                      prefill.slot_capacity * expert_ff,
+                                      slot_bound * expert_ff,
                                       stream);
         LaunchQuantizeActivationQ8_1FromFp32(prefill.act_slots,
                                              prefill.act_q8,
-                                             prefill.slot_capacity, expert_ff,
+                                             slot_bound, expert_ff,
                                              stream);
         LaunchFlintMoeGroupedDownWmma(
             layer.ffn_down_exps.data, layer.ffn_down_exps.type,
