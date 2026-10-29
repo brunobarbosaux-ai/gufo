@@ -2336,6 +2336,7 @@ public:
   void Invalidate() noexcept override {
     position_ = 0;
     has_frontier_logits_ = false;
+    has_rollback_ = false;
     committed_.clear();
     lookup_.Clear();
   }
@@ -2383,6 +2384,21 @@ public:
   [[nodiscard]] gufo::core::speculative::PromptLookup& lookup() noexcept {
     return lookup_;
   }
+  /// Pre-block frontier of the last speculative block. A cancelled block may
+  /// have advanced past the tokens the client received, so PrepareCancellation
+  /// rewinds to this position (mirrors the Qwen MTP runner).
+  [[nodiscard]] bool has_rollback() const noexcept { return has_rollback_; }
+  void set_rollback(std::size_t position) {
+    rollback_position_ = position;
+    has_rollback_ = true;
+  }
+  [[nodiscard]] std::size_t rollback_position() const noexcept {
+    return rollback_position_;
+  }
+  void clear_rollback() noexcept { has_rollback_ = false; }
+  [[nodiscard]] std::vector<float>& rollback_logits() noexcept {
+    return rollback_logits_;
+  }
 
 private:
   hip::FlintGpuArena arena_;
@@ -2393,6 +2409,9 @@ private:
   bool has_frontier_logits_{false};
   std::vector<std::int32_t> committed_;
   gufo::core::speculative::PromptLookup lookup_;
+  std::size_t rollback_position_{0};
+  bool has_rollback_{false};
+  std::vector<float> rollback_logits_;
 };
 
 /// Immutable host copy of one flint state at a checkpoint (5.3c): the fp32
@@ -2613,6 +2632,7 @@ public:
     if (offset + consumed > max_context_) {
       throw std::invalid_argument("flint prompt exceeds the served context");
     }
+    flint.clear_rollback();
     const bool last_chunk = offset + consumed == prompt.size();
     // Chunked prefill (F-L4): the whole chunk runs the batched layer stack,
     // which amortises weight reads and kernel launches over its tokens. It is
@@ -2705,6 +2725,7 @@ public:
   void PreparePrefixReuse(TextRunnerState& state,
                           std::span<const TextRunnerToken> prefix) const override {
     auto& flint = RequireFlintState(state);
+    flint.clear_rollback();
     flint.committed().clear();
     flint.committed().reserve(prefix.size());
     for (const auto token : prefix)
@@ -2752,10 +2773,32 @@ public:
     flint.lookup().Extend(flint.committed());
   }
 
+  void PrepareCancellation(TextRunnerState& state) const override {
+    auto& flint = RequireFlintState(state);
+    if (!flint.has_rollback()) return;
+    // A cancelled speculative block may have advanced past the tokens the
+    // client actually received. Rewind to the block's start so the committed
+    // checkpoint is a prefix the next request's prompt shares.
+    flint.set_position(flint.rollback_position());
+    flint.committed().resize(flint.rollback_position());
+    flint.lookup().Clear();
+    flint.lookup().Extend(flint.committed());
+    flint.logits() = flint.rollback_logits();
+    flint.mark_frontier();
+    flint.clear_rollback();
+  }
+
   [[nodiscard]] TextDecodeStep DecodeStep(
       TextRunnerState& state, std::size_t max_tokens,
       sampling::SamplerState& sampler) const override {
     auto& flint = RequireFlintState(state);
+    // Record the pre-step frontier so a cancelled step can be rewound to a
+    // position the next request's prompt is guaranteed to share. The
+    // multi-token path advances the state before the scheduler publishes the
+    // tokens, so a disconnect mid-publish would otherwise leave the committed
+    // checkpoint ahead of the client's received content.
+    flint.set_rollback(flint.position());
+    flint.rollback_logits() = flint.logits();
     // Speculation is greedy-only and needs room for an anchor plus a draft.
     if (!lookup_speculation_ || max_tokens < 2 ||
         !sampler.config().can_use_unmodified_argmax()) {
@@ -2939,6 +2982,7 @@ public:
                              buffers.stream));
     HIP_CHECK(hipStreamSynchronize(buffers.stream));
     flint.set_position(typed->position);
+    flint.clear_rollback();
     if (typed->frontier_logits.empty()) {
       flint.clear_frontier();
     } else {
