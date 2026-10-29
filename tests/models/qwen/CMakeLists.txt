@@ -24,6 +24,10 @@ add_qwen_cpu_test(qwen_flint_weights_test
   tests/models/qwen/flint_weights_test.cpp
   "cpu;models;qwen;flint;weights")
 
+add_qwen_cpu_test(qwen_dflash_weights_test
+  tests/models/qwen/dflash_weights_test.cpp
+  "cpu;models;qwen;dflash;weights")
+
 add_qwen_cpu_test(qwen_flint_attention_test
   tests/models/qwen/cpu/flint_attention_test.cpp
   "cpu;models;qwen;flint;attention")

@@ -160,6 +160,11 @@ std::optional<QwenDFlashWeights> QwenDFlashWeights::LoadFromGguf(
           values[0] <= std::numeric_limits<std::uint32_t>::max() / 2U) {
         rotary_dim = static_cast<std::uint32_t>(values[0] * 2U);
       }
+    } else if (head_dim.has_value()) {
+      // llama.cpp parity: a draft that omits the rotary dimension entirely
+      // rotates the full head. The Flint DFlash-2 export carries only
+      // dflash.rope.freq_base, so default to the head dimension.
+      rotary_dim = *head_dim;
     }
   }
   const auto context_length =
