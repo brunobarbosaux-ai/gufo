@@ -445,6 +445,10 @@ def cmd_g5_verdict(args):
 
 def cmd_g8(args):
     cfg = engine_config(args.engine)
+    if args.base_url:
+        cfg["base"] = args.base_url
+    if args.model:
+        cfg["model"] = args.model
     prompt = [{"role": "user", "content":
                "Count from one to twenty as digits, comma separated."}]
     for sessions in range(1, args.sessions + 1):
@@ -584,6 +588,11 @@ def main():
 
     p = sub.add_parser("g8")
     p.add_argument("--engine", choices=("oracle", "serve"), default="serve")
+    p.add_argument("--base-url", default=None,
+                   help="override the engine base URL (default: the "
+                        "llama-swap test gateway)")
+    p.add_argument("--model", default=None,
+                   help="override the served model id")
     p.add_argument("--sessions", type=int, default=8)
     p.add_argument("--max-tokens", type=int, default=384)
     p.add_argument("--gate", action="store_true",
