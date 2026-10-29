@@ -3,6 +3,7 @@
 
 #include "src/core/model_config.hpp"
 #include "src/models/qwen/state.hpp"
+#include "src/models/qwen/tokenizer.hpp"
 
 namespace gufo::hip {
 
@@ -16,6 +17,8 @@ class DFlashTargetWeights {
   virtual ~DFlashTargetWeights() = default;
 
   [[nodiscard]] virtual const core::ModelConfig& GetConfig() const noexcept = 0;
+  [[nodiscard]] virtual const tokenization::QwenTokenizer& GetTokenizer()
+      const noexcept = 0;
   [[nodiscard]] virtual const models::QwenTensorRef& GetTokenEmbedding()
       const noexcept = 0;
   [[nodiscard]] virtual const models::QwenTensorRef& GetOutputHead()

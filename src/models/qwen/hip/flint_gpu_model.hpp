@@ -28,6 +28,7 @@ class FlintGpuModel : public DFlashTargetWeights {
  public:
   FlintGpuModel(std::shared_ptr<const core::GgufReader> reader,
                 models::FlintModelWeights weights,
+                std::shared_ptr<const tokenization::QwenTokenizer> tokenizer,
                 std::vector<QwenGpuWeightRegion> weight_regions);
   ~FlintGpuModel();
 
@@ -49,6 +50,10 @@ class FlintGpuModel : public DFlashTargetWeights {
   [[nodiscard]] const core::ModelConfig& GetConfig() const noexcept override {
     return weights_.config;
   }
+  [[nodiscard]] const tokenization::QwenTokenizer& GetTokenizer()
+      const noexcept override {
+    return *tokenizer_;
+  }
   [[nodiscard]] const models::QwenTensorRef& GetTokenEmbedding()
       const noexcept override {
     return weights_.token_embd;
@@ -65,6 +70,7 @@ class FlintGpuModel : public DFlashTargetWeights {
  private:
   std::shared_ptr<const core::GgufReader> reader_;
   models::FlintModelWeights weights_;
+  std::shared_ptr<const tokenization::QwenTokenizer> tokenizer_;
   std::vector<QwenGpuWeightRegion> weight_regions_;
 };
 

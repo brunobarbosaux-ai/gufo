@@ -14,12 +14,15 @@ namespace gufo::hip {
 /// One F32 or BF16 row of FastGEMVBlockKernel: the whole block computes
 /// y[m] = A[m, :] . x with blockDim.x threads (at most 16 waves). Kernels
 /// that fuse this GEMV with other work call it so the arithmetic stays the
-/// same.
+/// same. `residual` (optional) is added to the row in the same expression as
+/// the store: callers may pass the output buffer itself, and the load must
+/// precede the store.
 __device__ __forceinline__ void FastGEMVBlockRow(const void* __restrict__ A,
                                                  core::GgmlType a_type,
                                                  const float* __restrict__ x,
                                                  float* __restrict__ y,
-                                                 std::size_t m, std::size_t K) {
+                                                 std::size_t m, std::size_t K,
+                                                 const float* __restrict__ residual = nullptr) {
   const std::size_t tid = threadIdx.x;
   const std::size_t lane_id = tid & 31u;
   const std::size_t warp_id = tid >> 5u;
@@ -85,8 +88,7 @@ __device__ __forceinline__ void FastGEMVBlockRow(const void* __restrict__ A,
       block_sum += __shfl_xor(block_sum, offset);
     }
     if (lane_id == 0) {
-      const float r = 0.0F;
-      y[m] = block_sum + r;
+      y[m] = block_sum + (residual != nullptr ? residual[m] : 0.0F);
     }
   }
 }

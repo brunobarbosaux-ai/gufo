@@ -81,10 +81,7 @@ __global__ void FastGEMVBlockKernel(const void* __restrict__ A,
     return;
   const float* x = x_rows + (static_cast<std::size_t>(blockIdx.y) * K);
   float* y = y_rows + (static_cast<std::size_t>(blockIdx.y) * M);
-  FastGEMVBlockRow(A, a_type, x, y, m, K);
-  if (residual != nullptr && threadIdx.x == 0) {
-    y[m] += residual[m];
-  }
+  FastGEMVBlockRow(A, a_type, x, y, m, K, residual);
 }
 
 namespace {

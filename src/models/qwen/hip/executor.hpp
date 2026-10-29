@@ -113,7 +113,7 @@ public:
     return weights_;
   }
   [[nodiscard]] const tokenization::QwenTokenizer& GetTokenizer()
-      const noexcept {
+      const noexcept override {
     return *tokenizer_;
   }
   [[nodiscard]] const core::ModelConfig& GetConfig() const noexcept override {

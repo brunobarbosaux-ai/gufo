@@ -15,9 +15,11 @@ namespace gufo::hip {
 
 FlintGpuModel::FlintGpuModel(std::shared_ptr<const core::GgufReader> reader,
                              models::FlintModelWeights weights,
+                             std::shared_ptr<const tokenization::QwenTokenizer> tokenizer,
                              std::vector<QwenGpuWeightRegion> weight_regions)
     : reader_(std::move(reader)),
       weights_(std::move(weights)),
+      tokenizer_(std::move(tokenizer)),
       weight_regions_(std::move(weight_regions)) {}
 
 FlintGpuModel::~FlintGpuModel() {
@@ -49,6 +51,11 @@ std::shared_ptr<const FlintGpuModel> FlintGpuModel::CreateFromGguf(
     return nullptr;
   }
 
+  auto tokenizer =
+      tokenization::QwenTokenizer::CreateFromGguf(*reader, error_msg);
+  if (!tokenizer)
+    return nullptr;
+
   std::vector<QwenGpuWeightRegion> weight_regions;
   if (!detail::CreateWeightRegions(*reader, weight_regions, error_msg)) {
     return nullptr;
@@ -79,8 +86,11 @@ std::shared_ptr<const FlintGpuModel> FlintGpuModel::CreateFromGguf(
     return nullptr;
   }
 
+  std::shared_ptr<const tokenization::QwenTokenizer> shared_tokenizer(
+      std::move(tokenizer));
   return std::make_shared<const FlintGpuModel>(
-      std::move(reader), std::move(*weights_opt), std::move(weight_regions));
+      std::move(reader), std::move(*weights_opt), std::move(shared_tokenizer),
+      std::move(weight_regions));
 }
 
 namespace {

@@ -2615,7 +2615,7 @@ public:
   [[nodiscard]] const std::vector<std::int32_t>& committed() const noexcept {
     return committed_;
   }
-  [[nodiscard]] gufo::speculative::PromptLookup& lookup() noexcept {
+  [[nodiscard]] gufo::speculative::PromptLookup<std::int32_t>& lookup() noexcept {
     return lookup_;
   }
   /// Pre-block frontier of the last speculative block. A cancelled block may
@@ -2849,7 +2849,7 @@ private:
   std::size_t position_{0};
   bool has_frontier_logits_{false};
   std::vector<std::int32_t> committed_;
-  gufo::speculative::PromptLookup lookup_;
+  gufo::speculative::PromptLookup<std::int32_t> lookup_;
   std::size_t rollback_position_{0};
   bool has_rollback_{false};
   std::vector<float> rollback_logits_;
@@ -3313,7 +3313,7 @@ public:
       const std::int32_t anchor_i32 = static_cast<std::int32_t>(anchor);
       const auto match = flint.lookup().Find(
           flint.committed(), std::span<const std::int32_t>(&anchor_i32, 1),
-          gufo::speculative::PromptLookup::kMinMatch);
+          gufo::speculative::PromptLookup<std::int32_t>::kMinMatch);
       if (match.length != 0) {
         const std::size_t available = std::min(
             chain_cap - 1, flint.lookup().IndexedTokens() - match.start);
