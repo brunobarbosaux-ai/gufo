@@ -311,13 +311,15 @@ FlintGpuArena::FlintGpuArena(const core::ModelConfig& config,
   const std::size_t prefill_floats =
       cap * (hidden_size * 5 + attention_size * 2 + kv_size * 2 +
              ffn_act * 2 + config.expert_count + used) +
-      slots * (1 + config.expert_feed_forward_length * 2 + hidden_size);
+      slots * (1 + config.expert_feed_forward_length * 2 + hidden_size) +
+      kFlintVerifyMaxTokens * config.vocab_size;
   const std::size_t prefill_ints =
       cap +  // d_tokens staging
       cap * used +  // selected
       config.expert_count * 3 + 1 +  // counts, cursors, offsets
       slots * 2 +                    // slot_tokens, token_slots
-      tiles * 2 + 1;                 // tile_expert, tile_slot0, tile_count
+      tiles * 2 + 1 +                // tile_expert, tile_slot0, tile_count
+      kFlintVerifyMaxTokens;         // verify_tokens
 
   float* prefill_block = nullptr;
   HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&prefill_block),
@@ -347,6 +349,7 @@ FlintGpuArena::FlintGpuArena(const core::ModelConfig& config,
   prefill_.act_slots = prefill_alloc(slots * config.expert_feed_forward_length);
   prefill_.up_slots = prefill_alloc(slots * config.expert_feed_forward_length);
   prefill_.down_slots = prefill_alloc(slots * hidden_size);
+  prefill_.verify_logits = prefill_alloc(kFlintVerifyMaxTokens * config.vocab_size);
 
   int* prefill_int_block = nullptr;
   HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&prefill_int_block),
@@ -371,6 +374,9 @@ FlintGpuArena::FlintGpuArena(const core::ModelConfig& config,
   prefill_.tile_slot0 = int_cursor;
   int_cursor += tiles;
   prefill_.tile_count = int_cursor;
+  int_cursor += 1;
+  prefill_.verify_tokens = reinterpret_cast<std::uint32_t*>(int_cursor);
+  int_cursor += kFlintVerifyMaxTokens;
 
   const std::size_t q8_k = std::max<std::size_t>(
       std::max<std::size_t>(hidden_size, attention_size), ffn_act);

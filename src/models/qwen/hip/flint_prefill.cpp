@@ -560,5 +560,34 @@ void ExecuteFlintPrefillChunk(const models::FlintModelWeights& weights,
   collect();
 }
 
+void ExecuteFlintVerifyChunk(const models::FlintModelWeights& weights,
+                             std::span<const std::uint32_t> tokens,
+                             std::uint32_t start_pos,
+                             const FlintGpuStepBuffers& buffers,
+                             const FlintPrefillBuffers& prefill) {
+  if (tokens.empty() || tokens.size() > kFlintVerifyMaxTokens) {
+    throw std::invalid_argument(
+        "ExecuteFlintVerifyChunk: token count must be in [1, 16]");
+  }
+  const auto& config = weights.config;
+  const std::size_t n = tokens.size();
+  const std::size_t hidden = config.hidden_size;
+  const std::size_t vocab = config.vocab_size;
+
+  ExecuteFlintPrefillChunk(weights, tokens, start_pos, /*compute_logits=*/false,
+                           buffers, prefill);
+  LaunchBatchedRMSNorm(prefill.hidden,
+                       static_cast<const float*>(weights.output_norm.data),
+                       prefill.normed, nullptr, n, hidden, kFlintRmsEps,
+                       buffers.stream);
+  LaunchQuantizeActivationQ8_1FromFp32(prefill.normed, prefill.q8_act, n,
+                                       hidden, buffers.stream);
+  LaunchBatchedQuantGEMMPreQuantized(weights.output.type, weights.output.data,
+                                     prefill.q8_act, prefill.verify_logits, n,
+                                     vocab, hidden, buffers.stream);
+  LaunchBatchedGPUArgmax(prefill.verify_logits, prefill.verify_tokens, n, vocab,
+                         /*scratch=*/{}, buffers.stream);
+}
+
 }  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

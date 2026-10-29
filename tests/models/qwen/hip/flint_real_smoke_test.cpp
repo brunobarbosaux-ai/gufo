@@ -1649,6 +1649,145 @@ double Fp32LogpGate(gufo::core::GgmlType weight_type) {
   }
 }
 
+/// 7.6 exactness probe: does the prefill (verify) path produce the same greedy
+/// argmax as step-by-step decode, row for row? Speculation is only
+/// greedy-exact if it does. Builds a sequence by greedy decode, then re-runs
+/// it through the prefill path in chunks of `k` and compares the per-row
+/// argmax. Reports the mismatch rate and the top1-top2 margin at each
+/// mismatch (a flip only happens at a near-tie).
+void RunVerifyExactness(
+    const gufo::hip::FlintGpuModel& model,
+    const std::vector<gufo::tokenization::TokenId>& prompt_tokens,
+    std::uint32_t max_context) {
+  const auto& config = model.GetConfig();
+  const std::size_t hidden = config.hidden_size;
+  const std::size_t vocab = config.vocab_size;
+  const std::size_t n = 256;  // sequence length
+  const std::size_t k =  // verify chunk size (speculation draft cap)
+      std::getenv("GUFO_FLINT_VERIFY_K") != nullptr
+          ? static_cast<std::size_t>(std::atoi(std::getenv("GUFO_FLINT_VERIFY_K")))
+          : 8;
+
+  gufo::hip::FlintGpuArena arena(config, max_context);
+  const auto buffers = arena.GetBuffers();
+  const auto prefill = arena.GetPrefillBuffers();
+
+  // Pass 1: greedy decode from the prompt, recording the sequence and the
+  // argmax at every position (argmax[i] predicts token i+1).
+  std::vector<std::uint32_t> seq(prompt_tokens.begin(), prompt_tokens.end());
+  std::vector<std::uint32_t> decode_argmax;
+  std::vector<float> logits(vocab);
+  std::vector<float> decode_logits(n * vocab);
+  const auto host_argmax = [&](const float* row, float* margin) {
+    std::size_t best = 0;
+    float second = -1e30F;
+    for (std::size_t v = 0; v < vocab; ++v) {
+      if (row[v] > row[best]) {
+        second = row[best];
+        best = v;
+      } else if (row[v] > second) {
+        second = row[v];
+      }
+    }
+    if (margin != nullptr) {
+      *margin = row[best] - second;
+    }
+    return static_cast<std::uint32_t>(best);
+  };
+  const auto decode_one = [&](std::uint32_t token, std::uint32_t pos) {
+    gufo::hip::ExecuteFlintDecodeStep(model.GetWeights(), token, pos,
+                                      /*compute_logits=*/true, buffers,
+                                      /*timings=*/nullptr,
+                                      arena.GetGraphState());
+    HIP_CHECK(hipStreamSynchronize(buffers.stream));
+    HIP_CHECK(hipMemcpy(logits.data(), buffers.logits,
+                        vocab * sizeof(float), hipMemcpyDeviceToHost));
+    std::copy(logits.begin(), logits.end(),
+              decode_logits.begin() + static_cast<std::size_t>(pos) * vocab);
+    return host_argmax(logits.data(), nullptr);
+  };
+  for (std::size_t i = 0; i < seq.size(); ++i) {
+    decode_argmax.push_back(
+        decode_one(seq[i], static_cast<std::uint32_t>(i)));
+  }
+  while (seq.size() < n) {
+    const std::uint32_t next = decode_argmax.back();
+    seq.push_back(next);
+    decode_argmax.push_back(
+        decode_one(next, static_cast<std::uint32_t>(seq.size() - 1)));
+  }
+
+  // Pass 2: prefill in chunks of k through the production verify tail
+  // (ExecuteFlintVerifyChunk), reading back the per-row argmax and logits.
+  std::vector<std::uint32_t> logits_tokens(k);
+  std::vector<float> logits_all(k * vocab);
+  std::vector<std::uint32_t> prefill_argmax(n);
+  std::vector<float> prefill_margin(n);
+  std::vector<float> prefill_logits(n * vocab);
+  for (std::size_t start = 0; start < n; start += k) {
+    const std::size_t kk = std::min(k, n - start);
+    gufo::hip::ExecuteFlintVerifyChunk(
+        model.GetWeights(),
+        std::span<const std::uint32_t>(seq.data() + start, kk),
+        static_cast<std::uint32_t>(start), buffers, prefill);
+    HIP_CHECK(hipStreamSynchronize(buffers.stream));
+    HIP_CHECK(hipMemcpy(logits_tokens.data(), prefill.verify_tokens,
+                        kk * sizeof(std::uint32_t), hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(logits_all.data(), prefill.verify_logits,
+                        kk * vocab * sizeof(float), hipMemcpyDeviceToHost));
+    for (std::size_t j = 0; j < kk; ++j) {
+      prefill_argmax[start + j] = logits_tokens[j];
+      host_argmax(logits_all.data() + j * vocab, &prefill_margin[start + j]);
+      std::copy(logits_all.begin() + j * vocab,
+                logits_all.begin() + (j + 1) * vocab,
+                prefill_logits.begin() + (start + j) * vocab);
+    }
+  }
+
+  // Logit-space divergence between the two paths (cosine + max abs error),
+  // to separate "small error, near-tie flips" from "large divergence".
+  double cos_sum = 0.0;
+  double max_abs = 0.0;
+  for (std::size_t i = 0; i < n; ++i) {
+    const float* a = decode_logits.data() + i * vocab;
+    const float* b = prefill_logits.data() + i * vocab;
+    double dot = 0.0, na = 0.0, nb = 0.0;
+    for (std::size_t v = 0; v < vocab; ++v) {
+      dot += static_cast<double>(a[v]) * b[v];
+      na += static_cast<double>(a[v]) * a[v];
+      nb += static_cast<double>(b[v]) * b[v];
+      max_abs = std::max(max_abs,
+                         std::abs(static_cast<double>(a[v]) - b[v]));
+    }
+    cos_sum += dot / (std::sqrt(na) * std::sqrt(nb));
+  }
+  std::cout << "  logit divergence: mean cos=" << (cos_sum / n)
+            << " max|delta|=" << max_abs << "\n";
+
+  // Compare.
+  std::size_t mismatches = 0;
+  double min_mismatch_margin = 1e30;
+  for (std::size_t i = 0; i < n; ++i) {
+    if (decode_argmax[i] != prefill_argmax[i]) {
+      ++mismatches;
+      min_mismatch_margin =
+          std::min(min_mismatch_margin,
+                   static_cast<double>(prefill_margin[i]));
+      if (mismatches <= 12) {
+        std::cout << "  mismatch @" << i << ": decode=" << decode_argmax[i]
+                  << " prefill=" << prefill_argmax[i]
+                  << " margin=" << prefill_margin[i] << "\n";
+      }
+    }
+  }
+  std::cout << "verify exactness: " << mismatches << "/" << n
+            << " mismatches (" << (100.0 * mismatches / n) << "%)";
+  if (mismatches != 0) {
+    std::cout << ", min mismatch margin=" << min_mismatch_margin;
+  }
+  std::cout << "\n";
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1680,7 +1819,8 @@ int main(int argc, char** argv) {
       argc > 1 ? std::string_view(argv[1]) : std::string_view{};
   bool probe = mode == "probe";
   const bool chunk = mode == "chunk";
-  if (!mode.empty() && !probe && !chunk && mode != "keycount")
+  const bool verify = mode == "verify";
+  if (!mode.empty() && !probe && !chunk && !verify && mode != "keycount")
     max_context = static_cast<std::uint32_t>(std::atoi(argv[1]));
   if (argc > 2) steps = static_cast<std::uint32_t>(std::atoi(argv[2]));
   Expect(steps > 0, "steps must be positive");
@@ -1748,6 +1888,11 @@ int main(int argc, char** argv) {
             ? static_cast<std::uint32_t>(std::atoi(argv[2]))
             : std::max<std::uint32_t>(max_context, 1024);
     RunChunkParity(*gpu_model, tokens, tokens_full, chunk_ctx);
+    return 0;
+  }
+
+  if (verify) {
+    RunVerifyExactness(*gpu_model, prompt_tokens, max_context);
     return 0;
   }
 

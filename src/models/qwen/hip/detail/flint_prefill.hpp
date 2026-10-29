@@ -20,6 +20,11 @@ namespace gufo::hip {
 /// tokens instead of one.
 inline constexpr std::size_t kFlintPrefillBatchCapacity = 2048;
 
+/// Largest draft chunk the speculative verify tail covers in one call. The
+/// verify tail computes logits for every row, so the logits scratch is
+/// kFlintVerifyMaxTokens x vocab rather than one row.
+inline constexpr std::size_t kFlintVerifyMaxTokens = 16;
+
 /// Upper bound on the slot tables for a chunk of `tokens`: the compact slot
 /// count plus the 16-row bucket padding the grouped WMMA route requires (at
 /// most 15 rows per expert), rounded up to a whole number of tiles so
@@ -79,6 +84,8 @@ struct FlintPrefillBuffers {
   int* tile_count = nullptr;   ///< [1] live tile count
 
   std::uint32_t* d_tokens = nullptr;  ///< [cap] device staging for token ids
+  std::uint32_t* verify_tokens = nullptr;  ///< [kFlintVerifyMaxTokens] argmax token per verified row
+  float* verify_logits = nullptr;  ///< [kFlintVerifyMaxTokens, vocab_size] per-row logits
 
   void* q8_act = nullptr;     ///< tiled Q8_1 activation staging
   void* q8_normed = nullptr;  ///< tiled Q8_1 of normed (shared by all readers)
@@ -128,6 +135,18 @@ void ExecuteFlintPrefillChunk(const models::FlintModelWeights& weights,
                               const FlintGpuStepBuffers& buffers,
                               const FlintPrefillBuffers& prefill,
                               FlintPrefillTimings* timings = nullptr);
+
+/// Runs the batched prefill layer stack over `tokens` (1..kFlintVerifyMaxTokens)
+/// and computes the output norm + output GEMM + argmax for EVERY row, writing
+/// the k argmax tokens to `prefill.verify_tokens` and the k x vocab logits to
+/// `prefill.verify_logits`. This is the speculative verify tail: identical to
+/// ExecuteFlintPrefillChunk except the tail covers all rows instead of the
+/// last. The KV cache is written for positions [start_pos, start_pos + k).
+void ExecuteFlintVerifyChunk(const models::FlintModelWeights& weights,
+                             std::span<const std::uint32_t> tokens,
+                             std::uint32_t start_pos,
+                             const FlintGpuStepBuffers& buffers,
+                             const FlintPrefillBuffers& prefill);
 
 }  // namespace gufo::hip
 
