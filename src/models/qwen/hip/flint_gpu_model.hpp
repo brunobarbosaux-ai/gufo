@@ -10,6 +10,7 @@
 #include "src/core/gguf_reader.hpp"
 #include "src/models/qwen/hip/detail/flint_decode_step.hpp"
 #include "src/models/qwen/hip/detail/flint_prefill.hpp"
+#include "src/models/qwen/hip/dflash_target.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/state.hpp"
 
@@ -22,7 +23,7 @@ namespace gufo::hip {
 /// the same mapped-registration path QwenGpuModel uses, so no per-tensor
 /// device copies. The reader is retained because the region offsets are
 /// relative to its original mappings.
-class FlintGpuModel {
+class FlintGpuModel : public DFlashTargetWeights {
  public:
   FlintGpuModel(std::shared_ptr<const core::GgufReader> reader,
                 models::FlintModelWeights weights,
@@ -44,8 +45,16 @@ class FlintGpuModel {
   [[nodiscard]] const models::FlintModelWeights& GetWeights() const noexcept {
     return weights_;
   }
-  [[nodiscard]] const core::ModelConfig& GetConfig() const noexcept {
+  [[nodiscard]] const core::ModelConfig& GetConfig() const noexcept override {
     return weights_.config;
+  }
+  [[nodiscard]] const models::QwenTensorRef& GetTokenEmbedding()
+      const noexcept override {
+    return weights_.token_embd;
+  }
+  [[nodiscard]] const models::QwenTensorRef& GetOutputHead()
+      const noexcept override {
+    return weights_.output;
   }
   [[nodiscard]] std::size_t GetWeightRegionCount() const noexcept {
     return weight_regions_.size();

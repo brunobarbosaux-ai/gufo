@@ -93,7 +93,7 @@ public:
 
   [[nodiscard]] static std::shared_ptr<const QwenDFlashGpuModel> Create(
       std::shared_ptr<const core::GgufReader> dflash_reader,
-      std::shared_ptr<const QwenGpuModel> target_model,
+      std::shared_ptr<const DFlashTargetWeights> target_model,
       std::string* error_msg = nullptr);
 
   [[nodiscard]] const speculative::QwenDFlashWeights& GetWeights()
@@ -113,13 +113,13 @@ public:
 
 private:
   QwenDFlashGpuModel(std::shared_ptr<const core::GgufReader> dflash_reader,
-                     std::shared_ptr<const QwenGpuModel> target_model,
+                     std::shared_ptr<const DFlashTargetWeights> target_model,
                      speculative::QwenDFlashWeights weights,
                      std::vector<void*> allocations,
                      std::size_t packed_weight_bytes);
 
   std::shared_ptr<const core::GgufReader> dflash_reader_;
-  std::shared_ptr<const QwenGpuModel> target_model_;
+  std::shared_ptr<const DFlashTargetWeights> target_model_;
   speculative::QwenDFlashWeights weights_;
   std::vector<void*> allocations_;
   std::size_t packed_weight_bytes_{0};
@@ -275,7 +275,7 @@ public:
 
   [[nodiscard]] static std::unique_ptr<QwenDFlashGpuDraftBackend>
   CreateFromGguf(std::string_view dflash_model_path,
-                 std::shared_ptr<const QwenGpuModel> target_model,
+                 std::shared_ptr<const DFlashTargetWeights> target_model,
                  QwenDFlashGpuDraftConfig config = {},
                  std::string* error_msg = nullptr);
 

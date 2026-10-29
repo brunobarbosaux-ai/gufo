@@ -219,7 +219,7 @@ std::unique_ptr<QwenDFlashGpuDraftBackend> QwenDFlashGpuDraftBackend::Create(
 std::unique_ptr<QwenDFlashGpuDraftBackend>
 QwenDFlashGpuDraftBackend::CreateFromGguf(
     std::string_view dflash_model_path,
-    std::shared_ptr<const QwenGpuModel> target_model,
+    std::shared_ptr<const DFlashTargetWeights> target_model,
     QwenDFlashGpuDraftConfig config, std::string* error_msg) {
   if (dflash_model_path.empty() || target_model == nullptr) {
     if (error_msg != nullptr) {

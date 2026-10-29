@@ -292,7 +292,7 @@ void PackDFlashWeights(speculative::QwenDFlashWeights& weights,
 
 QwenDFlashGpuModel::QwenDFlashGpuModel(
     std::shared_ptr<const core::GgufReader> dflash_reader,
-    std::shared_ptr<const QwenGpuModel> target_model,
+    std::shared_ptr<const DFlashTargetWeights> target_model,
     speculative::QwenDFlashWeights weights, std::vector<void*> allocations,
     std::size_t packed_weight_bytes)
     : dflash_reader_(std::move(dflash_reader)),
@@ -311,7 +311,8 @@ QwenDFlashGpuModel::~QwenDFlashGpuModel() {
 
 std::shared_ptr<const QwenDFlashGpuModel> QwenDFlashGpuModel::Create(
     std::shared_ptr<const core::GgufReader> dflash_reader,
-    std::shared_ptr<const QwenGpuModel> target_model, std::string* error_msg) {
+    std::shared_ptr<const DFlashTargetWeights> target_model,
+    std::string* error_msg) {
   if (dflash_reader == nullptr || target_model == nullptr) {
     if (error_msg != nullptr) {
       *error_msg = "DFlash reader and target GPU model are required";
@@ -358,8 +359,8 @@ std::shared_ptr<const QwenDFlashGpuModel> QwenDFlashGpuModel::Create(
 
     // Unconditionally bind GPU device pointers from the target model for tied
     // weights
-    weights.token_embedding = target_model->GetWeights().token_embd;
-    weights.output = target_model->GetWeights().output;
+    weights.token_embedding = target_model->GetTokenEmbedding();
+    weights.output = target_model->GetOutputHead();
     if (weights.output.type == core::GgmlType::kBF16 &&
         weights.output.num_elements %
                 quant::QuantizedBlockElements(core::GgmlType::kQ8_0) ==
