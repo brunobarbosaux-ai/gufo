@@ -27,10 +27,11 @@ a convenience for a local two-port setup.
 Usage:
   serve_gates.py g4 --engine oracle --out /tmp/g4-oracle.json [--prompts N]
   serve_gates.py g4 --engine serve  --out /tmp/g4-serve.json
-  serve_gates.py g4-compare A.json B.json
+  serve_gates.py g4-compare A.json B.json --calibration tools/gates/calibration/<model>-<quant>.json
+  serve_gates.py g4-calibrate --capture /tmp/g4-oracle.json --out <calibration>.json
   serve_gates.py g5 --engine oracle --out /tmp/g5-oracle.json [--rows 200]
   serve_gates.py g5 --engine serve  --out /tmp/g5-serve.json
-  python3 .../stageg/dist.py g5-serve.json g5-oracle.json
+  serve_gates.py g5-verdict g5-serve.json g5-oracle.json
   serve_gates.py g8 --engine serve --sessions 8 [--gate]   # 1..8 sessions
 """
 
@@ -47,23 +48,26 @@ SERVE = "http://127.0.0.1:8006/v1"
 SERVE_MODEL = "model"
 G4_TOKENS = 512  # prompt length target and generation length (gate spec)
 # Fork acceptance: the serve engine's fork token must be one the oracle
-# itself considered essentially co-optimal — rank <= G4_MAX_RANK in the
-# captured top-k and within G4_NEAR_TIE_DELTA logprobs of top-1.
+# itself considered essentially co-optimal — rank <= max_rank in the
+# captured top-k and within max_delta logprobs of top-1.
 # Structural bugs fork early and land outside the top ranks.
 # The envelope is per model/quant, calibrated against the oracle's own
-# self-flip distribution (prefill-vs-decode on the same file). First
-# calibration, Q4_K_XL on a 40B MoE (2026-11-08): 397 near-tie positions,
-# the oracle flips 15.9% of them against itself, P95 self-flip delta
-# 0.709, max 1.335, zero structural disagreements. delta <= 0.8 /
-# rank <= 4 (P97 of self-flips, covering the full observed rank range)
-# matches the gate to the oracle's measured behavior. The previous
-# envelope (delta <= 0.5, rank <= 3) was stricter than the oracle's own
-# self-consistency on Q4. Other quants need their own calibration run
-# (IQ formats measured roughly 2x the Q4 envelope in early data).
-# Evidence and methodology: docs/quality/g4-envelope-calibration.json
-# and tools/gates/README.md.
-G4_NEAR_TIE_DELTA = 0.8
-G4_MAX_RANK = 4
+# self-flip distribution (prefill-vs-decode on the same file) via
+# `g4-calibrate`, and g4-compare refuses to run without one (either
+# --calibration or explicit --max-delta/--max-rank). Calibrations so far
+# live in tools/gates/calibration/:
+# - flint-40b-ud-q4_k_xl.json (2026-11-08): 397 near-tie positions, the
+#   oracle flips 15.9% of them against itself, P95 delta 0.709, max
+#   1.335, zero structural disagreements. Envelope delta <= 0.8 (P97) /
+#   rank <= 4 (full observed range). The previous envelope (delta <= 0.5,
+#   rank <= 3) was stricter than the oracle's own self-consistency on Q4.
+# - qwen38-flash-next-ud-q4_k_xl.json (2026-11-13): 591 near-tie
+#   positions, 28.1% self-flip rate, P97 delta 0.513, max 0.825, flips
+#   out to rank 6, zero structural disagreements. Envelope delta <= 0.55
+#   / rank <= 6. The Flint envelope does NOT transfer: 4 of 166 flips
+#   fall outside it.
+# Other quants need their own calibration run (IQ formats measured
+# roughly 2x the Q4 envelope in early data).
 G4_TOP_K = 20  # oracle top-k captured per token (must match the arm capture)
 _THINK_OPEN = chr(60) + "think" + chr(62)
 _THINK_CLOSE = chr(60) + "/think" + chr(62)
@@ -85,26 +89,6 @@ def get(url, timeout=60):
         return json.loads(response.read())
 
 
-def chat(base_url, model, messages, max_tokens, temperature, top_p, top_k,
-         seed, timeout=600):
-    payload = {
-        "model": model,
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "top_p": top_p,
-        "top_k": top_k,
-        "seed": seed,
-    }
-    if base_url.endswith("/v1") or "/v1/chat" in base_url:
-        data = post(f"{base_url}/chat/completions", payload, timeout)
-        return data["choices"][0]["message"]["content"]
-    # llama.cpp native endpoint (oracle): /completion with the rendered prompt
-    data = post(f"{base_url}/completion", {**payload, "messages": None} |
-                {"prompt": messages}, timeout)
-    return data["content"]
-
-
 def engine_config(engine, base_url=None, model=None):
     if engine == "oracle":
         return {"base": base_url or ORACLE, "model": model or "oracle-model",
@@ -115,22 +99,33 @@ def engine_config(engine, base_url=None, model=None):
     raise SystemExit(f"unknown engine {engine}")
 
 
-_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+_THINK_RE = re.compile(_THINK_OPEN + r".*?" + _THINK_CLOSE, re.DOTALL)
+_THINK_BLOCK_RE = re.compile(
+    "^" + _THINK_OPEN + "(.*)" + _THINK_CLOSE, re.DOTALL)
 
 
 def extract_text(message, full=False):
-    """Comparable generation text. full=True keeps the reasoning stream
-    (G8, serve-only — the strongest identity signal, and it does not
-    depend on reasoning finishing within max_tokens). full=False returns
-    the answer with any inline reasoning stripped (G4/G5, cross-engine —
+    """Comparable generation text. full=True returns the whole generated
+    stream normalised to "reasoning then answer" regardless of engine
+    convention: a separating engine fills reasoning_content, an inlining
+    engine carries the think block inside content, and both must yield
+    the same comparable stream (G8, serve-only). full=False returns the
+    answer with any inline reasoning stripped (G4/G5, cross-engine —
     gufo separates reasoning into reasoning_content while llama.cpp may
     inline it, so the answer is the comparable surface)."""
     if not isinstance(message, dict):
         text = message or ""
     else:
-        text = message.get("content") or ""
-        if full:
-            text = (message.get("reasoning_content") or "") + text
+        content = message.get("content") or ""
+        reasoning = message.get("reasoning_content") or ""
+        if not full:
+            return _THINK_RE.sub("", content).strip()
+        if not reasoning:
+            m = _THINK_BLOCK_RE.match(content.lstrip())
+            if m:
+                reasoning = m.group(1)
+                content = content[m.end():]
+        return (reasoning + content).strip()
     return _THINK_RE.sub("", text).strip()
 
 
@@ -221,7 +216,8 @@ def cmd_g4(args):
             full = extract_text(choice["message"], full=True)
             lp = choice.get("logprobs") or {}
             gen = lp.get("content") or []
-            row = {"class": item["class"], "prompt_tokens": item["tokens"],
+            row = {"class": item["class"], "prompt": item["text"],
+                   "prompt_tokens": item["tokens"],
                    "text": answer, "full": full,
                    "gen_tokens": [c["token"] for c in gen],
                    "top_logprobs": [c.get("top_logprobs") or [] for c in gen]}
@@ -249,8 +245,24 @@ def cmd_g4(args):
 
 
 def cmd_g4_compare(args):
-    max_delta = G4_NEAR_TIE_DELTA if args.max_delta is None else args.max_delta
-    max_rank = G4_MAX_RANK if args.max_rank is None else args.max_rank
+    calibration = None
+    if args.calibration:
+        calibration = json.load(open(args.calibration))
+        env = calibration.get("envelope") or {}
+        max_delta = env.get("max_delta")
+        max_rank = env.get("max_rank")
+    else:
+        max_delta = max_rank = None
+    if args.max_delta is not None:
+        max_delta = args.max_delta
+    if args.max_rank is not None:
+        max_rank = args.max_rank
+    if max_delta is None or max_rank is None:
+        raise SystemExit(
+            "g4-compare needs an envelope for this model/quant: pass "
+            "--calibration <file> (as written by g4-calibrate) or both "
+            "--max-delta and --max-rank. There is no cross-model default: "
+            "envelopes are measured per model/quant (see README).")
     left = json.load(open(args.left))
     right = json.load(open(args.right))
     failures = 0
@@ -303,18 +315,20 @@ def _g4_fork_check(row_l, row_r, div):
     tops = row_l.get("top_logprobs")
     if not toks or not tops:
         return None
+    # Map stream position -> original token index. Think-tag tokens are
+    # not part of the parsed full text, so they are dropped from the
+    # stream but their indices must be kept for the top-k lookup.
     if _THINK_CLOSE in toks:
         close = toks.index(_THINK_CLOSE)
-        stream = toks[1:close] + toks[close + 1:]
+        idx = list(range(1, close)) + list(range(close + 1, len(toks)))
     elif toks and toks[0] == _THINK_OPEN:
         # Truncated inside reasoning: no closing tag, but the opening
         # tag token is still there (it is not part of the parsed
         # reasoning_content the arm's full text was built from).
-        close = len(toks)
-        stream = toks[1:]
+        idx = list(range(1, len(toks)))
     else:
-        close = len(toks)
-        stream = toks
+        idx = list(range(len(toks)))
+    stream = [toks[i] for i in idx]
     full = "".join(stream)
     lead = len(full) - len(full.lstrip())
     if full.strip() != row_l["full"]:
@@ -331,9 +345,7 @@ def _g4_fork_check(row_l, row_r, div):
         acc += len(t)
     if fork_j is None:
         return None
-    # content-row index: skip the open-tag token, and the close-tag token
-    # once past it.
-    row_i = fork_j + 1 + (1 if fork_j >= close - 1 else 0)
+    row_i = idx[fork_j]
     if row_i >= len(tops) or not tops[row_i]:
         return None
     entries = tops[row_i]
@@ -341,11 +353,125 @@ def _g4_fork_check(row_l, row_r, div):
     serve_txt = row_r["full"]
     for rank, e in enumerate(entries):
         tok = e["token"]
-        for cand in (tok, tok.lstrip()):
-            if cand and serve_txt[k0:k0 + len(cand)] == cand:
+        # The stripped fallback shifts the match offset by the stripped
+        # whitespace. Either way the candidate must cover the divergence
+        # point: matching only a common prefix before div would accept
+        # tokens that do not explain the fork at all.
+        for cand, off in ((tok, 0),
+                          (tok.lstrip(), len(tok) - len(tok.lstrip()))):
+            start = k0 + off
+            if not cand or start > div or start + len(cand) <= div:
+                continue
+            if serve_txt[start:start + len(cand)] == cand:
                 delta = entries[0]["logprob"] - e["logprob"]
                 return rank + 1, delta
     return None
+
+
+def cmd_g4_calibrate(args):
+    """Oracle prefill-vs-decode self-flip calibration (envelope source).
+
+    Replays a captured oracle arm back through the prefill path: each
+    generated position is re-scored by sending prompt + generated prefix
+    as an assistant-message prefill, so the scored position is computed
+    by the batched-prefill path instead of the cached-decode path that
+    produced the capture. Every top-1 disagreement between the two paths
+    is an oracle self-flip; the flip delta/rank distribution is the
+    per-model/quant envelope evidence (see README, "Calibrating a new
+    model/quant pair").
+    """
+    cap = json.load(open(args.capture))
+    base = (args.base_url or ORACLE).rstrip("/")
+
+    flips = []
+    scored = 0
+    aligned = 0
+    t0 = time.time()
+    for row in cap["rows"]:
+        toks = row["gen_tokens"]
+        tops = row["top_logprobs"]
+        prompt = row.get("prompt")
+        if not prompt:
+            print(f"  [{row['class']}] no prompt text in capture — "
+                  f"recapture with a current harness", file=sys.stderr)
+            continue
+        prefix = ""
+        for i, piece in enumerate(toks):
+            entry = tops[i] if i < len(tops) else []
+            if not entry:
+                prefix += piece
+                continue
+            gap = (entry[0]["logprob"] - entry[1]["logprob"]
+                   if len(entry) > 1 else 9.9)
+            if gap > args.max_gap or i % args.stride != 0:
+                prefix += piece
+                continue
+            if args.limit and scored >= args.limit:
+                break
+            data = post(f"{base}/v1/chat/completions", {
+                "messages": [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": prefix},
+                ],
+                "max_tokens": 1, "temperature": 0.0, "top_p": 1.0,
+                "top_k": 0, "n_probs": 20,
+            })
+            scored += 1
+            lp = (data["choices"][0].get("logprobs") or {}).get("content")
+            rescored = (lp or [{}])[0].get("top_logprobs") or []
+            if rescored:
+                r_top = rescored[0]
+                c_top = entry[0]
+                if r_top["token"] == c_top["token"]:
+                    aligned += 1
+                else:
+                    rank = next(
+                        (r + 1 for r, e in enumerate(entry)
+                         if e["token"] == r_top["token"]), 99)
+                    flips.append({
+                        "row": row["class"], "position": i,
+                        "capture_top1": c_top["token"],
+                        "capture_top1_logprob": c_top["logprob"],
+                        "rescored_top1": r_top["token"],
+                        "rescored_top1_logprob": r_top["logprob"],
+                        "delta": abs(c_top["logprob"] - r_top["logprob"]),
+                        "rank": rank,
+                        "decode_gap": gap,
+                    })
+            prefix += piece
+        if args.limit and scored >= args.limit:
+            break
+        print(f"  [{row['class']}] done (running flips: {len(flips)})")
+
+    deltas = sorted(f["delta"] for f in flips)
+    ranks = sorted(f["rank"] for f in flips)
+
+    def pct(p):
+        return deltas[min(len(deltas) - 1, int(p * len(deltas)))] \
+            if deltas else 0.0
+
+    summary = {
+        "sampled": scored,
+        "aligned": aligned,
+        "flips": len(flips),
+        "flip_rate": round(len(flips) / max(scored, 1), 4),
+        "max_flip_delta": round(deltas[-1], 4) if deltas else 0.0,
+        "p95_flip_delta": round(pct(0.95), 4),
+        "p97_flip_delta": round(pct(0.97), 4),
+        "max_rank": ranks[-1] if ranks else 0,
+        "structural_beyond_top20": sum(1 for f in flips if f["rank"] == 99),
+    }
+    json.dump({
+        "gate": "G4-oracle-self-flip-calibration",
+        "capture": args.capture,
+        "settings": {"max_gap": args.max_gap, "stride": args.stride},
+        "sanity": {"capture_alignment": f"{aligned}/{scored}"},
+        "flips": flips,
+        "summary": summary,
+        "seconds": round(time.time() - t0, 1),
+    }, open(args.out, "w"), indent=1)
+    print(json.dumps(summary, indent=1))
+    print(f"calibration evidence: {args.out}")
 
 
 def cmd_g5(args):
@@ -386,8 +512,8 @@ def cmd_g5_verdict(args):
     support set, the argmax ordering, or produce large TV; near-tie noise
     only reshuffles proportions. Hard criteria: support agreement,
     ordering agreement, TV <= 0.25, missing-rate symmetry. The chi-square
-    and permutation p-values from stageg/dist.py stay in the record as
-    noise quantification.
+    and permutation p-values from the original stageg harness stay in the
+    record as noise quantification.
     """
     left = json.load(open(args.left))
     right = json.load(open(args.right))
@@ -495,7 +621,9 @@ def main():
         p = sub.add_parser(name)
         p.add_argument("--engine", choices=("oracle", "serve"), required=True)
         p.add_argument("--out", required=True)
-        p.add_argument("--prompts", type=int, default=8)
+        p.add_argument("--prompts", type=int, default=8,
+                       help="prompt count; capped at one per corpus class "
+                            "(9 classes today)")
         p.add_argument("--rows", type=int, default=200)
         p.add_argument("--max-tokens", type=int, default=16)
         p.add_argument("--base-url", default=None,
@@ -515,16 +643,37 @@ def main():
                                 "corpus prompts (default: the pinned "
                                 "oracle on :8098)")
 
+    p = sub.add_parser("g4-calibrate",
+                       help="oracle prefill-vs-decode self-flip calibration "
+                            "from a captured oracle arm; writes the flips "
+                            "JSON that g4-compare --calibration consumes")
+    p.add_argument("--capture", required=True,
+                   help="oracle arm JSON from `g4 --engine oracle`")
+    p.add_argument("--out", required=True)
+    p.add_argument("--base-url", default=None,
+                   help="oracle base URL (default: the pinned oracle on "
+                        ":8098; must serve the same model as the capture)")
+    p.add_argument("--max-gap", type=float, default=0.5,
+                   help="re-score positions whose capture top1-top2 "
+                        "logprob gap is <= this (near-ties only)")
+    p.add_argument("--stride", type=int, default=1,
+                   help="re-score every Nth generated position")
+    p.add_argument("--limit", type=int, default=0,
+                   help="stop after this many re-scores (0 = all)")
+
     p = sub.add_parser("g4-compare")
     p.add_argument("left")
     p.add_argument("right")
     p.add_argument("--max-delta", type=float, default=None,
-                   help="near-tie delta bound override (default: "
-                        "G4_NEAR_TIE_DELTA, calibrated on a Q4_K_XL 40B MoE; "
-                        "other model/quant pairs need their own envelope — "
-                        "IQ formats measured roughly 2x in early data)")
+                   help="near-tie delta bound (required, directly or via "
+                        "--calibration — envelopes are per model/quant)")
     p.add_argument("--max-rank", type=int, default=None,
-                   help="fork rank bound override (default: G4_MAX_RANK)")
+                   help="fork rank bound (required, directly or via "
+                        "--calibration)")
+    p.add_argument("--calibration", default=None,
+                   help="calibration JSON (as written by g4-calibrate) to "
+                        "take the envelope from; --max-delta/--max-rank "
+                        "override it")
 
     p = sub.add_parser("g8")
     p.add_argument("--engine", choices=("oracle", "serve"), default="serve")
@@ -544,6 +693,8 @@ def main():
     args = parser.parse_args()
     if args.cmd == "g4":
         cmd_g4(args)
+    elif args.cmd == "g4-calibrate":
+        cmd_g4_calibrate(args)
     elif args.cmd == "g4-compare":
         raise SystemExit(cmd_g4_compare(args))
     elif args.cmd == "g5":

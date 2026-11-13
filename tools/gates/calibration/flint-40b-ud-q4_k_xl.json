@@ -1,0 +1,3359 @@
+{
+ "sanity": {
+  "capture_alignment": "3339/3342",
+  "pos0_jaccard": {
+   "ascii": 1.0,
+   "code": 1.0,
+   "cjk": 1.0,
+   "mixed": 1.0,
+   "numeric": 1.0,
+   "contraction": 1.0,
+   "whitespace": 1.0,
+   "tool_xml": 1.0
+  },
+  "pos0_top1_mismatches": 0
+ },
+ "flips": [
+  {
+   "class": "ascii",
+   "j": 1,
+   "decode_gap": 0.0178,
+   "flip": true,
+   "decode_top1_tok": "We",
+   "prefill_pick_tok": "The",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.2721
+  },
+  {
+   "class": "ascii",
+   "j": 8,
+   "decode_gap": 0.5696,
+   "flip": false,
+   "decode_top1_tok": ".",
+   "prefill_pick_tok": "."
+  },
+  {
+   "class": "ascii",
+   "j": 31,
+   "decode_gap": 0.0996,
+   "flip": false,
+   "decode_top1_tok": " random",
+   "prefill_pick_tok": " random"
+  },
+  {
+   "class": "ascii",
+   "j": 33,
+   "decode_gap": 0.3175,
+   "flip": false,
+   "decode_top1_tok": ",",
+   "prefill_pick_tok": ","
+  },
+  {
+   "class": "ascii",
+   "j": 35,
+   "decode_gap": 0.2778,
+   "flip": false,
+   "decode_top1_tok": " trying",
+   "prefill_pick_tok": " trying"
+  },
+  {
+   "class": "ascii",
+   "j": 38,
+   "decode_gap": 0.0931,
+   "flip": false,
+   "decode_top1_tok": "?",
+   "prefill_pick_tok": "?"
+  },
+  {
+   "class": "ascii",
+   "j": 39,
+   "decode_gap": 0.0045,
+   "flip": true,
+   "decode_top1_tok": " Could",
+   "prefill_pick_tok": " Need",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.1533
+  },
+  {
+   "class": "ascii",
+   "j": 56,
+   "decode_gap": 0.2042,
+   "flip": false,
+   "decode_top1_tok": " they",
+   "prefill_pick_tok": " they"
+  },
+  {
+   "class": "ascii",
+   "j": 57,
+   "decode_gap": 0.5961,
+   "flip": false,
+   "decode_top1_tok": " want",
+   "prefill_pick_tok": " want"
+  },
+  {
+   "class": "ascii",
+   "j": 70,
+   "decode_gap": 0.575,
+   "flip": false,
+   "decode_top1_tok": " typed",
+   "prefill_pick_tok": " typed"
+  },
+  {
+   "class": "ascii",
+   "j": 71,
+   "decode_gap": 0.0997,
+   "flip": false,
+   "decode_top1_tok": " nonsense",
+   "prefill_pick_tok": " nonsense"
+  },
+  {
+   "class": "ascii",
+   "j": 74,
+   "decode_gap": 0.5589,
+   "flip": false,
+   "decode_top1_tok": " need",
+   "prefill_pick_tok": " need"
+  },
+  {
+   "class": "ascii",
+   "j": 87,
+   "decode_gap": 0.5296,
+   "flip": false,
+   "decode_top1_tok": " message",
+   "prefill_pick_tok": " message"
+  },
+  {
+   "class": "ascii",
+   "j": 109,
+   "decode_gap": 0.2573,
+   "flip": false,
+   "decode_top1_tok": "Maybe",
+   "prefill_pick_tok": "Maybe"
+  },
+  {
+   "class": "ascii",
+   "j": 110,
+   "decode_gap": 0.5947,
+   "flip": false,
+   "decode_top1_tok": " initials",
+   "prefill_pick_tok": " initials"
+  },
+  {
+   "class": "ascii",
+   "j": 124,
+   "decode_gap": 0.1357,
+   "flip": true,
+   "decode_top1_tok": " Or",
+   "prefill_pick_tok": " Could",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.4357
+  },
+  {
+   "class": "ascii",
+   "j": 126,
+   "decode_gap": 0.4224,
+   "flip": false,
+   "decode_top1_tok": " maybe",
+   "prefill_pick_tok": " maybe"
+  },
+  {
+   "class": "ascii",
+   "j": 128,
+   "decode_gap": 0.1453,
+   "flip": true,
+   "decode_top1_tok": " keyboard",
+   "prefill_pick_tok": " game",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.116
+  },
+  {
+   "class": "ascii",
+   "j": 130,
+   "decode_gap": 0.3341,
+   "flip": false,
+   "decode_top1_tok": " Could",
+   "prefill_pick_tok": " Could"
+  },
+  {
+   "class": "ascii",
+   "j": 151,
+   "decode_gap": 0.1576,
+   "flip": true,
+   "decode_top1_tok": " generate",
+   "prefill_pick_tok": " say",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.1894
+  },
+  {
+   "class": "ascii",
+   "j": 170,
+   "decode_gap": 0.5537,
+   "flip": false,
+   "decode_top1_tok": " Maybe",
+   "prefill_pick_tok": " Maybe"
+  },
+  {
+   "class": "ascii",
+   "j": 171,
+   "decode_gap": 0.2211,
+   "flip": false,
+   "decode_top1_tok": " all",
+   "prefill_pick_tok": " all"
+  },
+  {
+   "class": "ascii",
+   "j": 173,
+   "decode_gap": 0.1442,
+   "flip": true,
+   "decode_top1_tok": " start",
+   "prefill_pick_tok": " capitalized",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.1846
+  },
+  {
+   "class": "ascii",
+   "j": 174,
+   "decode_gap": 0.2933,
+   "flip": false,
+   "decode_top1_tok": " with",
+   "prefill_pick_tok": " with"
+  },
+  {
+   "class": "ascii",
+   "j": 177,
+   "decode_gap": 0.234,
+   "flip": false,
+   "decode_top1_tok": " November",
+   "prefill_pick_tok": " November"
+  },
+  {
+   "class": "ascii",
+   "j": 200,
+   "decode_gap": 0.2874,
+   "flip": false,
+   "decode_top1_tok": " it's",
+   "prefill_pick_tok": " it's"
+  },
+  {
+   "class": "ascii",
+   "j": 202,
+   "decode_gap": 0.4839,
+   "flip": false,
+   "decode_top1_tok": " sequence",
+   "prefill_pick_tok": " sequence"
+  },
+  {
+   "class": "ascii",
+   "j": 205,
+   "decode_gap": 0.3162,
+   "flip": false,
+   "decode_top1_tok": " with",
+   "prefill_pick_tok": " with"
+  },
+  {
+   "class": "ascii",
+   "j": 225,
+   "decode_gap": 0.1771,
+   "flip": false,
+   "decode_top1_tok": " maybe",
+   "prefill_pick_tok": " maybe"
+  },
+  {
+   "class": "ascii",
+   "j": 226,
+   "decode_gap": 0.2006,
+   "flip": true,
+   "decode_top1_tok": " they",
+   "prefill_pick_tok": " it's",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.006
+  },
+  {
+   "class": "ascii",
+   "j": 243,
+   "decode_gap": 0.0924,
+   "flip": false,
+   "decode_top1_tok": " \"",
+   "prefill_pick_tok": " \""
+  },
+  {
+   "class": "ascii",
+   "j": 244,
+   "decode_gap": 0.521,
+   "flip": false,
+   "decode_top1_tok": "n",
+   "prefill_pick_tok": "n"
+  },
+  {
+   "class": "ascii",
+   "j": 262,
+   "decode_gap": 0.4294,
+   "flip": false,
+   "decode_top1_tok": " rearrange",
+   "prefill_pick_tok": " rearrange"
+  },
+  {
+   "class": "ascii",
+   "j": 265,
+   "decode_gap": 0.3543,
+   "flip": false,
+   "decode_top1_tok": "the",
+   "prefill_pick_tok": "the"
+  },
+  {
+   "class": "ascii",
+   "j": 276,
+   "decode_gap": 0.5401,
+   "flip": false,
+   "decode_top1_tok": " famous",
+   "prefill_pick_tok": " famous"
+  },
+  {
+   "class": "ascii",
+   "j": 301,
+   "decode_gap": 0.3585,
+   "flip": false,
+   "decode_top1_tok": "\"",
+   "prefill_pick_tok": "\""
+  },
+  {
+   "class": "ascii",
+   "j": 306,
+   "decode_gap": 0.5524,
+   "flip": false,
+   "decode_top1_tok": "\"",
+   "prefill_pick_tok": "\""
+  },
+  {
+   "class": "ascii",
+   "j": 308,
+   "decode_gap": 0.1939,
+   "flip": false,
+   "decode_top1_tok": " not",
+   "prefill_pick_tok": " not"
+  },
+  {
+   "class": "ascii",
+   "j": 311,
+   "decode_gap": 0.1105,
+   "flip": false,
+   "decode_top1_tok": " it's",
+   "prefill_pick_tok": " it's"
+  },
+  {
+   "class": "ascii",
+   "j": 313,
+   "decode_gap": 0.3501,
+   "flip": false,
+   "decode_top1_tok": " cipher",
+   "prefill_pick_tok": " cipher"
+  },
+  {
+   "class": "ascii",
+   "j": 332,
+   "decode_gap": 0.4165,
+   "flip": false,
+   "decode_top1_tok": " Maybe",
+   "prefill_pick_tok": " Maybe"
+  },
+  {
+   "class": "ascii",
+   "j": 349,
+   "decode_gap": 0.0811,
+   "flip": true,
+   "decode_top1_tok": " be",
+   "prefill_pick_tok": " map",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.053
+  },
+  {
+   "class": "ascii",
+   "j": 350,
+   "decode_gap": 0.0072,
+   "flip": false,
+   "decode_top1_tok": " every",
+   "prefill_pick_tok": " every"
+  },
+  {
+   "class": "ascii",
+   "j": 354,
+   "decode_gap": 0.5198,
+   "flip": false,
+   "decode_top1_tok": " maybe",
+   "prefill_pick_tok": " maybe"
+  },
+  {
+   "class": "ascii",
+   "j": 357,
+   "decode_gap": 0.3974,
+   "flip": false,
+   "decode_top1_tok": " trying",
+   "prefill_pick_tok": " trying"
+  },
+  {
+   "class": "ascii",
+   "j": 359,
+   "decode_gap": 0.0402,
+   "flip": false,
+   "decode_top1_tok": " type",
+   "prefill_pick_tok": " type"
+  },
+  {
+   "class": "ascii",
+   "j": 373,
+   "decode_gap": 0.5368,
+   "flip": false,
+   "decode_top1_tok": " Maybe",
+   "prefill_pick_tok": " Maybe"
+  },
+  {
+   "class": "ascii",
+   "j": 375,
+   "decode_gap": 0.2481,
+   "flip": false,
+   "decode_top1_tok": " it's",
+   "prefill_pick_tok": " it's"
+  },
+  {
+   "class": "ascii",
+   "j": 380,
+   "decode_gap": 0.1347,
+   "flip": true,
+   "decode_top1_tok": " from",
+   "prefill_pick_tok": " for",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.2424
+  },
+  {
+   "class": "ascii",
+   "j": 384,
+   "decode_gap": 0.5568,
+   "flip": false,
+   "decode_top1_tok": " \"",
+   "prefill_pick_tok": " \""
+  },
+  {
+   "class": "ascii",
+   "j": 409,
+   "decode_gap": 0.1609,
+   "flip": true,
+   "decode_top1_tok": " \"",
+   "prefill_pick_tok": " random",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.0529
+  },
+  {
+   "class": "ascii",
+   "j": 426,
+   "decode_gap": 0.4497,
+   "flip": false,
+   "decode_top1_tok": " Let's",
+   "prefill_pick_tok": " Let's"
+  },
+  {
+   "class": "ascii",
+   "j": 430,
+   "decode_gap": 0.1368,
+   "flip": false,
+   "decode_top1_tok": " it's",
+   "prefill_pick_tok": " it's"
+  },
+  {
+   "class": "ascii",
+   "j": 433,
+   "decode_gap": 0.5846,
+   "flip": false,
+   "decode_top1_tok": " with",
+   "prefill_pick_tok": " with"
+  },
+  {
+   "class": "ascii",
+   "j": 434,
+   "decode_gap": 0.374,
+   "flip": false,
+   "decode_top1_tok": " repeated",
+   "prefill_pick_tok": " repeated"
+  },
+  {
+   "class": "ascii",
+   "j": 435,
+   "decode_gap": 0.4591,
+   "flip": false,
+   "decode_top1_tok": " \"",
+   "prefill_pick_tok": " \""
+  },
+  {
+   "class": "ascii",
+   "j": 439,
+   "decode_gap": 0.2564,
+   "flip": false,
+   "decode_top1_tok": " maybe",
+   "prefill_pick_tok": " maybe"
+  },
+  {
+   "class": "ascii",
+   "j": 445,
+   "decode_gap": 0.1713,
+   "flip": true,
+   "decode_top1_tok": " at",
+   "prefill_pick_tok": " should",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.1624
+  },
+  {
+   "class": "ascii",
+   "j": 457,
+   "decode_gap": 0.4407,
+   "flip": true,
+   "decode_top1_tok": "quick",
+   "prefill_pick_tok": "the",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.0262
+  },
+  {
+   "class": "ascii",
+   "j": 459,
+   "decode_gap": 0.4485,
+   "flip": false,
+   "decode_top1_tok": " the",
+   "prefill_pick_tok": " the"
+  },
+  {
+   "class": "ascii",
+   "j": 468,
+   "decode_gap": 0.5791,
+   "flip": false,
+   "decode_top1_tok": "?",
+   "prefill_pick_tok": "?"
+  },
+  {
+   "class": "ascii",
+   "j": 469,
+   "decode_gap": 0.1379,
+   "flip": false,
+   "decode_top1_tok": " Could",
+   "prefill_pick_tok": " Could"
+  },
+  {
+   "class": "ascii",
+   "j": 472,
+   "decode_gap": 0.1677,
+   "flip": false,
+   "decode_top1_tok": " \"",
+   "prefill_pick_tok": " \""
+  },
+  {
+   "class": "ascii",
+   "j": 474,
+   "decode_gap": 0.4772,
+   "flip": true,
+   "decode_top1_tok": " Sierra",
+   "prefill_pick_tok": "\"",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.0155
+  },
+  {
+   "class": "ascii",
+   "j": 491,
+   "decode_gap": 0.38,
+   "flip": false,
+   "decode_top1_tok": " say",
+   "prefill_pick_tok": " say"
+  },
+  {
+   "class": "ascii",
+   "j": 505,
+   "decode_gap": 0.1744,
+   "flip": false,
+   "decode_top1_tok": " Maybe",
+   "prefill_pick_tok": " Maybe"
+  },
+  {
+   "class": "ascii",
+   "j": 509,
+   "decode_gap": 0.2976,
+   "flip": false,
+   "decode_top1_tok": " sentence",
+   "prefill_pick_tok": " sentence"
+  },
+  {
+   "class": "code",
+   "j": 2,
+   "decode_gap": 0.3499,
+   "flip": false,
+   "decode_top1_tok": " are",
+   "prefill_pick_tok": " are"
+  },
+  {
+   "class": "code",
+   "j": 60,
+   "decode_gap": 0.0891,
+   "flip": true,
+   "decode_top1_tok": " fn",
+   "prefill_pick_tok": " `",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.0146
+  },
+  {
+   "class": "code",
+   "j": 77,
+   "decode_gap": 0.4643,
+   "flip": false,
+   "decode_top1_tok": " that",
+   "prefill_pick_tok": " that"
+  },
+  {
+   "class": "code",
+   "j": 83,
+   "decode_gap": 0.3196,
+   "flip": false,
+   "decode_top1_tok": " to",
+   "prefill_pick_tok": " to"
+  },
+  {
+   "class": "code",
+   "j": 95,
+   "decode_gap": 0.5352,
+   "flip": false,
+   "decode_top1_tok": " what",
+   "prefill_pick_tok": " what"
+  },
+  {
+   "class": "code",
+   "j": 99,
+   "decode_gap": 0.2703,
+   "flip": false,
+   "decode_top1_tok": ",",
+   "prefill_pick_tok": ","
+  },
+  {
+   "class": "code",
+   "j": 104,
+   "decode_gap": 0.3632,
+   "flip": false,
+   "decode_top1_tok": " TODO",
+   "prefill_pick_tok": " TODO"
+  },
+  {
+   "class": "code",
+   "j": 105,
+   "decode_gap": 0.2517,
+   "flip": true,
+   "decode_top1_tok": "s",
+   "prefill_pick_tok": " comments",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.0773
+  },
+  {
+   "class": "code",
+   "j": 111,
+   "decode_gap": 0.1736,
+   "flip": false,
+   "decode_top1_tok": " not",
+   "prefill_pick_tok": " not"
+  },
+  {
+   "class": "code",
+   "j": 115,
+   "decode_gap": 0.384,
+   "flip": false,
+   "decode_top1_tok": " need",
+   "prefill_pick_tok": " need"
+  },
+  {
+   "class": "code",
+   "j": 117,
+   "decode_gap": 0.4159,
+   "flip": false,
+   "decode_top1_tok": " interpret",
+   "prefill_pick_tok": " interpret"
+  },
+  {
+   "class": "code",
+   "j": 135,
+   "decode_gap": 0.4978,
+   "flip": false,
+   "decode_top1_tok": " to",
+   "prefill_pick_tok": " to"
+  },
+  {
+   "class": "code",
+   "j": 136,
+   "decode_gap": 0.1025,
+   "flip": true,
+   "decode_top1_tok": " complete",
+   "prefill_pick_tok": " use",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.0282
+  },
+  {
+   "class": "code",
+   "j": 143,
+   "decode_gap": 0.2251,
+   "flip": false,
+   "decode_top1_tok": " are",
+   "prefill_pick_tok": " are"
+  },
+  {
+   "class": "code",
+   "j": 144,
+   "decode_gap": 0.4061,
+   "flip": false,
+   "decode_top1_tok": " showing",
+   "prefill_pick_tok": " showing"
+  },
+  {
+   "class": "code",
+   "j": 152,
+   "decode_gap": 0.4893,
+   "flip": false,
+   "decode_top1_tok": ".\n\n",
+   "prefill_pick_tok": ".\n\n"
+  },
+  {
+   "class": "code",
+   "j": 157,
+   "decode_gap": 0.4387,
+   "flip": false,
+   "decode_top1_tok": " I",
+   "prefill_pick_tok": " I"
+  },
+  {
+   "class": "code",
+   "j": 164,
+   "decode_gap": 0.1516,
+   "flip": false,
+   "decode_top1_tok": " I",
+   "prefill_pick_tok": " I"
+  },
+  {
+   "class": "code",
+   "j": 174,
+   "decode_gap": 0.0006,
+   "flip": true,
+   "decode_top1_tok": " value",
+   "prefill_pick_tok": " variable",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.4871
+  },
+  {
+   "class": "code",
+   "j": 189,
+   "decode_gap": 0.0622,
+   "flip": false,
+   "decode_top1_tok": " by",
+   "prefill_pick_tok": " by"
+  },
+  {
+   "class": "code",
+   "j": 193,
+   "decode_gap": 0.3458,
+   "flip": false,
+   "decode_top1_tok": ".",
+   "prefill_pick_tok": "."
+  },
+  {
+   "class": "code",
+   "j": 197,
+   "decode_gap": 0.2178,
+   "flip": false,
+   "decode_top1_tok": " maybe",
+   "prefill_pick_tok": " maybe"
+  },
+  {
+   "class": "code",
+   "j": 217,
+   "decode_gap": 0.285,
+   "flip": false,
+   "decode_top1_tok": " are",
+   "prefill_pick_tok": " are"
+  },
+  {
+   "class": "code",
+   "j": 219,
+   "decode_gap": 0.1832,
+   "flip": false,
+   "decode_top1_tok": " for",
+   "prefill_pick_tok": " for"
+  },
+  {
+   "class": "code",
+   "j": 220,
+   "decode_gap": 0.5597,
+   "flip": false,
+   "decode_top1_tok": " actual",
+   "prefill_pick_tok": " actual"
+  },
+  {
+   "class": "code",
+   "j": 240,
+   "decode_gap": 0.1057,
+   "flip": true,
+   "decode_top1_tok": " about",
+   "prefill_pick_tok": " how",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.2618
+  },
+  {
+   "class": "code",
+   "j": 247,
+   "decode_gap": 0.0192,
+   "flip": true,
+   "decode_top1_tok": " user",
+   "prefill_pick_tok": " instruction",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.1681
+  },
+  {
+   "class": "code",
+   "j": 255,
+   "decode_gap": 0.1674,
+   "flip": true,
+   "decode_top1_tok": " provide",
+   "prefill_pick_tok": " assume",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.0483
+  },
+  {
+   "class": "code",
+   "j": 260,
+   "decode_gap": 0.0841,
+   "flip": false,
+   "decode_top1_tok": " possible",
+   "prefill_pick_tok": " possible"
+  },
+  {
+   "class": "code",
+   "j": 265,
+   "decode_gap": 0.0369,
+   "flip": true,
+   "decode_top1_tok": " with",
+   "prefill_pick_tok": " by",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.1492
+  },
+  {
+   "class": "code",
+   "j": 279,
+   "decode_gap": 0.2449,
+   "flip": false,
+   "decode_top1_tok": ")",
+   "prefill_pick_tok": ")"
+  },
+  {
+   "class": "code",
+   "j": 280,
+   "decode_gap": 0.5231,
+   "flip": false,
+   "decode_top1_tok": " assigns",
+   "prefill_pick_tok": " assigns"
+  },
+  {
+   "class": "code",
+   "j": 281,
+   "decode_gap": 0.2043,
+   "flip": false,
+   "decode_top1_tok": " some",
+   "prefill_pick_tok": " some"
+  },
+  {
+   "class": "code",
+   "j": 293,
+   "decode_gap": 0.0611,
+   "flip": true,
+   "decode_top1_tok": " constructed",
+   "prefill_pick_tok": " something",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.291
+  },
+  {
+   "class": "code",
+   "j": 295,
+   "decode_gap": 0.0126,
+   "flip": false,
+   "decode_top1_tok": " that",
+   "prefill_pick_tok": " that"
+  },
+  {
+   "class": "code",
+   "j": 298,
+   "decode_gap": 0.5368,
+   "flip": false,
+   "decode_top1_tok": " perhaps",
+   "prefill_pick_tok": " perhaps"
+  },
+  {
+   "class": "code",
+   "j": 309,
+   "decode_gap": 0.3115,
+   "flip": false,
+   "decode_top1_tok": ",",
+   "prefill_pick_tok": ","
+  },
+  {
+   "class": "code",
+   "j": 336,
+   "decode_gap": 0.5503,
+   "flip": false,
+   "decode_top1_tok": " that",
+   "prefill_pick_tok": " that"
+  },
+  {
+   "class": "code",
+   "j": 356,
+   "decode_gap": 0.1917,
+   "flip": false,
+   "decode_top1_tok": " maybe",
+   "prefill_pick_tok": " maybe"
+  },
+  {
+   "class": "code",
+   "j": 383,
+   "decode_gap": 0.1271,
+   "flip": false,
+   "decode_top1_tok": "?",
+   "prefill_pick_tok": "?"
+  },
+  {
+   "class": "code",
+   "j": 388,
+   "decode_gap": 0.4717,
+   "flip": false,
+   "decode_top1_tok": " the",
+   "prefill_pick_tok": " the"
+  },
+  {
+   "class": "code",
+   "j": 390,
+   "decode_gap": 0.5831,
+   "flip": false,
+   "decode_top1_tok": " number",
+   "prefill_pick_tok": " number"
+  },
+  {
+   "class": "code",
+   "j": 391,
+   "decode_gap": 0.066,
+   "flip": false,
+   "decode_top1_tok": ",",
+   "prefill_pick_tok": ","
+  },
+  {
+   "class": "code",
+   "j": 413,
+   "decode_gap": 0.3056,
+   "flip": false,
+   "decode_top1_tok": " the",
+   "prefill_pick_tok": " the"
+  },
+  {
+   "class": "code",
+   "j": 418,
+   "decode_gap": 0.3765,
+   "flip": false,
+   "decode_top1_tok": " the",
+   "prefill_pick_tok": " the"
+  },
+  {
+   "class": "code",
+   "j": 434,
+   "decode_gap": 0.5167,
+   "flip": false,
+   "decode_top1_tok": " wrote",
+   "prefill_pick_tok": " wrote"
+  },
+  {
+   "class": "code",
+   "j": 442,
+   "decode_gap": 0.4759,
+   "flip": false,
+   "decode_top1_tok": "?",
+   "prefill_pick_tok": "?"
+  },
+  {
+   "class": "code",
+   "j": 453,
+   "decode_gap": 0.3339,
+   "flip": false,
+   "decode_top1_tok": "Given",
+   "prefill_pick_tok": "Given"
+  },
+  {
+   "class": "code",
+   "j": 478,
+   "decode_gap": 0.5279,
+   "flip": false,
+   "decode_top1_tok": " or",
+   "prefill_pick_tok": " or"
+  },
+  {
+   "class": "cjk",
+   "j": 1,
+   "decode_gap": 0.2075,
+   "flip": false,
+   "decode_top1_tok": "\u7528\u6237",
+   "prefill_pick_tok": "\u7528\u6237"
+  },
+  {
+   "class": "cjk",
+   "j": 15,
+   "decode_gap": 0.5462,
+   "flip": false,
+   "decode_top1_tok": "\u9700\u8981",
+   "prefill_pick_tok": "\u9700\u8981"
+  },
+  {
+   "class": "cjk",
+   "j": 24,
+   "decode_gap": 0.2981,
+   "flip": false,
+   "decode_top1_tok": "\u7684",
+   "prefill_pick_tok": "\u7684"
+  },
+  {
+   "class": "cjk",
+   "j": 25,
+   "decode_gap": 0.1308,
+   "flip": false,
+   "decode_top1_tok": "\u8ba8\u8bba",
+   "prefill_pick_tok": "\u8ba8\u8bba"
+  },
+  {
+   "class": "cjk",
+   "j": 26,
+   "decode_gap": 0.5863,
+   "flip": false,
+   "decode_top1_tok": "\u3002\n\n",
+   "prefill_pick_tok": "\u3002\n\n"
+  },
+  {
+   "class": "cjk",
+   "j": 28,
+   "decode_gap": 0.3146,
+   "flip": false,
+   "decode_top1_tok": "\u9700\u8981",
+   "prefill_pick_tok": "\u9700\u8981"
+  },
+  {
+   "class": "cjk",
+   "j": 29,
+   "decode_gap": 0.447,
+   "flip": false,
+   "decode_top1_tok": "\u63d0\u4f9b",
+   "prefill_pick_tok": "\u63d0\u4f9b"
+  },
+  {
+   "class": "cjk",
+   "j": 33,
+   "decode_gap": 0.4509,
+   "flip": false,
+   "decode_top1_tok": "\u6709",
+   "prefill_pick_tok": "\u6709"
+  },
+  {
+   "class": "cjk",
+   "j": 37,
+   "decode_gap": 0.0605,
+   "flip": false,
+   "decode_top1_tok": "\u3002",
+   "prefill_pick_tok": "\u3002"
+  },
+  {
+   "class": "cjk",
+   "j": 50,
+   "decode_gap": 0.022,
+   "flip": false,
+   "decode_top1_tok": "\u7684",
+   "prefill_pick_tok": "\u7684"
+  },
+  {
+   "class": "cjk",
+   "j": 56,
+   "decode_gap": 0.5068,
+   "flip": false,
+   "decode_top1_tok": "\u3002",
+   "prefill_pick_tok": "\u3002"
+  },
+  {
+   "class": "cjk",
+   "j": 62,
+   "decode_gap": 0.1502,
+   "flip": false,
+   "decode_top1_tok": "\u4e0d\u540c\u7684",
+   "prefill_pick_tok": "\u4e0d\u540c\u7684"
+  },
+  {
+   "class": "cjk",
+   "j": 76,
+   "decode_gap": 0.355,
+   "flip": false,
+   "decode_top1_tok": "\u6216\u8005",
+   "prefill_pick_tok": "\u6216\u8005"
+  },
+  {
+   "class": "cjk",
+   "j": 78,
+   "decode_gap": 0.4739,
+   "flip": false,
+   "decode_top1_tok": "\u9ad8\u7ea7",
+   "prefill_pick_tok": "\u9ad8\u7ea7"
+  },
+  {
+   "class": "cjk",
+   "j": 80,
+   "decode_gap": 0.085,
+   "flip": false,
+   "decode_top1_tok": "\u5206",
+   "prefill_pick_tok": "\u5206"
+  },
+  {
+   "class": "cjk",
+   "j": 83,
+   "decode_gap": 0.4501,
+   "flip": false,
+   "decode_top1_tok": "\u3002",
+   "prefill_pick_tok": "\u3002"
+  },
+  {
+   "class": "cjk",
+   "j": 87,
+   "decode_gap": 0.2982,
+   "flip": false,
+   "decode_top1_tok": "\u5e94\u8be5",
+   "prefill_pick_tok": "\u5e94\u8be5"
+  },
+  {
+   "class": "cjk",
+   "j": 88,
+   "decode_gap": 0.5016,
+   "flip": false,
+   "decode_top1_tok": "\u5f3a\u8c03",
+   "prefill_pick_tok": "\u5f3a\u8c03"
+  },
+  {
+   "class": "cjk",
+   "j": 91,
+   "decode_gap": 0.2348,
+   "flip": false,
+   "decode_top1_tok": "\u6027",
+   "prefill_pick_tok": "\u6027"
+  },
+  {
+   "class": "cjk",
+   "j": 93,
+   "decode_gap": 0.3819,
+   "flip": false,
+   "decode_top1_tok": "\u8bad\u7ec3",
+   "prefill_pick_tok": "\u8bad\u7ec3"
+  },
+  {
+   "class": "cjk",
+   "j": 103,
+   "decode_gap": 0.0259,
+   "flip": false,
+   "decode_top1_tok": "\u7684",
+   "prefill_pick_tok": "\u7684"
+  },
+  {
+   "class": "cjk",
+   "j": 109,
+   "decode_gap": 0.5447,
+   "flip": false,
+   "decode_top1_tok": "\u786e\u4fdd",
+   "prefill_pick_tok": "\u786e\u4fdd"
+  },
+  {
+   "class": "cjk",
+   "j": 110,
+   "decode_gap": 0.2551,
+   "flip": false,
+   "decode_top1_tok": "\u6bcf\u4e2a",
+   "prefill_pick_tok": "\u6bcf\u4e2a"
+  },
+  {
+   "class": "cjk",
+   "j": 119,
+   "decode_gap": 0.0354,
+   "flip": false,
+   "decode_top1_tok": "\u6211",
+   "prefill_pick_tok": "\u6211"
+  },
+  {
+   "class": "cjk",
+   "j": 122,
+   "decode_gap": 0.5037,
+   "flip": false,
+   "decode_top1_tok": "\u4e13\u4e1a",
+   "prefill_pick_tok": "\u4e13\u4e1a"
+  },
+  {
+   "class": "cjk",
+   "j": 140,
+   "decode_gap": 0.0262,
+   "flip": false,
+   "decode_top1_tok": "\u3002",
+   "prefill_pick_tok": "\u3002"
+  },
+  {
+   "class": "cjk",
+   "j": 155,
+   "decode_gap": 0.1629,
+   "flip": false,
+   "decode_top1_tok": "\u6709",
+   "prefill_pick_tok": "\u6709"
+  },
+  {
+   "class": "cjk",
+   "j": 161,
+   "decode_gap": 0.3991,
+   "flip": false,
+   "decode_top1_tok": "\u5230\u7684",
+   "prefill_pick_tok": "\u5230\u7684"
+  },
+  {
+   "class": "cjk",
+   "j": 197,
+   "decode_gap": 0.1671,
+   "flip": false,
+   "decode_top1_tok": "\u540c\u65f6",
+   "prefill_pick_tok": "\u540c\u65f6"
+  },
+  {
+   "class": "cjk",
+   "j": 204,
+   "decode_gap": 0.3745,
+   "flip": false,
+   "decode_top1_tok": "\u6a21\u578b",
+   "prefill_pick_tok": "\u6a21\u578b"
+  },
+  {
+   "class": "cjk",
+   "j": 207,
+   "decode_gap": 0.1601,
+   "flip": true,
+   "decode_top1_tok": "\u76f4\u63a5",
+   "prefill_pick_tok": "\u7075",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.2104
+  },
+  {
+   "class": "cjk",
+   "j": 241,
+   "decode_gap": 0.145,
+   "flip": false,
+   "decode_top1_tok": "\u8bed\u8a00",
+   "prefill_pick_tok": "\u8bed\u8a00"
+  },
+  {
+   "class": "cjk",
+   "j": 244,
+   "decode_gap": 0.4599,
+   "flip": false,
+   "decode_top1_tok": "\u8bad\u7ec3",
+   "prefill_pick_tok": "\u8bad\u7ec3"
+  },
+  {
+   "class": "cjk",
+   "j": 250,
+   "decode_gap": 0.1379,
+   "flip": false,
+   "decode_top1_tok": "\u7684",
+   "prefill_pick_tok": "\u7684"
+  },
+  {
+   "class": "cjk",
+   "j": 252,
+   "decode_gap": 0.0075,
+   "flip": true,
+   "decode_top1_tok": "\u5e8f\u5217",
+   "prefill_pick_tok": "\uff08",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.0836
+  },
+  {
+   "class": "cjk",
+   "j": 266,
+   "decode_gap": 0.0374,
+   "flip": false,
+   "decode_top1_tok": "\u6216",
+   "prefill_pick_tok": "\u6216"
+  },
+  {
+   "class": "cjk",
+   "j": 272,
+   "decode_gap": 0.1248,
+   "flip": true,
+   "decode_top1_tok": "\u4e0d\u540c",
+   "prefill_pick_tok": "\u6240\u6709",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.5217
+  },
+  {
+   "class": "cjk",
+   "j": 275,
+   "decode_gap": 0.2399,
+   "flip": true,
+   "decode_top1_tok": "Token",
+   "prefill_pick_tok": "token",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.0167
+  },
+  {
+   "class": "cjk",
+   "j": 285,
+   "decode_gap": 0.0593,
+   "flip": false,
+   "decode_top1_tok": "\u5230",
+   "prefill_pick_tok": "\u5230"
+  },
+  {
+   "class": "cjk",
+   "j": 295,
+   "decode_gap": 0.5057,
+   "flip": false,
+   "decode_top1_tok": "\u8fc1\u79fb",
+   "prefill_pick_tok": "\u8fc1\u79fb"
+  },
+  {
+   "class": "cjk",
+   "j": 314,
+   "decode_gap": 0.1602,
+   "flip": false,
+   "decode_top1_tok": "\u8fc1\u79fb",
+   "prefill_pick_tok": "\u8fc1\u79fb"
+  },
+  {
+   "class": "cjk",
+   "j": 325,
+   "decode_gap": 0.1265,
+   "flip": false,
+   "decode_top1_tok": "\u5728",
+   "prefill_pick_tok": "\u5728"
+  },
+  {
+   "class": "cjk",
+   "j": 374,
+   "decode_gap": 0.556,
+   "flip": false,
+   "decode_top1_tok": "\u8bcd",
+   "prefill_pick_tok": "\u8bcd"
+  },
+  {
+   "class": "cjk",
+   "j": 377,
+   "decode_gap": 0.444,
+   "flip": true,
+   "decode_top1_tok": "\u5b9e\u4f53",
+   "prefill_pick_tok": "\u8bed\u4e49",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.1904
+  },
+  {
+   "class": "cjk",
+   "j": 381,
+   "decode_gap": 0.0129,
+   "flip": false,
+   "decode_top1_tok": "\u4eba\u5de5",
+   "prefill_pick_tok": "\u4eba\u5de5"
+  },
+  {
+   "class": "cjk",
+   "j": 390,
+   "decode_gap": 0.4503,
+   "flip": true,
+   "decode_top1_tok": "\u6807\u6ce8",
+   "prefill_pick_tok": "\u6b67",
+   "decode_pick_rank_in_prefill": 3,
+   "flip_delta": 1.335
+  },
+  {
+   "class": "cjk",
+   "j": 394,
+   "decode_gap": 0.1281,
+   "flip": true,
+   "decode_top1_tok": "\u5206",
+   "prefill_pick_tok": "\u504f",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.725
+  },
+  {
+   "class": "cjk",
+   "j": 413,
+   "decode_gap": 0.5568,
+   "flip": false,
+   "decode_top1_tok": "\u5904\u7406",
+   "prefill_pick_tok": "\u5904\u7406"
+  },
+  {
+   "class": "cjk",
+   "j": 424,
+   "decode_gap": 0.205,
+   "flip": false,
+   "decode_top1_tok": "\u5e73\u8861",
+   "prefill_pick_tok": "\u5e73\u8861"
+  },
+  {
+   "class": "cjk",
+   "j": 431,
+   "decode_gap": 0.3614,
+   "flip": false,
+   "decode_top1_tok": "\u6837\u672c",
+   "prefill_pick_tok": "\u6837\u672c"
+  },
+  {
+   "class": "cjk",
+   "j": 437,
+   "decode_gap": 0.2089,
+   "flip": true,
+   "decode_top1_tok": "\u4e0d\u540c",
+   "prefill_pick_tok": "\u9886\u57df",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.0148
+  },
+  {
+   "class": "cjk",
+   "j": 441,
+   "decode_gap": 0.3499,
+   "flip": false,
+   "decode_top1_tok": "\u4e13\u4e1a",
+   "prefill_pick_tok": "\u4e13\u4e1a"
+  },
+  {
+   "class": "cjk",
+   "j": 448,
+   "decode_gap": 0.4118,
+   "flip": false,
+   "decode_top1_tok": "\u7b49",
+   "prefill_pick_tok": "\u7b49"
+  },
+  {
+   "class": "cjk",
+   "j": 450,
+   "decode_gap": 0.5735,
+   "flip": false,
+   "decode_top1_tok": "\u907f\u514d",
+   "prefill_pick_tok": "\u907f\u514d"
+  },
+  {
+   "class": "cjk",
+   "j": 462,
+   "decode_gap": 0.4219,
+   "flip": false,
+   "decode_top1_tok": "\u5b9e\u8df5",
+   "prefill_pick_tok": "\u5b9e\u8df5"
+  },
+  {
+   "class": "cjk",
+   "j": 468,
+   "decode_gap": 0.249,
+   "flip": false,
+   "decode_top1_tok": "\u65b0",
+   "prefill_pick_tok": "\u65b0"
+  },
+  {
+   "class": "cjk",
+   "j": 477,
+   "decode_gap": 0.332,
+   "flip": false,
+   "decode_top1_tok": "\u5728",
+   "prefill_pick_tok": "\u5728"
+  },
+  {
+   "class": "cjk",
+   "j": 480,
+   "decode_gap": 0.4563,
+   "flip": false,
+   "decode_top1_tok": "\u767b\u5f55",
+   "prefill_pick_tok": "\u767b\u5f55"
+  },
+  {
+   "class": "cjk",
+   "j": 482,
+   "decode_gap": 0.2979,
+   "flip": false,
+   "decode_top1_tok": "\u65f6",
+   "prefill_pick_tok": "\u65f6"
+  },
+  {
+   "class": "cjk",
+   "j": 486,
+   "decode_gap": 0.525,
+   "flip": false,
+   "decode_top1_tok": "\u9700",
+   "prefill_pick_tok": "\u9700"
+  },
+  {
+   "class": "cjk",
+   "j": 496,
+   "decode_gap": 0.4516,
+   "flip": false,
+   "decode_top1_tok": "\u5206",
+   "prefill_pick_tok": "\u5206"
+  },
+  {
+   "class": "cjk",
+   "j": 498,
+   "decode_gap": 0.1614,
+   "flip": true,
+   "decode_top1_tok": "\u65b9\u5f0f",
+   "prefill_pick_tok": "\u89c4\u5219",
+   "decode_pick_rank_in_prefill": 3,
+   "flip_delta": 0.7091
+  },
+  {
+   "class": "cjk",
+   "j": 505,
+   "decode_gap": 0.3777,
+   "flip": true,
+   "decode_top1_tok": "\u5904\u7406",
+   "prefill_pick_tok": "\u6355",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.1301
+  },
+  {
+   "class": "cjk",
+   "j": 506,
+   "decode_gap": 0.1066,
+   "flip": false,
+   "decode_top1_tok": "\u6a21\u7cca",
+   "prefill_pick_tok": "\u6a21\u7cca"
+  },
+  {
+   "class": "mixed",
+   "j": 4,
+   "decode_gap": 0.1101,
+   "flip": false,
+   "decode_top1_tok": " sent",
+   "prefill_pick_tok": " sent"
+  },
+  {
+   "class": "mixed",
+   "j": 14,
+   "decode_gap": 0.1272,
+   "flip": false,
+   "decode_top1_tok": " characters",
+   "prefill_pick_tok": " characters"
+  },
+  {
+   "class": "mixed",
+   "j": 17,
+   "decode_gap": 0.1046,
+   "flip": true,
+   "decode_top1_tok": ",",
+   "prefill_pick_tok": ":",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.0615
+  },
+  {
+   "class": "mixed",
+   "j": 22,
+   "decode_gap": 0.5204,
+   "flip": false,
+   "decode_top1_tok": "\"",
+   "prefill_pick_tok": "\""
+  },
+  {
+   "class": "mixed",
+   "j": 29,
+   "decode_gap": 0.1291,
+   "flip": false,
+   "decode_top1_tok": " doesn't",
+   "prefill_pick_tok": " doesn't"
+  },
+  {
+   "class": "mixed",
+   "j": 33,
+   "decode_gap": 0.5695,
+   "flip": false,
+   "decode_top1_tok": " coherent",
+   "prefill_pick_tok": " coherent"
+  },
+  {
+   "class": "mixed",
+   "j": 37,
+   "decode_gap": 0.0142,
+   "flip": true,
+   "decode_top1_tok": ".",
+   "prefill_pick_tok": " in",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.3987
+  },
+  {
+   "class": "mixed",
+   "j": 44,
+   "decode_gap": 0.4741,
+   "flip": false,
+   "decode_top1_tok": " way",
+   "prefill_pick_tok": " way"
+  },
+  {
+   "class": "mixed",
+   "j": 49,
+   "decode_gap": 0.4219,
+   "flip": false,
+   "decode_top1_tok": " while",
+   "prefill_pick_tok": " while"
+  },
+  {
+   "class": "mixed",
+   "j": 51,
+   "decode_gap": 0.2436,
+   "flip": true,
+   "decode_top1_tok": " a",
+   "prefill_pick_tok": " clarity",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.1074
+  },
+  {
+   "class": "mixed",
+   "j": 84,
+   "decode_gap": 0.1483,
+   "flip": false,
+   "decode_top1_tok": " inviting",
+   "prefill_pick_tok": " inviting"
+  },
+  {
+   "class": "mixed",
+   "j": 88,
+   "decode_gap": 0.4357,
+   "flip": false,
+   "decode_top1_tok": " share",
+   "prefill_pick_tok": " share"
+  },
+  {
+   "class": "mixed",
+   "j": 106,
+   "decode_gap": 0.4713,
+   "flip": false,
+   "decode_top1_tok": " attempt",
+   "prefill_pick_tok": " attempt"
+  },
+  {
+   "class": "mixed",
+   "j": 108,
+   "decode_gap": 0.4388,
+   "flip": false,
+   "decode_top1_tok": " guess",
+   "prefill_pick_tok": " guess"
+  },
+  {
+   "class": "mixed",
+   "j": 123,
+   "decode_gap": 0.4751,
+   "flip": false,
+   "decode_top1_tok": " j",
+   "prefill_pick_tok": " j"
+  },
+  {
+   "class": "mixed",
+   "j": 133,
+   "decode_gap": 0.556,
+   "flip": false,
+   "decode_top1_tok": "How",
+   "prefill_pick_tok": "How"
+  },
+  {
+   "class": "mixed",
+   "j": 140,
+   "decode_gap": 0.0196,
+   "flip": false,
+   "decode_top1_tok": " If",
+   "prefill_pick_tok": " If"
+  },
+  {
+   "class": "numeric",
+   "j": 7,
+   "decode_gap": 0.0312,
+   "flip": false,
+   "decode_top1_tok": " infer",
+   "prefill_pick_tok": " infer"
+  },
+  {
+   "class": "numeric",
+   "j": 18,
+   "decode_gap": 0.1136,
+   "flip": false,
+   "decode_top1_tok": " number",
+   "prefill_pick_tok": " number"
+  },
+  {
+   "class": "numeric",
+   "j": 26,
+   "decode_gap": 0.3513,
+   "flip": false,
+   "decode_top1_tok": " maybe",
+   "prefill_pick_tok": " maybe"
+  },
+  {
+   "class": "numeric",
+   "j": 32,
+   "decode_gap": 0.2613,
+   "flip": true,
+   "decode_top1_tok": " maybe",
+   "prefill_pick_tok": " they",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.0691
+  },
+  {
+   "class": "numeric",
+   "j": 63,
+   "decode_gap": 0.2514,
+   "flip": false,
+   "decode_top1_tok": " handle",
+   "prefill_pick_tok": " handle"
+  },
+  {
+   "class": "numeric",
+   "j": 66,
+   "decode_gap": 0.2887,
+   "flip": false,
+   "decode_top1_tok": " Could",
+   "prefill_pick_tok": " Could"
+  },
+  {
+   "class": "numeric",
+   "j": 78,
+   "decode_gap": 0.4337,
+   "flip": false,
+   "decode_top1_tok": ".",
+   "prefill_pick_tok": "."
+  },
+  {
+   "class": "numeric",
+   "j": 86,
+   "decode_gap": 0.1206,
+   "flip": false,
+   "decode_top1_tok": " and",
+   "prefill_pick_tok": " and"
+  },
+  {
+   "class": "numeric",
+   "j": 114,
+   "decode_gap": 0.1704,
+   "flip": false,
+   "decode_top1_tok": ".\n\n",
+   "prefill_pick_tok": ".\n\n"
+  },
+  {
+   "class": "numeric",
+   "j": 121,
+   "decode_gap": 0.0248,
+   "flip": false,
+   "decode_top1_tok": " AI",
+   "prefill_pick_tok": " AI"
+  },
+  {
+   "class": "numeric",
+   "j": 126,
+   "decode_gap": 0.3375,
+   "flip": false,
+   "decode_top1_tok": " assume",
+   "prefill_pick_tok": " assume"
+  },
+  {
+   "class": "numeric",
+   "j": 132,
+   "decode_gap": 0.4269,
+   "flip": false,
+   "decode_top1_tok": "You've",
+   "prefill_pick_tok": "You've"
+  },
+  {
+   "class": "numeric",
+   "j": 144,
+   "decode_gap": 0.308,
+   "flip": false,
+   "decode_top1_tok": " it",
+   "prefill_pick_tok": " it"
+  },
+  {
+   "class": "numeric",
+   "j": 148,
+   "decode_gap": 0.097,
+   "flip": false,
+   "decode_top1_tok": " to",
+   "prefill_pick_tok": " to"
+  },
+  {
+   "class": "numeric",
+   "j": 152,
+   "decode_gap": 0.5362,
+   "flip": false,
+   "decode_top1_tok": " include",
+   "prefill_pick_tok": " include"
+  },
+  {
+   "class": "numeric",
+   "j": 153,
+   "decode_gap": 0.4419,
+   "flip": false,
+   "decode_top1_tok": " quick",
+   "prefill_pick_tok": " quick"
+  },
+  {
+   "class": "numeric",
+   "j": 155,
+   "decode_gap": 0.0103,
+   "flip": false,
+   "decode_top1_tok": ":",
+   "prefill_pick_tok": ":"
+  },
+  {
+   "class": "numeric",
+   "j": 169,
+   "decode_gap": 0.5726,
+   "flip": false,
+   "decode_top1_tok": " composite",
+   "prefill_pick_tok": " composite"
+  },
+  {
+   "class": "numeric",
+   "j": 171,
+   "decode_gap": 0.3775,
+   "flip": false,
+   "decode_top1_tok": " prime",
+   "prefill_pick_tok": " prime"
+  },
+  {
+   "class": "numeric",
+   "j": 172,
+   "decode_gap": 0.3554,
+   "flip": false,
+   "decode_top1_tok": " factorization",
+   "prefill_pick_tok": " factorization"
+  },
+  {
+   "class": "numeric",
+   "j": 220,
+   "decode_gap": 0.4382,
+   "flip": false,
+   "decode_top1_tok": " divide",
+   "prefill_pick_tok": " divide"
+  },
+  {
+   "class": "numeric",
+   "j": 228,
+   "decode_gap": 0.1601,
+   "flip": false,
+   "decode_top1_tok": " Wait",
+   "prefill_pick_tok": " Wait"
+  },
+  {
+   "class": "numeric",
+   "j": 274,
+   "decode_gap": 0.4208,
+   "flip": false,
+   "decode_top1_tok": ",",
+   "prefill_pick_tok": ","
+  },
+  {
+   "class": "numeric",
+   "j": 284,
+   "decode_gap": 0.5879,
+   "flip": false,
+   "decode_top1_tok": " (",
+   "prefill_pick_tok": " ("
+  },
+  {
+   "class": "numeric",
+   "j": 345,
+   "decode_gap": 0.2032,
+   "flip": false,
+   "decode_top1_tok": " if",
+   "prefill_pick_tok": " if"
+  },
+  {
+   "class": "numeric",
+   "j": 346,
+   "decode_gap": 0.5491,
+   "flip": false,
+   "decode_top1_tok": " user",
+   "prefill_pick_tok": " user"
+  },
+  {
+   "class": "numeric",
+   "j": 348,
+   "decode_gap": 0.5778,
+   "flip": false,
+   "decode_top1_tok": " \"",
+   "prefill_pick_tok": " \""
+  },
+  {
+   "class": "numeric",
+   "j": 349,
+   "decode_gap": 0.2182,
+   "flip": true,
+   "decode_top1_tok": "12",
+   "prefill_pick_tok": "What",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.2722
+  },
+  {
+   "class": "numeric",
+   "j": 354,
+   "decode_gap": 0.3873,
+   "flip": false,
+   "decode_top1_tok": " maybe",
+   "prefill_pick_tok": " maybe"
+  },
+  {
+   "class": "numeric",
+   "j": 355,
+   "decode_gap": 0.2547,
+   "flip": false,
+   "decode_top1_tok": " wants",
+   "prefill_pick_tok": " wants"
+  },
+  {
+   "class": "numeric",
+   "j": 360,
+   "decode_gap": 0.466,
+   "flip": false,
+   "decode_top1_tok": "12",
+   "prefill_pick_tok": "12"
+  },
+  {
+   "class": "numeric",
+   "j": 372,
+   "decode_gap": 0.2231,
+   "flip": false,
+   "decode_top1_tok": ":",
+   "prefill_pick_tok": ":"
+  },
+  {
+   "class": "numeric",
+   "j": 390,
+   "decode_gap": 0.367,
+   "flip": false,
+   "decode_top1_tok": ";",
+   "prefill_pick_tok": ";"
+  },
+  {
+   "class": "numeric",
+   "j": 403,
+   "decode_gap": 0.0815,
+   "flip": false,
+   "decode_top1_tok": " Let",
+   "prefill_pick_tok": " Let"
+  },
+  {
+   "class": "numeric",
+   "j": 434,
+   "decode_gap": 0.2841,
+   "flip": false,
+   "decode_top1_tok": " \"",
+   "prefill_pick_tok": " \""
+  },
+  {
+   "class": "numeric",
+   "j": 441,
+   "decode_gap": 0.0022,
+   "flip": true,
+   "decode_top1_tok": " +",
+   "prefill_pick_tok": "?\"",
+   "decode_pick_rank_in_prefill": 3,
+   "flip_delta": 0.5476
+  },
+  {
+   "class": "numeric",
+   "j": 448,
+   "decode_gap": 0.2166,
+   "flip": false,
+   "decode_top1_tok": " produce",
+   "prefill_pick_tok": " produce"
+  },
+  {
+   "class": "numeric",
+   "j": 451,
+   "decode_gap": 0.5606,
+   "flip": false,
+   "decode_top1_tok": " with",
+   "prefill_pick_tok": " with"
+  },
+  {
+   "class": "numeric",
+   "j": 455,
+   "decode_gap": 0.055,
+   "flip": false,
+   "decode_top1_tok": " clarification",
+   "prefill_pick_tok": " clarification"
+  },
+  {
+   "class": "numeric",
+   "j": 467,
+   "decode_gap": 0.065,
+   "flip": true,
+   "decode_top1_tok": "Twelve",
+   "prefill_pick_tok": "In",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.7761
+  },
+  {
+   "class": "numeric",
+   "j": 483,
+   "decode_gap": 0.3194,
+   "flip": false,
+   "decode_top1_tok": " factorization",
+   "prefill_pick_tok": " factorization"
+  },
+  {
+   "class": "contraction",
+   "j": 1,
+   "decode_gap": 0.1635,
+   "flip": true,
+   "decode_top1_tok": "We",
+   "prefill_pick_tok": "The",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.1868
+  },
+  {
+   "class": "contraction",
+   "j": 10,
+   "decode_gap": 0.3573,
+   "flip": false,
+   "decode_top1_tok": " wrote",
+   "prefill_pick_tok": " wrote"
+  },
+  {
+   "class": "contraction",
+   "j": 32,
+   "decode_gap": 0.1309,
+   "flip": false,
+   "decode_top1_tok": " gar",
+   "prefill_pick_tok": " gar"
+  },
+  {
+   "class": "contraction",
+   "j": 37,
+   "decode_gap": 0.1965,
+   "flip": false,
+   "decode_top1_tok": " typo",
+   "prefill_pick_tok": " typo"
+  },
+  {
+   "class": "contraction",
+   "j": 38,
+   "decode_gap": 0.3234,
+   "flip": true,
+   "decode_top1_tok": "/",
+   "prefill_pick_tok": " keyboard",
+   "decode_pick_rank_in_prefill": 4,
+   "flip_delta": 0.2548
+  },
+  {
+   "class": "contraction",
+   "j": 51,
+   "decode_gap": 0.4305,
+   "flip": false,
+   "decode_top1_tok": " But",
+   "prefill_pick_tok": " But"
+  },
+  {
+   "class": "contraction",
+   "j": 53,
+   "decode_gap": 0.4472,
+   "flip": false,
+   "decode_top1_tok": " they",
+   "prefill_pick_tok": " they"
+  },
+  {
+   "class": "contraction",
+   "j": 54,
+   "decode_gap": 0.3225,
+   "flip": false,
+   "decode_top1_tok": " want",
+   "prefill_pick_tok": " want"
+  },
+  {
+   "class": "contraction",
+   "j": 59,
+   "decode_gap": 0.3547,
+   "flip": true,
+   "decode_top1_tok": " craft",
+   "prefill_pick_tok": " infer",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.052
+  },
+  {
+   "class": "contraction",
+   "j": 68,
+   "decode_gap": 0.0646,
+   "flip": true,
+   "decode_top1_tok": " should",
+   "prefill_pick_tok": " respond",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.2125
+  },
+  {
+   "class": "contraction",
+   "j": 69,
+   "decode_gap": 0.5238,
+   "flip": false,
+   "decode_top1_tok": " politely",
+   "prefill_pick_tok": " politely"
+  },
+  {
+   "class": "contraction",
+   "j": 76,
+   "decode_gap": 0.3338,
+   "flip": false,
+   "decode_top1_tok": " mention",
+   "prefill_pick_tok": " mention"
+  },
+  {
+   "class": "contraction",
+   "j": 81,
+   "decode_gap": 0.3975,
+   "flip": false,
+   "decode_top1_tok": " maybe",
+   "prefill_pick_tok": " maybe"
+  },
+  {
+   "class": "contraction",
+   "j": 85,
+   "decode_gap": 0.369,
+   "flip": false,
+   "decode_top1_tok": " inspect",
+   "prefill_pick_tok": " inspect"
+  },
+  {
+   "class": "contraction",
+   "j": 113,
+   "decode_gap": 0.1825,
+   "flip": false,
+   "decode_top1_tok": "I've",
+   "prefill_pick_tok": "I've"
+  },
+  {
+   "class": "contraction",
+   "j": 164,
+   "decode_gap": 0.2753,
+   "flip": false,
+   "decode_top1_tok": " I'm",
+   "prefill_pick_tok": " I'm"
+  },
+  {
+   "class": "contraction",
+   "j": 171,
+   "decode_gap": 0.4098,
+   "flip": false,
+   "decode_top1_tok": " Not",
+   "prefill_pick_tok": " Not"
+  },
+  {
+   "class": "contraction",
+   "j": 182,
+   "decode_gap": 0.4094,
+   "flip": false,
+   "decode_top1_tok": "We",
+   "prefill_pick_tok": "We"
+  },
+  {
+   "class": "contraction",
+   "j": 187,
+   "decode_gap": 0.3593,
+   "flip": false,
+   "decode_top1_tok": "I",
+   "prefill_pick_tok": "I"
+  },
+  {
+   "class": "contraction",
+   "j": 192,
+   "decode_gap": 0.2852,
+   "flip": false,
+   "decode_top1_tok": " understand",
+   "prefill_pick_tok": " understand"
+  },
+  {
+   "class": "contraction",
+   "j": 193,
+   "decode_gap": 0.29,
+   "flip": false,
+   "decode_top1_tok": ".",
+   "prefill_pick_tok": "."
+  },
+  {
+   "class": "contraction",
+   "j": 194,
+   "decode_gap": 0.0756,
+   "flip": false,
+   "decode_top1_tok": " Did",
+   "prefill_pick_tok": " Did"
+  },
+  {
+   "class": "contraction",
+   "j": 203,
+   "decode_gap": 0.0344,
+   "flip": true,
+   "decode_top1_tok": " re",
+   "prefill_pick_tok": " clarify",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.0882
+  },
+  {
+   "class": "contraction",
+   "j": 209,
+   "decode_gap": 0.3841,
+   "flip": false,
+   "decode_top1_tok": "But",
+   "prefill_pick_tok": "But"
+  },
+  {
+   "class": "contraction",
+   "j": 211,
+   "decode_gap": 0.0105,
+   "flip": false,
+   "decode_top1_tok": " need",
+   "prefill_pick_tok": " need"
+  },
+  {
+   "class": "contraction",
+   "j": 216,
+   "decode_gap": 0.2162,
+   "flip": true,
+   "decode_top1_tok": " says",
+   "prefill_pick_tok": "?",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.1162
+  },
+  {
+   "class": "contraction",
+   "j": 233,
+   "decode_gap": 0.5476,
+   "flip": false,
+   "decode_top1_tok": " Maybe",
+   "prefill_pick_tok": " Maybe"
+  },
+  {
+   "class": "contraction",
+   "j": 234,
+   "decode_gap": 0.1755,
+   "flip": false,
+   "decode_top1_tok": " they",
+   "prefill_pick_tok": " they"
+  },
+  {
+   "class": "contraction",
+   "j": 240,
+   "decode_gap": 0.4202,
+   "flip": false,
+   "decode_top1_tok": " a",
+   "prefill_pick_tok": " a"
+  },
+  {
+   "class": "contraction",
+   "j": 252,
+   "decode_gap": 0.2677,
+   "flip": false,
+   "decode_top1_tok": "\"",
+   "prefill_pick_tok": "\""
+  },
+  {
+   "class": "contraction",
+   "j": 260,
+   "decode_gap": 0.5529,
+   "flip": false,
+   "decode_top1_tok": "it",
+   "prefill_pick_tok": "it"
+  },
+  {
+   "class": "contraction",
+   "j": 272,
+   "decode_gap": 0.1314,
+   "flip": false,
+   "decode_top1_tok": " we",
+   "prefill_pick_tok": " we"
+  },
+  {
+   "class": "contraction",
+   "j": 274,
+   "decode_gap": 0.2786,
+   "flip": false,
+   "decode_top1_tok": ",",
+   "prefill_pick_tok": ","
+  },
+  {
+   "class": "contraction",
+   "j": 284,
+   "decode_gap": 0.013,
+   "flip": true,
+   "decode_top1_tok": "it",
+   "prefill_pick_tok": "cat",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.0736
+  },
+  {
+   "class": "contraction",
+   "j": 302,
+   "decode_gap": 0.0485,
+   "flip": false,
+   "decode_top1_tok": " apost",
+   "prefill_pick_tok": " apost"
+  },
+  {
+   "class": "contraction",
+   "j": 303,
+   "decode_gap": 0.2834,
+   "flip": false,
+   "decode_top1_tok": "rophe",
+   "prefill_pick_tok": "rophe"
+  },
+  {
+   "class": "contraction",
+   "j": 307,
+   "decode_gap": 0.1304,
+   "flip": false,
+   "decode_top1_tok": " parse",
+   "prefill_pick_tok": " parse"
+  },
+  {
+   "class": "contraction",
+   "j": 310,
+   "decode_gap": 0.4027,
+   "flip": false,
+   "decode_top1_tok": " \"",
+   "prefill_pick_tok": " \""
+  },
+  {
+   "class": "contraction",
+   "j": 315,
+   "decode_gap": 0.1711,
+   "flip": false,
+   "decode_top1_tok": " \"",
+   "prefill_pick_tok": " \""
+  },
+  {
+   "class": "contraction",
+   "j": 322,
+   "decode_gap": 0.447,
+   "flip": true,
+   "decode_top1_tok": " \"",
+   "prefill_pick_tok": " starts",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.0325
+  },
+  {
+   "class": "contraction",
+   "j": 342,
+   "decode_gap": 0.2159,
+   "flip": false,
+   "decode_top1_tok": "t",
+   "prefill_pick_tok": "t"
+  },
+  {
+   "class": "contraction",
+   "j": 344,
+   "decode_gap": 0.2238,
+   "flip": false,
+   "decode_top1_tok": "\"",
+   "prefill_pick_tok": "\""
+  },
+  {
+   "class": "contraction",
+   "j": 353,
+   "decode_gap": 0.5437,
+   "flip": false,
+   "decode_top1_tok": " maybe",
+   "prefill_pick_tok": " maybe"
+  },
+  {
+   "class": "contraction",
+   "j": 376,
+   "decode_gap": 0.4766,
+   "flip": false,
+   "decode_top1_tok": "\"",
+   "prefill_pick_tok": "\""
+  },
+  {
+   "class": "contraction",
+   "j": 388,
+   "decode_gap": 0.1357,
+   "flip": false,
+   "decode_top1_tok": " maybe",
+   "prefill_pick_tok": " maybe"
+  },
+  {
+   "class": "contraction",
+   "j": 392,
+   "decode_gap": 0.0539,
+   "flip": true,
+   "decode_top1_tok": " missing",
+   "prefill_pick_tok": " (",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.4237
+  },
+  {
+   "class": "contraction",
+   "j": 413,
+   "decode_gap": 0.3589,
+   "flip": false,
+   "decode_top1_tok": " contraction",
+   "prefill_pick_tok": " contraction"
+  },
+  {
+   "class": "contraction",
+   "j": 441,
+   "decode_gap": 0.3208,
+   "flip": false,
+   "decode_top1_tok": " user",
+   "prefill_pick_tok": " user"
+  },
+  {
+   "class": "contraction",
+   "j": 443,
+   "decode_gap": 0.3042,
+   "flip": false,
+   "decode_top1_tok": " random",
+   "prefill_pick_tok": " random"
+  },
+  {
+   "class": "contraction",
+   "j": 448,
+   "decode_gap": 0.4074,
+   "flip": false,
+   "decode_top1_tok": " \"",
+   "prefill_pick_tok": " \""
+  },
+  {
+   "class": "contraction",
+   "j": 465,
+   "decode_gap": 0.2247,
+   "flip": false,
+   "decode_top1_tok": " due",
+   "prefill_pick_tok": " due"
+  },
+  {
+   "class": "contraction",
+   "j": 468,
+   "decode_gap": 0.0433,
+   "flip": false,
+   "decode_top1_tok": " shift",
+   "prefill_pick_tok": " shift"
+  },
+  {
+   "class": "contraction",
+   "j": 474,
+   "decode_gap": 0.4092,
+   "flip": true,
+   "decode_top1_tok": " letters",
+   "prefill_pick_tok": " keys",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.8677
+  },
+  {
+   "class": "contraction",
+   "j": 493,
+   "decode_gap": 0.0177,
+   "flip": true,
+   "decode_top1_tok": "The",
+   "prefill_pick_tok": "the",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.1931
+  },
+  {
+   "class": "contraction",
+   "j": 506,
+   "decode_gap": 0.4872,
+   "flip": false,
+   "decode_top1_tok": "\"",
+   "prefill_pick_tok": "\""
+  },
+  {
+   "class": "whitespace",
+   "j": 1,
+   "decode_gap": 0.4914,
+   "flip": false,
+   "decode_top1_tok": "The",
+   "prefill_pick_tok": "The"
+  },
+  {
+   "class": "whitespace",
+   "j": 5,
+   "decode_gap": 0.0386,
+   "flip": false,
+   "decode_top1_tok": " what",
+   "prefill_pick_tok": " what"
+  },
+  {
+   "class": "whitespace",
+   "j": 11,
+   "decode_gap": 0.4802,
+   "flip": false,
+   "decode_top1_tok": " of",
+   "prefill_pick_tok": " of"
+  },
+  {
+   "class": "whitespace",
+   "j": 13,
+   "decode_gap": 0.2814,
+   "flip": false,
+   "decode_top1_tok": " or",
+   "prefill_pick_tok": " or"
+  },
+  {
+   "class": "whitespace",
+   "j": 14,
+   "decode_gap": 0.1514,
+   "flip": false,
+   "decode_top1_tok": " a",
+   "prefill_pick_tok": " a"
+  },
+  {
+   "class": "whitespace",
+   "j": 15,
+   "decode_gap": 0.1623,
+   "flip": false,
+   "decode_top1_tok": " test",
+   "prefill_pick_tok": " test"
+  },
+  {
+   "class": "whitespace",
+   "j": 17,
+   "decode_gap": 0.0008,
+   "flip": true,
+   "decode_top1_tok": ":",
+   "prefill_pick_tok": ":\n\n",
+   "decode_pick_rank_in_prefill": 3,
+   "flip_delta": 0.1574
+  },
+  {
+   "class": "whitespace",
+   "j": 21,
+   "decode_gap": 0.1042,
+   "flip": false,
+   "decode_top1_tok": "\",",
+   "prefill_pick_tok": "\","
+  },
+  {
+   "class": "whitespace",
+   "j": 32,
+   "decode_gap": 0.5306,
+   "flip": false,
+   "decode_top1_tok": " might",
+   "prefill_pick_tok": " might"
+  },
+  {
+   "class": "whitespace",
+   "j": 34,
+   "decode_gap": 0.2361,
+   "flip": false,
+   "decode_top1_tok": ":\n\n",
+   "prefill_pick_tok": ":\n\n"
+  },
+  {
+   "class": "whitespace",
+   "j": 45,
+   "decode_gap": 0.591,
+   "flip": false,
+   "decode_top1_tok": "/",
+   "prefill_pick_tok": "/"
+  },
+  {
+   "class": "whitespace",
+   "j": 46,
+   "decode_gap": 0.4044,
+   "flip": false,
+   "decode_top1_tok": "odd",
+   "prefill_pick_tok": "odd"
+  },
+  {
+   "class": "whitespace",
+   "j": 53,
+   "decode_gap": 0.5441,
+   "flip": false,
+   "decode_top1_tok": " fragment",
+   "prefill_pick_tok": " fragment"
+  },
+  {
+   "class": "whitespace",
+   "j": 54,
+   "decode_gap": 0.2862,
+   "flip": false,
+   "decode_top1_tok": " from",
+   "prefill_pick_tok": " from"
+  },
+  {
+   "class": "whitespace",
+   "j": 55,
+   "decode_gap": 0.2815,
+   "flip": false,
+   "decode_top1_tok": " something",
+   "prefill_pick_tok": " something"
+  },
+  {
+   "class": "whitespace",
+   "j": 63,
+   "decode_gap": 0.2331,
+   "flip": false,
+   "decode_top1_tok": " testing",
+   "prefill_pick_tok": " testing"
+  },
+  {
+   "class": "whitespace",
+   "j": 65,
+   "decode_gap": 0.0823,
+   "flip": false,
+   "decode_top1_tok": "\n",
+   "prefill_pick_tok": "\n"
+  },
+  {
+   "class": "whitespace",
+   "j": 68,
+   "decode_gap": 0.5817,
+   "flip": false,
+   "decode_top1_tok": " Could",
+   "prefill_pick_tok": " Could"
+  },
+  {
+   "class": "whitespace",
+   "j": 70,
+   "decode_gap": 0.1384,
+   "flip": false,
+   "decode_top1_tok": " a",
+   "prefill_pick_tok": " a"
+  },
+  {
+   "class": "whitespace",
+   "j": 78,
+   "decode_gap": 0.2242,
+   "flip": false,
+   "decode_top1_tok": " content",
+   "prefill_pick_tok": " content"
+  },
+  {
+   "class": "whitespace",
+   "j": 83,
+   "decode_gap": 0.0338,
+   "flip": false,
+   "decode_top1_tok": " There's",
+   "prefill_pick_tok": " There's"
+  },
+  {
+   "class": "whitespace",
+   "j": 89,
+   "decode_gap": 0.1908,
+   "flip": false,
+   "decode_top1_tok": ".",
+   "prefill_pick_tok": "."
+  },
+  {
+   "class": "whitespace",
+   "j": 94,
+   "decode_gap": 0.2613,
+   "flip": false,
+   "decode_top1_tok": ":\n",
+   "prefill_pick_tok": ":\n"
+  },
+  {
+   "class": "whitespace",
+   "j": 96,
+   "decode_gap": 0.1833,
+   "flip": false,
+   "decode_top1_tok": " word",
+   "prefill_pick_tok": " word"
+  },
+  {
+   "class": "whitespace",
+   "j": 110,
+   "decode_gap": 0.2725,
+   "flip": true,
+   "decode_top1_tok": " A",
+   "prefill_pick_tok": " Testing",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.4293
+  },
+  {
+   "class": "whitespace",
+   "j": 113,
+   "decode_gap": 0.2885,
+   "flip": false,
+   "decode_top1_tok": " how",
+   "prefill_pick_tok": " how"
+  },
+  {
+   "class": "whitespace",
+   "j": 115,
+   "decode_gap": 0.5439,
+   "flip": false,
+   "decode_top1_tok": " respond",
+   "prefill_pick_tok": " respond"
+  },
+  {
+   "class": "whitespace",
+   "j": 123,
+   "decode_gap": 0.3957,
+   "flip": false,
+   "decode_top1_tok": " input",
+   "prefill_pick_tok": " input"
+  },
+  {
+   "class": "whitespace",
+   "j": 136,
+   "decode_gap": 0.1116,
+   "flip": true,
+   "decode_top1_tok": " Something",
+   "prefill_pick_tok": " Testing",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.1724
+  },
+  {
+   "class": "whitespace",
+   "j": 140,
+   "decode_gap": 0.5211,
+   "flip": false,
+   "decode_top1_tok": " formatting",
+   "prefill_pick_tok": " formatting"
+  },
+  {
+   "class": "whitespace",
+   "j": 141,
+   "decode_gap": 0.0769,
+   "flip": false,
+   "decode_top1_tok": " (",
+   "prefill_pick_tok": " ("
+  },
+  {
+   "class": "whitespace",
+   "j": 142,
+   "decode_gap": 0.508,
+   "flip": false,
+   "decode_top1_tok": "like",
+   "prefill_pick_tok": "like"
+  },
+  {
+   "class": "whitespace",
+   "j": 143,
+   "decode_gap": 0.599,
+   "flip": false,
+   "decode_top1_tok": " \"",
+   "prefill_pick_tok": " \""
+  },
+  {
+   "class": "whitespace",
+   "j": 146,
+   "decode_gap": 0.4322,
+   "flip": false,
+   "decode_top1_tok": "\",",
+   "prefill_pick_tok": "\","
+  },
+  {
+   "class": "whitespace",
+   "j": 150,
+   "decode_gap": 0.2138,
+   "flip": false,
+   "decode_top1_tok": "\")\n\n",
+   "prefill_pick_tok": "\")\n\n"
+  },
+  {
+   "class": "whitespace",
+   "j": 151,
+   "decode_gap": 0.3675,
+   "flip": false,
+   "decode_top1_tok": "The",
+   "prefill_pick_tok": "The"
+  },
+  {
+   "class": "whitespace",
+   "j": 156,
+   "decode_gap": 0.5059,
+   "flip": false,
+   "decode_top1_tok": " probably",
+   "prefill_pick_tok": " probably"
+  },
+  {
+   "class": "whitespace",
+   "j": 157,
+   "decode_gap": 0.0432,
+   "flip": false,
+   "decode_top1_tok": " acknowledge",
+   "prefill_pick_tok": " acknowledge"
+  },
+  {
+   "class": "whitespace",
+   "j": 168,
+   "decode_gap": 0.47,
+   "flip": false,
+   "decode_top1_tok": ".",
+   "prefill_pick_tok": "."
+  },
+  {
+   "class": "whitespace",
+   "j": 171,
+   "decode_gap": 0.3089,
+   "flip": false,
+   "decode_top1_tok": " just",
+   "prefill_pick_tok": " just"
+  },
+  {
+   "class": "whitespace",
+   "j": 172,
+   "decode_gap": 0.2335,
+   "flip": false,
+   "decode_top1_tok": " ignore",
+   "prefill_pick_tok": " ignore"
+  },
+  {
+   "class": "whitespace",
+   "j": 180,
+   "decode_gap": 0.0597,
+   "flip": false,
+   "decode_top1_tok": " let",
+   "prefill_pick_tok": " let"
+  },
+  {
+   "class": "whitespace",
+   "j": 184,
+   "decode_gap": 0.3548,
+   "flip": false,
+   "decode_top1_tok": " what",
+   "prefill_pick_tok": " what"
+  },
+  {
+   "class": "whitespace",
+   "j": 185,
+   "decode_gap": 0.2452,
+   "flip": false,
+   "decode_top1_tok": " this",
+   "prefill_pick_tok": " this"
+  },
+  {
+   "class": "whitespace",
+   "j": 199,
+   "decode_gap": 0.5828,
+   "flip": false,
+   "decode_top1_tok": " -",
+   "prefill_pick_tok": " -"
+  },
+  {
+   "class": "whitespace",
+   "j": 211,
+   "decode_gap": 0.0263,
+   "flip": true,
+   "decode_top1_tok": "?\n",
+   "prefill_pick_tok": " in",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.24
+  },
+  {
+   "class": "whitespace",
+   "j": 213,
+   "decode_gap": 0.3476,
+   "flip": false,
+   "decode_top1_tok": " A",
+   "prefill_pick_tok": " A"
+  },
+  {
+   "class": "whitespace",
+   "j": 214,
+   "decode_gap": 0.2854,
+   "flip": false,
+   "decode_top1_tok": " word",
+   "prefill_pick_tok": " word"
+  },
+  {
+   "class": "whitespace",
+   "j": 216,
+   "decode_gap": 0.5962,
+   "flip": false,
+   "decode_top1_tok": "?\n",
+   "prefill_pick_tok": "?\n"
+  },
+  {
+   "class": "whitespace",
+   "j": 218,
+   "decode_gap": 0.1187,
+   "flip": false,
+   "decode_top1_tok": " Maybe",
+   "prefill_pick_tok": " Maybe"
+  },
+  {
+   "class": "whitespace",
+   "j": 221,
+   "decode_gap": 0.0509,
+   "flip": true,
+   "decode_top1_tok": " if",
+   "prefill_pick_tok": " how",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.3606
+  },
+  {
+   "class": "whitespace",
+   "j": 224,
+   "decode_gap": 0.5274,
+   "flip": false,
+   "decode_top1_tok": " handle",
+   "prefill_pick_tok": " handle"
+  },
+  {
+   "class": "whitespace",
+   "j": 229,
+   "decode_gap": 0.1165,
+   "flip": false,
+   "decode_top1_tok": " best",
+   "prefill_pick_tok": " best"
+  },
+  {
+   "class": "whitespace",
+   "j": 238,
+   "decode_gap": 0.2002,
+   "flip": false,
+   "decode_top1_tok": " noting",
+   "prefill_pick_tok": " noting"
+  },
+  {
+   "class": "whitespace",
+   "j": 256,
+   "decode_gap": 0.4731,
+   "flip": false,
+   "decode_top1_tok": ".\n\n",
+   "prefill_pick_tok": ".\n\n"
+  },
+  {
+   "class": "whitespace",
+   "j": 267,
+   "decode_gap": 0.4004,
+   "flip": false,
+   "decode_top1_tok": " response",
+   "prefill_pick_tok": " response"
+  },
+  {
+   "class": "whitespace",
+   "j": 275,
+   "decode_gap": 0.3867,
+   "flip": false,
+   "decode_top1_tok": " would",
+   "prefill_pick_tok": " would"
+  },
+  {
+   "class": "whitespace",
+   "j": 285,
+   "decode_gap": 0.2107,
+   "flip": true,
+   "decode_top1_tok": ".",
+   "prefill_pick_tok": " necessarily",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.0423
+  },
+  {
+   "class": "whitespace",
+   "j": 286,
+   "decode_gap": 0.5631,
+   "flip": false,
+   "decode_top1_tok": " Keep",
+   "prefill_pick_tok": " Keep"
+  },
+  {
+   "class": "whitespace",
+   "j": 298,
+   "decode_gap": 0.5126,
+   "flip": false,
+   "decode_top1_tok": " got",
+   "prefill_pick_tok": " got"
+  },
+  {
+   "class": "whitespace",
+   "j": 307,
+   "decode_gap": 0.1901,
+   "flip": true,
+   "decode_top1_tok": ",\"",
+   "prefill_pick_tok": "\",",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.1012
+  },
+  {
+   "class": "whitespace",
+   "j": 321,
+   "decode_gap": 0.4952,
+   "flip": false,
+   "decode_top1_tok": " asking",
+   "prefill_pick_tok": " asking"
+  },
+  {
+   "class": "whitespace",
+   "j": 326,
+   "decode_gap": 0.171,
+   "flip": false,
+   "decode_top1_tok": ":\n\n",
+   "prefill_pick_tok": ":\n\n"
+  },
+  {
+   "class": "whitespace",
+   "j": 345,
+   "decode_gap": 0.0641,
+   "flip": false,
+   "decode_top1_tok": " wrapping",
+   "prefill_pick_tok": " wrapping"
+  },
+  {
+   "class": "whitespace",
+   "j": 348,
+   "decode_gap": 0.4807,
+   "flip": false,
+   "decode_top1_tok": " formatting",
+   "prefill_pick_tok": " formatting"
+  },
+  {
+   "class": "whitespace",
+   "j": 352,
+   "decode_gap": 0.1245,
+   "flip": false,
+   "decode_top1_tok": "Trying",
+   "prefill_pick_tok": "Trying"
+  },
+  {
+   "class": "whitespace",
+   "j": 361,
+   "decode_gap": 0.214,
+   "flip": true,
+   "decode_top1_tok": " split",
+   "prefill_pick_tok": " interrupted",
+   "decode_pick_rank_in_prefill": 3,
+   "flip_delta": 0.4638
+  },
+  {
+   "class": "whitespace",
+   "j": 369,
+   "decode_gap": 0.2809,
+   "flip": false,
+   "decode_top1_tok": "Feel",
+   "prefill_pick_tok": "Feel"
+  },
+  {
+   "class": "whitespace",
+   "j": 380,
+   "decode_gap": 0.4806,
+   "flip": false,
+   "decode_top1_tok": " help",
+   "prefill_pick_tok": " help"
+  },
+  {
+   "class": "whitespace",
+   "j": 382,
+   "decode_gap": 0.3228,
+   "flip": false,
+   "decode_top1_tok": "!",
+   "prefill_pick_tok": "!"
+  },
+  {
+   "class": "tool_xml",
+   "j": 2,
+   "decode_gap": 0.4751,
+   "flip": false,
+   "decode_top1_tok": " need",
+   "prefill_pick_tok": " need"
+  },
+  {
+   "class": "tool_xml",
+   "j": 7,
+   "decode_gap": 0.0486,
+   "flip": false,
+   "decode_top1_tok": " query",
+   "prefill_pick_tok": " query"
+  },
+  {
+   "class": "tool_xml",
+   "j": 22,
+   "decode_gap": 0.4853,
+   "flip": false,
+   "decode_top1_tok": " looks",
+   "prefill_pick_tok": " looks"
+  },
+  {
+   "class": "tool_xml",
+   "j": 24,
+   "decode_gap": 0.1388,
+   "flip": true,
+   "decode_top1_tok": " a",
+   "prefill_pick_tok": " an",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.1396
+  },
+  {
+   "class": "tool_xml",
+   "j": 27,
+   "decode_gap": 0.0079,
+   "flip": false,
+   "decode_top1_tok": "/HTML",
+   "prefill_pick_tok": "/HTML"
+  },
+  {
+   "class": "tool_xml",
+   "j": 32,
+   "decode_gap": 0.0798,
+   "flip": false,
+   "decode_top1_tok": " meant",
+   "prefill_pick_tok": " meant"
+  },
+  {
+   "class": "tool_xml",
+   "j": 37,
+   "decode_gap": 0.136,
+   "flip": false,
+   "decode_top1_tok": " it",
+   "prefill_pick_tok": " it"
+  },
+  {
+   "class": "tool_xml",
+   "j": 41,
+   "decode_gap": 0.4333,
+   "flip": false,
+   "decode_top1_tok": ".",
+   "prefill_pick_tok": "."
+  },
+  {
+   "class": "tool_xml",
+   "j": 64,
+   "decode_gap": 0.287,
+   "flip": false,
+   "decode_top1_tok": " help",
+   "prefill_pick_tok": " help"
+  },
+  {
+   "class": "tool_xml",
+   "j": 66,
+   "decode_gap": 0.0798,
+   "flip": false,
+   "decode_top1_tok": ".\n\n",
+   "prefill_pick_tok": ".\n\n"
+  },
+  {
+   "class": "tool_xml",
+   "j": 67,
+   "decode_gap": 0.1451,
+   "flip": false,
+   "decode_top1_tok": "The",
+   "prefill_pick_tok": "The"
+  },
+  {
+   "class": "tool_xml",
+   "j": 68,
+   "decode_gap": 0.3339,
+   "flip": false,
+   "decode_top1_tok": " query",
+   "prefill_pick_tok": " query"
+  },
+  {
+   "class": "tool_xml",
+   "j": 69,
+   "decode_gap": 0.4955,
+   "flip": false,
+   "decode_top1_tok": " appears",
+   "prefill_pick_tok": " appears"
+  },
+  {
+   "class": "tool_xml",
+   "j": 72,
+   "decode_gap": 0.282,
+   "flip": false,
+   "decode_top1_tok": " incomplete",
+   "prefill_pick_tok": " incomplete"
+  },
+  {
+   "class": "tool_xml",
+   "j": 74,
+   "decode_gap": 0.2058,
+   "flip": true,
+   "decode_top1_tok": " malformed",
+   "prefill_pick_tok": " broken",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.0471
+  },
+  {
+   "class": "tool_xml",
+   "j": 86,
+   "decode_gap": 0.4284,
+   "flip": false,
+   "decode_top1_tok": " Maybe",
+   "prefill_pick_tok": " Maybe"
+  },
+  {
+   "class": "tool_xml",
+   "j": 88,
+   "decode_gap": 0.4103,
+   "flip": false,
+   "decode_top1_tok": " intended",
+   "prefill_pick_tok": " intended"
+  },
+  {
+   "class": "tool_xml",
+   "j": 90,
+   "decode_gap": 0.506,
+   "flip": false,
+   "decode_top1_tok": " ask",
+   "prefill_pick_tok": " ask"
+  },
+  {
+   "class": "tool_xml",
+   "j": 92,
+   "decode_gap": 0.2404,
+   "flip": true,
+   "decode_top1_tok": " a",
+   "prefill_pick_tok": " something",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.096
+  },
+  {
+   "class": "tool_xml",
+   "j": 96,
+   "decode_gap": 0.3187,
+   "flip": false,
+   "decode_top1_tok": " or",
+   "prefill_pick_tok": " or"
+  },
+  {
+   "class": "tool_xml",
+   "j": 99,
+   "decode_gap": 0.5595,
+   "flip": false,
+   "decode_top1_tok": " But",
+   "prefill_pick_tok": " But"
+  },
+  {
+   "class": "tool_xml",
+   "j": 102,
+   "decode_gap": 0.5851,
+   "flip": false,
+   "decode_top1_tok": " broken",
+   "prefill_pick_tok": " broken"
+  },
+  {
+   "class": "tool_xml",
+   "j": 108,
+   "decode_gap": 0.1952,
+   "flip": false,
+   "decode_top1_tok": " technical",
+   "prefill_pick_tok": " technical"
+  },
+  {
+   "class": "tool_xml",
+   "j": 111,
+   "decode_gap": 0.2837,
+   "flip": false,
+   "decode_top1_tok": "We",
+   "prefill_pick_tok": "We"
+  },
+  {
+   "class": "tool_xml",
+   "j": 118,
+   "decode_gap": 0.0087,
+   "flip": true,
+   "decode_top1_tok": " query",
+   "prefill_pick_tok": " malformed",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.0119
+  },
+  {
+   "class": "tool_xml",
+   "j": 124,
+   "decode_gap": 0.2856,
+   "flip": false,
+   "decode_top1_tok": " for",
+   "prefill_pick_tok": " for"
+  },
+  {
+   "class": "tool_xml",
+   "j": 143,
+   "decode_gap": 0.3975,
+   "flip": false,
+   "decode_top1_tok": " been",
+   "prefill_pick_tok": " been"
+  },
+  {
+   "class": "tool_xml",
+   "j": 149,
+   "decode_gap": 0.1533,
+   "flip": false,
+   "decode_top1_tok": ".",
+   "prefill_pick_tok": "."
+  },
+  {
+   "class": "tool_xml",
+   "j": 159,
+   "decode_gap": 0.4027,
+   "flip": false,
+   "decode_top1_tok": "\">",
+   "prefill_pick_tok": "\">"
+  },
+  {
+   "class": "tool_xml",
+   "j": 161,
+   "decode_gap": 0.5659,
+   "flip": false,
+   "decode_top1_tok": " suggests",
+   "prefill_pick_tok": " suggests"
+  },
+  {
+   "class": "tool_xml",
+   "j": 162,
+   "decode_gap": 0.4202,
+   "flip": false,
+   "decode_top1_tok": " an",
+   "prefill_pick_tok": " an"
+  },
+  {
+   "class": "tool_xml",
+   "j": 163,
+   "decode_gap": 0.2627,
+   "flip": false,
+   "decode_top1_tok": " incomplete",
+   "prefill_pick_tok": " incomplete"
+  },
+  {
+   "class": "tool_xml",
+   "j": 184,
+   "decode_gap": 0.0562,
+   "flip": false,
+   "decode_top1_tok": " trying",
+   "prefill_pick_tok": " trying"
+  },
+  {
+   "class": "tool_xml",
+   "j": 199,
+   "decode_gap": 0.0087,
+   "flip": true,
+   "decode_top1_tok": " Are",
+   "prefill_pick_tok": " Do",
+   "decode_pick_rank_in_prefill": 2,
+   "flip_delta": 0.0667
+  }
+ ],
+ "divergence": {
+  "ascii": {
+   "found": true,
+   "j": 57,
+   "serve_pick_token": " typed",
+   "oracle_decode_top1": " want",
+   "prefill_pick": 1189,
+   "prefill_agrees_with_serve_pick": false,
+   "decode_top1_rank_in_prefill": 1,
+   "prefill_delta_top1_vs_serve_pick": 0.7947
+  },
+  "whitespace": {
+   "found": true,
+   "j": 14,
+   "serve_pick_token": " code",
+   "oracle_decode_top1": " a",
+   "prefill_pick": 260,
+   "prefill_agrees_with_serve_pick": false,
+   "decode_top1_rank_in_prefill": 1,
+   "prefill_delta_top1_vs_serve_pick": 0.6087
+  }
+ },
+ "summary": {
+  "sampled": 397,
+  "flips": 63,
+  "flip_rate": 0.1587,
+  "structural_gt20": 0,
+  "max_flip_delta": 1.335,
+  "p95_flip_delta": 0.7091,
+  "note": "prefill path scored with llama.cpp default prompt caching; the flip distribution therefore covers prefill-vs-decode and batch-shape numerics of the pinned oracle"
+ },
+ "envelope": {
+  "max_delta": 0.8,
+  "max_rank": 4,
+  "coverage": "P97 of self-flip deltas; full observed rank range"
+ },
+ "model": "flint-40b",
+ "quant": "UD-Q4_K_XL",
+ "date": "2026-11-08"
+}

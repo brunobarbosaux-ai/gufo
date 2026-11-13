@@ -87,7 +87,12 @@ python3 tools/gates/serve_gates.py g4 --engine oracle \
 python3 tools/gates/serve_gates.py g4 --engine serve \
   --base-url http://127.0.0.1:8006/v1 --model SERVE-MODEL \
   --out /tmp/g4-serve.json
-python3 tools/gates/serve_gates.py g4-compare /tmp/g4-oracle.json /tmp/g4-serve.json
+python3 tools/gates/serve_gates.py g4-compare /tmp/g4-oracle.json /tmp/g4-serve.json \
+  --calibration tools/gates/calibration/<model>-<quant>.json
+
+# G4 envelope calibration from a captured oracle arm (see below)
+python3 tools/gates/serve_gates.py g4-calibrate \
+  --capture /tmp/g4-oracle.json --out tools/gates/calibration/<model>-<quant>.json
 
 # G5: distribution arms, then the verdict
 python3 tools/gates/serve_gates.py g5 --engine oracle \
@@ -102,16 +107,60 @@ python3 tools/gates/serve_gates.py g8 --engine serve \
 ```
 
 G4 prompt construction samples `tools/gates/corpus.py` (deterministic,
-fixed seed, nine prompt classes) and trims prompts to depth with the
-oracle's `/tokenize`.
+fixed seed, nine prompt classes — `--prompts` is capped at one prompt per
+class) and trims prompts to depth with the oracle's `/tokenize`. Reasoning
+handling is normalised in the harness: an engine that separates reasoning
+into `reasoning_content` and one that inlines inline think blocks produce
+the same comparable streams, so the gates do not depend on the oracle's
+`--reasoning-format`.
 
 ## Calibrating a new model/quant pair
 
+The envelope comes from the oracle's own prefill-vs-decode disagreement,
+measured with `g4-calibrate`:
+
 1. Load the GGUF in a freshly started pinned llama.cpp server.
-2. Run `g4 --engine oracle` twice with different prompt subsets and
-   compare the arms with `g4-compare --max-delta 0 --max-rank 1`: any
-   disagreement is the oracle flipping against itself. The per-position
-   flip records from a prefill-vs-decode comparison are the calibration
-   sample (see the `flips` field in the evidence JSON for the schema).
-3. Choose the envelope at the desired coverage (P97 was chosen for Q4)
-   and record it with the run next to the model's other evidence.
+2. Capture an oracle arm: `g4 --engine oracle --out /tmp/arm.json`
+   (the arm stores the prompts and per-position top-20 logprobs).
+3. Re-score the arm through the prefill path:
+   `g4-calibrate --capture /tmp/arm.json --out <calibration>.json`.
+   Every position whose captured top1-top2 gap is within `--max-gap`
+   (default 0.5, the near-tie region) is re-sent as an assistant-message
+   prefill, so the scored position is computed by the batched-prefill
+   path instead of the decode path that produced the capture. Any top-1
+   disagreement is the oracle flipping against itself.
+4. Choose the envelope at the desired coverage (P97 of flip deltas and
+   the full observed rank range was chosen for both calibrations so far)
+   and record it in the calibration file's `envelope` field.
+
+Calibration files live in `tools/gates/calibration/<model>-<quant>.json`
+and carry their `envelope`; `g4-compare` takes the envelope from
+`--calibration <file>` (or explicit `--max-delta/--max-rank`) and refuses
+to run without one — there is no cross-model default. The first
+calibration, Q4_K_XL on a 40B MoE (2026-11-08):
+
+- 397 near-tie positions measured
+- the oracle flips 15.9% of them (63/397) against itself
+- P95 self-flip delta 0.709, max 1.335, all at decode gap < 0.478
+- zero structural disagreements (no flip beyond rank 4)
+
+The envelope delta <= 0.8 / rank <= 4 covers P97 of the oracle's own
+flips and the full observed rank range. The previous envelope
+(delta <= 0.5, rank <= 3) was stricter than the oracle's own
+self-consistency on Q4 and produced false failures.
+
+Second calibration, UD-Q4_K_XL on Qwen3.8-Flash-Next (2026-11-13): 591
+near-tie positions, 28.1% self-flip rate, P97 delta 0.513, max 0.825,
+flips out to rank 6, zero structural disagreements — envelope delta <=
+0.55 / rank <= 6. The Flint envelope does not transfer to this model:
+4 of 166 flips fall outside it, which is why the compare refuses to run
+without an explicit calibration.
+
+Raw data: the `flips` field of each calibration file (per-position
+records: capture vs rescored top-1, delta, rank, decode gap), plus the
+`summary` and `sanity` blocks.
+
+Coarser quants need looser envelopes: early IQ-format data measured
+roughly 2x the Q4 envelope. Every new model/quant pair gets its own
+calibration run before its gate verdict is published; the per-pair
+envelopes are recorded next to the run's evidence.
