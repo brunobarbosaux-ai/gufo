@@ -197,8 +197,16 @@ def build_g4_prompts(count, cfg, prompt_len=G4_TOKENS, oracle=None):
 def cmd_g4(args):
     cfg = engine_config(args.engine, args.base_url, args.model)
     gen_tokens = args.gen_tokens or args.prompt_len
-    prompts = build_g4_prompts(args.prompts, cfg, args.prompt_len,
-                               oracle=args.oracle_url)
+    if getattr(args, "prompts_file", None):
+        # Reuse the exact trimmed prompts from a previous arm (same
+        # tokenizer, deterministic corpus) so the serve arm can run
+        # without the oracle model resident for tokenization.
+        src = json.load(open(args.prompts_file))
+        prompts = [{"class": r["class"], "text": r["prompt"],
+                    "tokens": r["prompt_tokens"]} for r in src["rows"]]
+    else:
+        prompts = build_g4_prompts(args.prompts, cfg, args.prompt_len,
+                                   oracle=args.oracle_url)
     rows = []
     for index, item in enumerate(prompts):
         start = time.time()
@@ -625,6 +633,11 @@ def main():
         p.add_argument("--prompts", type=int, default=8,
                        help="prompt count; capped at one per corpus class "
                             "(9 classes today)")
+        p.add_argument("--prompts-file", default=None,
+                       help="reuse prompts captured in a previous arm JSON "
+                            "(same tokenizer) instead of trimming via the "
+                            "oracle's tokenize endpoints; lets the serve "
+                            "arm run without the oracle resident")
         p.add_argument("--rows", type=int, default=200)
         p.add_argument("--max-tokens", type=int, default=16)
         p.add_argument("--base-url", default=None,
