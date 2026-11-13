@@ -221,6 +221,13 @@ def cmd_g4(args):
                    "text": answer, "full": full,
                    "gen_tokens": [c["token"] for c in gen],
                    "top_logprobs": [c.get("top_logprobs") or [] for c in gen]}
+            # The oracle's comparable stream is the captured token stream
+            # with the think-tag tokens removed. The API's reasoning split
+            # can drop boundary characters (e.g. newlines around the close
+            # tag), which would break the fork check's stream rebuild.
+            row["full"] = "".join(t for t in row["gen_tokens"]
+                                  if t not in (_THINK_OPEN, _THINK_CLOSE)
+                                  ).strip()
         else:
             payload = {"model": cfg["model"],
                        "messages": [{"role": "user", "content": item["text"]}],
@@ -317,17 +324,11 @@ def _g4_fork_check(row_l, row_r, div):
         return None
     # Map stream position -> original token index. Think-tag tokens are
     # not part of the parsed full text, so they are dropped from the
-    # stream but their indices must be kept for the top-k lookup.
-    if _THINK_CLOSE in toks:
-        close = toks.index(_THINK_CLOSE)
-        idx = list(range(1, close)) + list(range(close + 1, len(toks)))
-    elif toks and toks[0] == _THINK_OPEN:
-        # Truncated inside reasoning: no closing tag, but the opening
-        # tag token is still there (it is not part of the parsed
-        # reasoning_content the arm's full text was built from).
-        idx = list(range(1, len(toks)))
-    else:
-        idx = list(range(len(toks)))
+    # stream but their indices must be kept for the top-k lookup. The
+    # open tag may be absent entirely (a chat template can pre-fill it,
+    # so the model never emits it) — filter by value, not by position.
+    idx = [i for i, t in enumerate(toks)
+           if t not in (_THINK_OPEN, _THINK_CLOSE)]
     stream = [toks[i] for i in idx]
     full = "".join(stream)
     lead = len(full) - len(full.lstrip())
