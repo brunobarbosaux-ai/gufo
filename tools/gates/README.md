@@ -14,6 +14,30 @@ of known models.
 | G5 | Sampling distribution (T1.0 / p0.95 / k20): same support, same ordering, TV within bound |
 | G8 | Concurrency: N identical concurrent requests produce byte-identical outputs |
 
+## The oracle
+
+"The oracle" is the pinned llama.cpp build used as the reference engine:
+an independent implementation of GGUF inference with a different kernel
+stack, sharing only the file format with Gufo. Comparing against it is
+what makes the gates evidence rather than self-checks: if a served model
+matches an implementation that shares no code with it, the kernels are
+probably right, and the comparison also demonstrates the "faster than
+llama.cpp without breaking correctness" claim directly. The pin matters
+as much as the engine: an oracle that changes under the gates makes
+runs from different dates incomparable, so every evidence file records
+which build produced it.
+
+The oracle is not perfectly self-consistent, and that is deliberate
+input to the design, not a flaw to hide. llama.cpp evaluates prompt
+positions with a batched prefill path and generated positions with a
+cached one-token-at-a-time decode path; the two do the same arithmetic
+in different orders, so near-tie tokens can flip between them even
+though nothing is wrong. The calibration below measures exactly that:
+how much disagreement is normal for this model and quant. A later
+Gufo-vs-oracle comparison is then judged against that measured noise
+floor, so real signal (an early fork, a token far outside the top
+ranks) separates from harmless rounding.
+
 ## The G4 near-tie envelope
 
 Bit-exact identity between two quantized-kernel stacks is unattainable:
