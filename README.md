@@ -48,19 +48,35 @@ in [#12](https://github.com/slimsami/strycast/pull/12), formerly
 Other community forks of Gufo for Strix Halo. They are not part of Strycast;
 report problems with them in their own repositories.
 
-- [D3rPapts/gufo_windows](https://github.com/D3rPapts/gufo_windows): a native
-  Windows 11 build for 64 GiB Strix Halo machines, with one router port for
-  text, image (Qwen-Image 2.1 with true CFG and multi-reference edits,
-  MOSS-Image), video (MiniMax H3, Wan 2.2, Wan 2.1 camera moves) and audio
-  (Qwen3-TTS, ACE-Step), live previews, a ComfyUI-compatible API, SSD expert
-  streaming and UD-Q3_K_XL for Qwen3.8 Flash-Next.
+- [D3rPapst/gufo-studio-windows](https://github.com/D3rPapst/gufo-studio-windows):
+  two Strix Halo machines as one AI studio on Windows 11, behind one
+  OpenAI-compatible port with a shared job pool, priorities and user accounts:
+  text, image (Qwen-Image 2.1, MOSS-Image), video (MiniMax H3, Wan), speech,
+  music (ACE-Step 1.5, MOSS-Music), 3D (TripoSG, TRELLIS.2) and upscaling.
 - [franzmoca/gufo](https://github.com/franzmoca/gufo): DeepSeek-V4.1-Flash
   (763B) on a single 128 GB Strix Halo, at IQ1_M in GPU memory or IQ2_XXS with
   experts streamed from SSD, and Gemma 4 26B-A4B and 31B, with MTP and image
-  input.
+  input. DeepSeek-V4.1-Flash is also an extension for stock Gufo:
+  [franzmoca/ds41-gufo-extension](https://github.com/franzmoca/ds41-gufo-extension).
+- [johandevlabs/gufo-iq4_xs](https://github.com/johandevlabs/gufo-iq4_xs):
+  Qwen3.8 Flash-Next in Unsloth's UD-IQ4_XS and UD-IQ3_XXS for 96 GB machines,
+  and ISTA-DASLab's GSQ-RCO IQ3_XXS on a branch. Its UD-IQ4_XS support is
+  in Strycast.
 - [neuhaus/gufo](https://github.com/neuhaus/gufo): Gufo RDMA for two Strix
   Halo machines linked by InfiniBand, RoCE v2 or USB4, with tensor parallelism,
   so Qwen3.8 Flash-Next runs at Q8 with longer contexts.
+- [zugliebhaber/gufo](https://github.com/zugliebhaber/gufo): batch-serving
+  throughput, with a shared paged KV block pool, a prefix cache shared between
+  sessions, wide decode batches and Prometheus metrics, on Linux and Windows.
+- [fewtarius/gufo](https://github.com/fewtarius/gufo): Laguna S and Qwen3.6
+  35B-A3B, q8_0/q4_0 KV cache, and the Radeon 780M (gfx1103) APU.
+- [ToR-O3/gufo](https://github.com/ToR-O3/gufo): Qwen3.8 Flash-Next UD-IQ4_XS
+  and mixed-quantization GGUFs under WSL, with WMMA prefill for IQ-quantized
+  experts.
+
+Fork maintainers describe their work, and where it overlaps, in the
+fork-coordination thread
+[gufo-org/gufo#1219](https://github.com/gufo-org/gufo/discussions/1219).
 
 ### Contributing a model
 
