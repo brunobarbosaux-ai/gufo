@@ -63,9 +63,8 @@ flips and the full observed rank range. The previous envelope
 (delta <= 0.5, rank <= 3) was stricter than the oracle's own
 self-consistency on Q4 and produced false failures.
 
-Raw data: `docs/quality/g4-envelope-calibration.json` (fields: `sanity`
-capture alignment, `flips` per-position records, `divergence` first
-fork per class, `summary`).
+Raw data: `tools/gates/calibration/flint-40b-ud-q4_k_xl.json` (fields:
+`sanity` capture alignment, `flips` per-position records, `summary`).
 
 Coarser quants need looser envelopes: early IQ-format data measured
 roughly 2x the Q4 envelope. Every new model/quant pair gets its own

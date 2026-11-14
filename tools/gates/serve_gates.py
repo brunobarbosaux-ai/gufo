@@ -125,7 +125,18 @@ def extract_text(message, full=False):
             if m:
                 reasoning = m.group(1)
                 content = content[m.end():]
-        return (reasoning + content).strip()
+        # Both engines' comparable stream is normalised to the same
+        # reasoning/answer assembly: reasoning stripped + "\n\n" + answer
+        # stripped. Engines disagree about the boundary (Gufo trims the
+        # reasoning and drops the separator after the close tag; llama.cpp
+        # keeps its own whitespace) — comparing the raw assemblies would
+        # fork every boundary-crossing row at an artifact position.
+        reasoning, content = reasoning.strip(), content.strip()
+        if not content:
+            return reasoning
+        if not reasoning:
+            return content
+        return reasoning + "\n\n" + content
     return _THINK_RE.sub("", text).strip()
 
 
@@ -230,12 +241,11 @@ def cmd_g4(args):
                    "gen_tokens": [c["token"] for c in gen],
                    "top_logprobs": [c.get("top_logprobs") or [] for c in gen]}
             # The oracle's comparable stream is the captured token stream
-            # with the think-tag tokens removed. The API's reasoning split
-            # can drop boundary characters (e.g. newlines around the close
-            # tag), which would break the fork check's stream rebuild.
-            row["full"] = "".join(t for t in row["gen_tokens"]
-                                  if t not in (_THINK_OPEN, _THINK_CLOSE)
-                                  ).strip()
+            # assembled the same way as the serve side (see
+            # _normalized_from_tokens) — the API's reasoning split and the
+            # engines' boundary conventions differ, so the raw assemblies
+            # are not comparable.
+            row["full"] = _normalized_from_tokens(row["gen_tokens"])
         else:
             payload = {"model": cfg["model"],
                        "messages": [{"role": "user", "content": item["text"]}],
@@ -315,6 +325,24 @@ def cmd_g4_compare(args):
     return 0 if failures == 0 else 1
 
 
+def _normalized_from_tokens(toks):
+    """Comparable text from the oracle's captured token stream, assembled
+    exactly like extract_text(full=True) on the serve side: reasoning
+    stripped + "\n\n" + answer stripped. Think-tag tokens carry no text;
+    the open tag may be absent entirely (a chat template can pre-fill
+    it, so the model never emits it)."""
+    close = toks.index(_THINK_CLOSE) if _THINK_CLOSE in toks else len(toks)
+    reasoning = "".join(t for t in toks[:close]
+                        if t not in (_THINK_OPEN, _THINK_CLOSE)).strip()
+    answer = "".join(t for t in toks[close:]
+                     if t not in (_THINK_OPEN, _THINK_CLOSE)).strip()
+    if not answer:
+        return reasoning
+    if not reasoning:
+        return answer
+    return reasoning + "\n\n" + answer
+
+
 def _g4_fork_check(row_l, row_r, div):
     """Verify the serve-side fork token against the oracle's own top-k at
     the fork position. Returns (rank, delta) or None when unverifiable.
@@ -325,40 +353,67 @@ def _g4_fork_check(row_l, row_r, div):
     identity is unattainable for ANY independent implementation. What
     must hold: streams agree up to the fork, and the token the serve
     engine picked is the oracle's own near-top choice there.
+
+    Both sides' comparable text follows extract_text(full=True):
+    reasoning stripped + "\\n\\n" + answer stripped. The oracle side is
+    rebuilt from its token stream with per-token spans in normalised
+    coordinates, so the fork char maps back to the token the oracle had
+    at that position. Think-tag tokens carry no text and are filtered by
+    value, not position (the open tag may be absent entirely — a chat
+    template can pre-fill it, so the model never emits it).
     """
     toks = row_l.get("gen_tokens")
     tops = row_l.get("top_logprobs")
     if not toks or not tops:
         return None
-    # Map stream position -> original token index. Think-tag tokens are
-    # not part of the parsed full text, so they are dropped from the
-    # stream but their indices must be kept for the top-k lookup. The
-    # open tag may be absent entirely (a chat template can pre-fill it,
-    # so the model never emits it) — filter by value, not by position.
-    idx = [i for i, t in enumerate(toks)
-           if t not in (_THINK_OPEN, _THINK_CLOSE)]
-    stream = [toks[i] for i in idx]
-    full = "".join(stream)
-    lead = len(full) - len(full.lstrip())
-    if full.strip() != row_l["full"]:
+    close = toks.index(_THINK_CLOSE) if _THINK_CLOSE in toks else len(toks)
+    pre = [(i, toks[i]) for i in range(close)
+           if toks[i] not in (_THINK_OPEN, _THINK_CLOSE)]
+    post = [(i, toks[i]) for i in range(close + 1, len(toks))
+            if toks[i] not in (_THINK_OPEN, _THINK_CLOSE)]
+
+    def segment(seg):
+        raw = "".join(t for _, t in seg)
+        return raw, raw.strip(), len(raw) - len(raw.lstrip())
+
+    raw_a, text_a, lead_a = segment(pre)
+    raw_b, text_b, lead_b = segment(post)
+    if text_a and text_b:
+        full = text_a + "\n\n" + text_b
+        sep = 2
+    else:
+        full = text_a or text_b
+        sep = 0
+    if full != row_l["full"]:
         print("    (oracle stream rebuild mismatch — cannot verify)")
         return None
-    # Map the fork char into the token stream (strip-offset aware).
-    div_r = div + lead
-    acc = 0
-    fork_j = None
-    for j, t in enumerate(stream):
-        if acc + len(t) > div_r:
-            fork_j = j
-            break
-        acc += len(t)
-    if fork_j is None:
+
+    # Map the fork char to the oracle token covering it. div may sit in
+    # the reasoning segment, inside the injected separator (no oracle
+    # token exists there — the texts cannot genuinely fork inside a
+    # separator both sides inject), or in the answer segment.
+    def find_token(seg, seg_text, lead, div_seg):
+        raw_pos = 0
+        for orig_i, t in seg:
+            start = max(raw_pos - lead, 0)
+            end = min(max(raw_pos + len(t) - lead, 0), len(seg_text))
+            raw_pos += len(t)
+            if start <= div_seg < end:
+                return orig_i, start
+        return None, None
+
+    if div < len(text_a):
+        row_i, k0 = find_token(pre, text_a, lead_a, div)
+    elif sep and div >= len(text_a) + sep:
+        row_i, k0 = find_token(post, text_b, lead_b,
+                               div - len(text_a) - sep)
+    else:
         return None
-    row_i = idx[fork_j]
+    if row_i is None:
+        return None
     if row_i >= len(tops) or not tops[row_i]:
         return None
     entries = tops[row_i]
-    k0 = acc - lead  # fork token start in stripped-text coordinates
     serve_txt = row_r["full"]
     for rank, e in enumerate(entries):
         tok = e["token"]
@@ -395,6 +450,8 @@ def cmd_g4_calibrate(args):
     flips = []
     scored = 0
     aligned = 0
+    positions_total = 0
+    skipped_gap = 0
     t0 = time.time()
     for row in cap["rows"]:
         toks = row["gen_tokens"]
@@ -407,11 +464,14 @@ def cmd_g4_calibrate(args):
         prefix = ""
         for i, piece in enumerate(toks):
             entry = tops[i] if i < len(tops) else []
+            positions_total += 1
             if not entry:
                 prefix += piece
                 continue
             gap = (entry[0]["logprob"] - entry[1]["logprob"]
                    if len(entry) > 1 else 9.9)
+            if gap > args.max_gap:
+                skipped_gap += 1
             if gap > args.max_gap or i % args.stride != 0:
                 prefix += piece
                 continue
@@ -437,13 +497,23 @@ def cmd_g4_calibrate(args):
                     rank = next(
                         (r + 1 for r, e in enumerate(entry)
                          if e["token"] == r_top["token"]), 99)
+                    # Same quantity g4-compare judges: the rescored top1's
+                    # logprob looked up in the capture's own distribution
+                    # at this position, against the capture's top1. Only
+                    # flips outside the captured top-20 (rank 99) have no
+                    # in-distribution logprob; their delta is None and
+                    # they are judged on rank alone.
+                    c_entry = next(
+                        (e for e in entry if e["token"] == r_top["token"]),
+                        None)
                     flips.append({
                         "row": row["class"], "position": i,
                         "capture_top1": c_top["token"],
                         "capture_top1_logprob": c_top["logprob"],
                         "rescored_top1": r_top["token"],
                         "rescored_top1_logprob": r_top["logprob"],
-                        "delta": abs(c_top["logprob"] - r_top["logprob"]),
+                        "delta": (round(c_top["logprob"] - c_entry["logprob"], 4)
+                                  if c_entry else None),
                         "rank": rank,
                         "decode_gap": gap,
                     })
@@ -452,7 +522,7 @@ def cmd_g4_calibrate(args):
             break
         print(f"  [{row['class']}] done (running flips: {len(flips)})")
 
-    deltas = sorted(f["delta"] for f in flips)
+    deltas = sorted(f["delta"] for f in flips if f["delta"] is not None)
     ranks = sorted(f["rank"] for f in flips)
 
     def pct(p):
@@ -469,6 +539,10 @@ def cmd_g4_calibrate(args):
         "p97_flip_delta": round(pct(0.97), 4),
         "max_rank": ranks[-1] if ranks else 0,
         "structural_beyond_top20": sum(1 for f in flips if f["rank"] == 99),
+        "positions_total": positions_total,
+        "positions_skipped_by_gap": skipped_gap,
+        "flips_near_gap_limit": sum(
+            1 for f in flips if f["decode_gap"] > 0.9 * args.max_gap),
     }
     json.dump({
         "gate": "G4-oracle-self-flip-calibration",
@@ -668,8 +742,10 @@ def main():
                    help="oracle base URL (default: the pinned oracle on "
                         ":8098; must serve the same model as the capture)")
     p.add_argument("--max-gap", type=float, default=0.5,
-                   help="re-score positions whose capture top1-top2 "
-                        "logprob gap is <= this (near-ties only)")
+                 help="re-score positions whose capture top1-top2 "
+                      "logprob gap is <= this (near-ties only); raise it "
+                      "(e.g. 99) to sample all positions — the default "
+                      "truncates the measured delta tail near the filter")
     p.add_argument("--stride", type=int, default=1,
                    help="re-score every Nth generated position")
     p.add_argument("--limit", type=int, default=0,
