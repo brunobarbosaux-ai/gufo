@@ -465,7 +465,11 @@ def cmd_g4_calibrate(args):
         for i, piece in enumerate(toks):
             entry = tops[i] if i < len(tops) else []
             positions_total += 1
-            if not entry:
+            if not entry or i == 0:
+                # Position 0 has no generated prefix: the prefill rescore
+                # runs against an empty assistant message, which llama.cpp
+                # answers with a degenerate empty token (logprob 0.0) —
+                # not a real prefill-vs-decode comparison.
                 prefix += piece
                 continue
             gap = (entry[0]["logprob"] - entry[1]["logprob"]

@@ -50,18 +50,23 @@ within `G4_NEAR_TIE_DELTA` logprobs of top-1.
 
 Those constants are **per model/quant**, calibrated against the oracle's
 own self-flip distribution (prefill-vs-decode on the same file, one
-generation per prompt, freshly started server). The first calibration,
-Q4_K_XL on a 40B MoE (2026-11-08):
+generation per prompt, freshly started server). The flip delta is
+measured in-distribution: the capture's top1 logprob minus the rescored
+top1's logprob looked up in the capture's own top-20 at that position —
+the same quantity `g4-compare` judges. The first calibration, Q4_K_XL
+on a 40B MoE (2026-11-14, re-run under the in-distribution delta
+semantics):
 
-- 397 near-tie positions measured
-- the oracle flips 15.9% of them (63/397) against itself
-- P95 self-flip delta 0.709, max 1.335, all at decode gap < 0.478
-- zero structural disagreements (no flip beyond rank 4)
+- 378 near-tie positions measured (top1-top2 decode gap <= 0.5)
+- the oracle flips 35.2% of them (133/378) against itself
+- P97 self-flip delta 0.774, max 1.047, all at rank <= 4
+- zero structural disagreements (no flip beyond the captured top-20)
 
 The envelope delta <= 0.8 / rank <= 4 covers P97 of the oracle's own
-flips and the full observed rank range. The previous envelope
-(delta <= 0.5, rank <= 3) was stricter than the oracle's own
-self-consistency on Q4 and produced false failures.
+flips and the full observed rank range. An earlier cross-pass delta
+measure (|capture top1 - rescored top1| across two forward passes)
+produced tighter-looking but non-comparable numbers; all calibration
+files in this directory use the in-distribution measure.
 
 Raw data: `tools/gates/calibration/flint-40b-ud-q4_k_xl.json` (fields:
 `sanity` capture alignment, `flips` per-position records, `summary`).
@@ -155,11 +160,12 @@ flips out to rank 6, zero structural disagreements — envelope delta <=
 4 of 166 flips fall outside it, which is why the compare refuses to run
 without an explicit calibration.
 
+Envelope width tracks the quant's delta tail, not its name: on the
+measured pairs, P97 ranges from 0.64 (Q4_K_M, 35B) to 0.91 (UD-Q4_K_XL
+and UD-IQ4_XS, Flash-Next). Every new model/quant pair gets its own
+calibration run before its gate verdict is published; the per-pair
+envelopes are recorded next to the run's evidence.
+
 Raw data: the `flips` field of each calibration file (per-position
 records: capture vs rescored top-1, delta, rank, decode gap), plus the
 `summary` and `sanity` blocks.
-
-Coarser quants need looser envelopes: early IQ-format data measured
-roughly 2x the Q4 envelope. Every new model/quant pair gets its own
-calibration run before its gate verdict is published; the per-pair
-envelopes are recorded next to the run's evidence.
