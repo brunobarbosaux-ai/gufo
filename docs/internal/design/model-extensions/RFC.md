@@ -809,6 +809,25 @@ Selection uses keys plus a mandatory probe:
    `--provider <id>` (a provider ID from the metadata) or by excluding an
    extension with `GUFO_EXTENSIONS`.
 
+Fallback providers (a generic tier that serves artifacts the blessed
+providers decline) fit this rule without a core change, under three
+conditions, all verified by the routing prototype against v0.33.0:
+
+- **Order.** The generated `RegisterBuiltExtensions` registers built-in
+  providers first and installed modules after them, and probing returns the
+  first match — so a module that registers a complement probe can never
+  take a blessed file. No priority field is needed.
+- **Complement probes.** A fallback probe must accept exactly the artifacts
+  the blessed probes decline (per decline reason, not a copied type list),
+  so the "exactly one" invariant holds. Copying blessed accept-lists one
+  type at a time couples the fallback to every blessed probe and drifts at
+  every rebase; the drift cost is part of the tier's maintenance budget.
+- **Unsized tensors.** Artifacts with tensor types core cannot size (for
+  example GGML type-42 `Q2_0`) make probing skip every provider that does
+  not set `accepts_unsized_tensors`, before any probe runs. A fallback for
+  such formats must set the flag; without it the complement rule never gets
+  evaluated.
+
 Today's Qwen 27B fallback ("any architecture that is not DeepSeek or
 Flash-Next") becomes an explicit key, `gguf:qwen35`, with a probe for the
 supported shapes. Artifacts the fallback accepted by accident fail with a
@@ -1185,6 +1204,47 @@ forced tool choice), continuation and cache suites (when the extension
 declares continuation state), cancellation and device loss; other
 capabilities use their existing API suites. A community extension benefits
 automatically from shared-kernel and core improvements.
+
+### Generic quant tier
+
+A community-tier extension that serves quant classes the blessed providers
+decline, built on the fallback selection rules above. Status and scope
+(issue #61):
+
+- **Pilot file class.** Whatever the blessed runners decline at the time of
+  the pilot — re-verified first: the qwen35moe runner has served the
+  Unsloth UD mixes (IQ4_XS, IQ3_S, IQ4_NL) since #59, and Flash-Next
+  Dynamic 3.1 IQ mixes are covered by the `flash_next_iq` registry
+  extension (gufo-extension#11). The remaining uncovered classes today are
+  sub-IQ3 expert mixes (IQ2/IQ1/Q2_K) on qwen35moe.
+- **Graph.** Reuse the existing runner's graph, vendored with a pinned
+  upstream revision and a reproducible vendor check (the `flash_next_iq`
+  pattern: mechanical rename, `.upstream-rev`, `vendor.sh check`), swapping
+  only the weight projections onto vendored kernels. A separate generic
+  graph per architecture is rejected unless the vendored-graph route fails
+  its gates.
+- **Vendored kernels.** Only the quant types the pilot file class uses.
+  Each vendored copy pins its llama.cpp commit and the probe refuses any
+  tensor type outside its pinned table rather than decoding with a stale
+  layout (the Q1_0 layout-drift finding is the test case).
+- **Continuation cache.** In scope, immediately after the pilot — without
+  it the tier re-prefills every conversation turn and loses to llama.cpp on
+  its main use case.
+- **Selection.** Complement probe + `accepts_unsized_tensors`, per the
+  fallback rules in "Registration and selection".
+- **Speed criteria.** No hard pass/fail number for the pilot. Report
+  prefill at 4K/32K/128K and decode next to llama.cpp (ROCm and Vulkan),
+  with a prefill time breakdown (matmul vs attention/GDN vs rest) and a
+  gap-closing outline. Decode should land near llama.cpp on its own (a
+  large gap indicates a bug, not missing tuning). Stop floor: prefill
+  clearly below llama.cpp with no credible route to closing the gap.
+- **Quality gates.** G4 within the calibrated envelope against the llama.cpp
+  oracle on the same file, plus G5 and G8 (tools/gates); run on Strix Halo
+  hardware per Gufo release, not in hosted CI.
+- **Ownership.** Shared CODEOWNERS (co-maintainers), revisited after the
+  pilot. Own directory, own extension build, published Gufo surface only;
+  CI builds it against Gufo main and the latest tag.
+- **Windows.** Explicitly excluded from Windows packages for the pilot.
 
 ## Success criteria and evaluation
 
