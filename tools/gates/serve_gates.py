@@ -37,6 +37,7 @@ Usage:
 
 import argparse
 import json
+import math
 import re
 import sys
 import threading
@@ -55,19 +56,11 @@ G4_TOKENS = 512  # prompt length target and generation length (gate spec)
 # self-flip distribution (prefill-vs-decode on the same file) via
 # `g4-calibrate`, and g4-compare refuses to run without one (either
 # --calibration or explicit --max-delta/--max-rank). Calibrations so far
-# live in tools/gates/calibration/:
-# - flint-40b-ud-q4_k_xl.json (2026-11-08): 397 near-tie positions, the
-#   oracle flips 15.9% of them against itself, P95 delta 0.709, max
-#   1.335, zero structural disagreements. Envelope delta <= 0.8 (P97) /
-#   rank <= 4 (full observed range). The previous envelope (delta <= 0.5,
-#   rank <= 3) was stricter than the oracle's own self-consistency on Q4.
-# - qwen38-flash-next-ud-q4_k_xl.json (2026-11-13): 591 near-tie
-#   positions, 28.1% self-flip rate, P97 delta 0.513, max 0.825, flips
-#   out to rank 6, zero structural disagreements. Envelope delta <= 0.55
-#   / rank <= 6. The Flint envelope does NOT transfer: 4 of 166 flips
-#   fall outside it.
-# Other quants need their own calibration run (IQ formats measured
-# roughly 2x the Q4 envelope in early data).
+# live in tools/gates/calibration/ — one file per model/quant pair, each
+# carrying its measured distribution and envelope; the files are the
+# source of truth for the numbers. Other quants need their own
+# calibration run (IQ formats measured roughly 2x the Q4 envelope in
+# early data).
 G4_TOP_K = 20  # oracle top-k captured per token (must match the arm capture)
 _THINK_OPEN = chr(60) + "think" + chr(62)
 _THINK_CLOSE = chr(60) + "/think" + chr(62)
@@ -290,6 +283,15 @@ def cmd_g4_compare(args):
             "envelopes are measured per model/quant (see README).")
     left = json.load(open(args.left))
     right = json.load(open(args.right))
+    # A serve arm that crashed partway must fail the gate, not pass on
+    # the rows it managed: zip() would silently stop at the shorter list.
+    left_classes = [r["class"] for r in left["rows"]]
+    right_classes = [r["class"] for r in right["rows"]]
+    if left_classes != right_classes:
+        raise SystemExit(
+            "G4 arms do not cover the same prompt classes — refusing to "
+            f"compare. Left: {left_classes}; right: {right_classes}. "
+            "Re-capture the incomplete arm.")
     failures = 0
     for row_l, row_r in zip(left["rows"], right["rows"]):
         a, b = row_l["full"], row_r["full"]
@@ -391,23 +393,32 @@ def _g4_fork_check(row_l, row_r, div):
     # Map the fork char to the oracle token covering it. div may sit in
     # the reasoning segment, inside the injected separator (no oracle
     # token exists there — the texts cannot genuinely fork inside a
-    # separator both sides inject), or in the answer segment.
+    # separator both sides inject), or in the answer segment. tok_start
+    # is the token's start in segment coordinates and may be negative
+    # when div falls in leading whitespace the normalization stripped;
+    # the caller translates it into whole-stream coordinates.
     def find_token(seg, seg_text, lead, div_seg):
         raw_pos = 0
         for orig_i, t in seg:
-            start = max(raw_pos - lead, 0)
+            tok_start = raw_pos - lead
             end = min(max(raw_pos + len(t) - lead, 0), len(seg_text))
             raw_pos += len(t)
-            if start <= div_seg < end:
-                return orig_i, start
+            if max(tok_start, 0) <= div_seg < end:
+                return orig_i, tok_start
         return None, None
 
     if div < len(text_a):
+        # Reasoning segment starts at stream position 0.
         row_i, k0 = find_token(pre, text_a, lead_a, div)
-    elif sep and div >= len(text_a) + sep:
+    elif div >= len(text_a) + sep:
+        # Answer segment starts after the reasoning text and the
+        # injected separator (sep is 0 when either segment is empty).
         row_i, k0 = find_token(post, text_b, lead_b,
                                div - len(text_a) - sep)
+        if k0 is not None:
+            k0 += len(text_a) + sep
     else:
+        # div inside the separator: no oracle token exists there.
         return None
     if row_i is None:
         return None
@@ -420,10 +431,13 @@ def _g4_fork_check(row_l, row_r, div):
         # The stripped fallback shifts the match offset by the stripped
         # whitespace. Either way the candidate must cover the divergence
         # point: matching only a common prefix before div would accept
-        # tokens that do not explain the fork at all.
+        # tokens that do not explain the fork at all. A negative start
+        # would make Python slice from the end of serve_txt — skip it.
         for cand, off in ((tok, 0),
                           (tok.lstrip(), len(tok) - len(tok.lstrip()))):
             start = k0 + off
+            if start < 0:
+                continue
             if not cand or start > div or start + len(cand) <= div:
                 continue
             if serve_txt[start:start + len(cand)] == cand:
@@ -555,6 +569,17 @@ def cmd_g4_calibrate(args):
         "sanity": {"capture_alignment": f"{aligned}/{scored}"},
         "flips": flips,
         "summary": summary,
+        # The envelope g4-compare judges against: P97 of the in-distribution
+        # flip deltas (rounded up to a margin) and the full observed rank
+        # range. Written only when --coverage is given, so a raw evidence
+        # file and a ready-to-use envelope are never confused.
+        **({"envelope": {
+                "max_delta": math.ceil(pct(args.coverage) * 20) / 20,
+                "max_rank": ranks[-1] if ranks else 0,
+                "coverage": f"P{int(args.coverage * 100)} of self-flip "
+                            "deltas (in-distribution); full observed rank "
+                            "range",
+            }} if args.coverage else {}),
         "seconds": round(time.time() - t0, 1),
     }, open(args.out, "w"), indent=1)
     print(json.dumps(summary, indent=1))
@@ -754,6 +779,12 @@ def main():
                    help="re-score every Nth generated position")
     p.add_argument("--limit", type=int, default=0,
                    help="stop after this many re-scores (0 = all)")
+    p.add_argument("--coverage", type=float, default=None,
+                   help="write an `envelope` field so the output can be "
+                        "passed to g4-compare --calibration directly: "
+                        "max_delta = the P<coverage*100> flip delta "
+                        "rounded up to 0.05, max_rank = the full observed "
+                        "rank range (e.g. --coverage 0.97)")
 
     p = sub.add_parser("g4-compare")
     p.add_argument("left")
